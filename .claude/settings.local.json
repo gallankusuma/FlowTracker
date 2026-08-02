@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "PowerShell(ssh root@76.13.22.155 \"cd /var/www/flowtracker-scraper && node --max-old-space-size=4096 backtest_harmonic_winrate.js 2>&1 | tail -200\")"
-    ]
-  }
-}

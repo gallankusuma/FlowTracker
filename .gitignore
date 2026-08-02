@@ -64,3 +64,8 @@ Revisi/
 
 # ── local scratch ──────────────────────────────────────────────────────────
 *.log
+
+# ── local tooling config ───────────────────────────────────────────────────
+# Per-machine Claude Code permissions. Not shared config, and it accumulates
+# literal commands — which is how the production VPS address ended up committed.
+.claude/settings.local.json
