@@ -622,6 +622,48 @@ HRP lowers drawdown in **both** halves and lowers return in **both** halves. In 
 
 ---
 
+## 2026-08-02 — Infrastructure: broker/bandarmology history extended 6.5 months → 2.5 years
+
+Not an experiment. Recorded because it unblocks the broker factors (F1/F2/F6/F7/F8), which every experiment from EXP-011 onward had to exclude — making all of them, in effect, price-only models.
+
+**Two separate gaps, only one of which cost API calls:**
+
+1. **`idx_broker_summary` already held raw data back to 2025-06-02** that had never been converted to concentration — `autoCalculateConcentration` only started running in Jan 2026. Recovered by re-running `POST /api/calc-concentration {force:true}` over 155 dates. **Zero API calls.** Check this table before ever assuming broker history is missing.
+2. Index Alpha serves broker data back to **2024-01-02**. Pulled via the new `scraper/backfill_broker_history_dates.js`: 116 liquid tickers × 328 trading days = 38,048 calls, 0 failures, 0 rate limits, ~3 hours.
+
+**Cost model, verified — do not re-derive:** the API's `from`/`to` parameters return a **SUM over the range, not a per-day series** (BBCA broker ZP: `buy_freq` 2,527 for one day vs 17,126 for the same week; no per-row date field). There is no range shortcut — one call per ticker per day, always.
+
+### Result
+
+| | before | after |
+|---|---|---|
+| `idx_concentration` dates | 123 | **605** |
+| earliest | 2026-01-19 | **2024-01-02** |
+| `idx_broker_summary` rows | 1.94M | **3.61M** |
+| dates usable (concentration ∧ price) | 123 | **605** |
+
+### Data quality — checked, not assumed
+
+The three periods have different provenance (API backfill / free recompute / original FT.id-overwritten), so the obvious failure mode is a silent scale break that would corrupt any cross-period factor study. It was checked and **there is none**:
+
+| period | n | sd(dn0) | p50 \|dn0\| | p90 | avg pos / neg |
+|---|---|---|---|---|---|
+| NEW 2024-01..2025-06 (self-computed) | 36,880 | 18.23 | 14.0 | 29.1 | +15.06 / −15.60 |
+| RECOVERED 2025-06..2026-01 (self-computed) | 32,969 | 17.29 | 12.7 | 27.4 | +14.03 / −14.43 |
+| ORIGINAL 2026-01-19 on (FT.id) | 26,903 | 17.96 | 9.8 | 26.1 | +12.06 / −13.49 |
+
+Cross-sectional mean |dn0| runs smoothly across the 2026-01-19 boundary (13.9, 13.3, 12.8, 13.9 → 14.0, 15.5, 15.5) with no level shift. `dn1..dn4` are present on **100%** of rows in every period, so F2's five-day series works throughout.
+
+**Two caveats that must travel with any result built on this:**
+
+- **84 rows breach the documented ±100 bound**, all in the FT.id-sourced ORIGINAL period (0.31%), and they are **date-clustered rather than diffuse** — 69 of 84 fall on 2026-06-03 and 2026-06-04 alone. These are bad FT.id pull days, not a scale difference. Clip to ±100 or exclude those dates.
+- **Coverage per date is uneven and lower in the new period**: ~113 tickers/date for 2024-01..2025-06 (a deliberate liquid-universe choice to fit the quota) versus ~213 for the recovered period, and highly variable in the original period (FT.id pulls cover all ~865 IDX names when they succeed, ~114 when they fail). A cross-sectional IC computed on 113 names is not strictly comparable to one on 219. In practice the Rp 5bn liquidity screen already reduces every backtest to ~100 names, so the binding constraint is unchanged — but it must be stated, not assumed away.
+- One orphan date (2026-06-01) has concentration with no matching broker-summary rows.
+
+**What this unblocks**: the broker factors can now be tested as a factor family in their own right, over 2.5 years, using EXP-011's method — the question being whether broker concentration predicts forward returns on IDX at all, and at what horizon. This is the one edge genuinely specific to this market, and EXP-012 established that the price-momentum family is internally correlated 0.49–0.67, so a genuinely orthogonal signal source is exactly what the factor set lacks. EXP-005's ablation already hinted F1/F2 help; it has never been testable until now.
+
+---
+
 ## Open follow-ups (not yet done)
 
 - **Re-run EXP-001 through EXP-010 on 10-year data under both horizons** — this is now the highest-value open item. The headline finding ("AWO Full is worse than random entry") was established on a single ~2-year regime with a 15-bar exit; both of those constraints are gone. Report SWING and POSITION side by side rather than replacing one with the other, and label everything survivorship-biased.
