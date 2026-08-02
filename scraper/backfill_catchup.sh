@@ -2,6 +2,14 @@
 DB_PASSWORD="${DB_PASSWORD:?DB_PASSWORD environment variable must be set}"
 API='http://127.0.0.1:3100'
 
+# Admin endpoints now require a key (2026-08-02). Sourced from .env when not
+# already exported. /api/cron/run already required it; calc-concentration does now.
+if [ -z "${ADMIN_API_KEY:-}" ] && [ -f "$(dirname "$0")/.env" ]; then
+  ADMIN_API_KEY=$(grep -E '^ADMIN_API_KEY=' "$(dirname "$0")/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"'"')
+fi
+ADMIN_API_KEY="${ADMIN_API_KEY:?ADMIN_API_KEY must be set or present in .env}"
+AUTH=(-H "x-admin-key: $ADMIN_API_KEY")
+
 echo '=== FlowTracker Data Backfill ==='
 echo "Start: $(date)"
 echo ""
@@ -17,7 +25,7 @@ for D in 2026-06-13 2026-06-16 2026-06-20 2026-06-23 2026-06-24 2026-06-25 2026-
   
   echo ""
   echo "📡 Pulling broker data for $D ..."
-  RESULT=$(curl -s -X POST "$API/api/cron/run" \
+  RESULT=$(curl -s -X POST "${AUTH[@]}" "$API/api/cron/run" \
     -H 'Content-Type: application/json' \
     -d "{\"date\":\"$D\"}" 2>/dev/null)
   echo "  Response: $(echo $RESULT | head -c 200)"
@@ -35,7 +43,7 @@ for D in 2026-06-13 2026-06-16 2026-06-20 2026-06-23 2026-06-24 2026-06-25 2026-
   done
 
   echo "  📊 Calculating concentration for $D..."
-  curl -s -X POST "$API/api/calc-concentration" \
+  curl -s -X POST "${AUTH[@]}" "$API/api/calc-concentration" \
     -H 'Content-Type: application/json' \
     -d "{\"date\":\"$D\"}" 2>/dev/null | head -c 200
   echo ""

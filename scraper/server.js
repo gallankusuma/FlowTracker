@@ -1385,7 +1385,7 @@ app.get('/api/flow-analyzer', async (req, res) => {
 });
 
 // POST /api/ft-pull — Manually trigger FT.id concentration pull (with auto-calc fallback)
-app.post('/api/ft-pull', async (req, res) => {
+app.post('/api/ft-pull', requireAdminKey, async (req, res) => {
   const { date } = req.body || {};
   const targetDate = date || getTodayDate();
   try {
@@ -1404,7 +1404,7 @@ app.post('/api/ft-pull', async (req, res) => {
 });
 
 // POST /api/calc-concentration — Calculate concentration from broker data (no FT.id dependency)
-app.post('/api/calc-concentration', async (req, res) => {
+app.post('/api/calc-concentration', requireAdminKey, async (req, res) => {
   const { date, force } = req.body || {};
   try {
     const result = await autoCalculateConcentration(date || getTodayDate(), !!force);
@@ -2969,7 +2969,7 @@ app.get('/api/cron/status', (req, res) => {
 });
 
 // GET /api/indexalpha/pull — Pull broker summary for specific stock(s) via Index Alpha
-app.get('/api/indexalpha/pull', async (req, res) => {
+app.get('/api/indexalpha/pull', requireAdminKey, async (req, res) => {
   const ticker = (req.query.ticker || '').toUpperCase();
   const date = req.query.date || getTodayDate();
   
@@ -3000,7 +3000,7 @@ app.get('/api/indexalpha/usage', async (req, res) => {
 
 // GET /api/indexalpha/backfill?days=10&from=2026-04-29&force=true — Backfill historical data
 let backfillRunning = false;
-app.get('/api/indexalpha/backfill', async (req, res) => {
+app.get('/api/indexalpha/backfill', requireAdminKey, async (req, res) => {
   const days = Math.min(parseInt(req.query.days) || 10, 365); // max 365 trading days
   const fromDate = req.query.from;
   
@@ -3620,7 +3620,7 @@ app.get('/api/paper-trading/history', async (req, res) => {
   } catch(err){ res.status(500).json({error:err.message}); }
 });
 
-app.post('/api/paper-trading/generate-plan', (req, res) => {
+app.post('/api/paper-trading/generate-plan', requireAdminKey, (req, res) => {
   const market=req.body.market||req.query.market||'us';
   const {execFile}=require('child_process');
   execFile('/var/www/flowtracker-scraper/.venv/bin/python3',['paper_trader.py','plan',market],{cwd:'/var/www/flowtracker-scraper'},(err,stdout,stderr)=>{
@@ -3629,7 +3629,7 @@ app.post('/api/paper-trading/generate-plan', (req, res) => {
   });
 });
 
-app.post('/api/paper-trading/open', (req, res) => {
+app.post('/api/paper-trading/open', requireAdminKey, (req, res) => {
   const market=req.body.market||'us';
   const {execFile}=require('child_process');
   execFile('/var/www/flowtracker-scraper/.venv/bin/python3',['paper_trader.py','open',market],{cwd:'/var/www/flowtracker-scraper'},(err,stdout)=>{
@@ -3637,7 +3637,7 @@ app.post('/api/paper-trading/open', (req, res) => {
   });
 });
 
-app.post('/api/paper-trading/check', (req, res) => {
+app.post('/api/paper-trading/check', requireAdminKey, (req, res) => {
   const market=req.body.market||'us';
   const {execFile}=require('child_process');
   execFile('/var/www/flowtracker-scraper/.venv/bin/python3',['paper_trader.py','check',market],{cwd:'/var/www/flowtracker-scraper'},(err,stdout)=>{
@@ -3645,7 +3645,7 @@ app.post('/api/paper-trading/check', (req, res) => {
   });
 });
 
-app.post('/api/paper-trading/settle', (req, res) => {
+app.post('/api/paper-trading/settle', requireAdminKey, (req, res) => {
   const market=req.body.market||'us';
   const {execFile}=require('child_process');
   execFile('/var/www/flowtracker-scraper/.venv/bin/python3',['paper_trader.py','settle',market],{cwd:'/var/www/flowtracker-scraper'},(err,stdout)=>{
@@ -3910,7 +3910,7 @@ app.patch('/api/scanner/picks/:id', async (req, res) => {
 // ft_recommendations — real columns are entry_min/entry_max/target_1/target_2 —
 // so this always failed its query and silently returned success:false via the
 // catch block. Not currently called by the frontend or cron; fixed for when it is.)
-app.post('/api/auto-journal/run', async (req, res) => {
+app.post('/api/auto-journal/run', requireAdminKey, async (req, res) => {
   try {
     // Update OPEN recommendations based on current price
     const [openRecs] = await pool.query(
@@ -6602,7 +6602,7 @@ app.get('/api/signal-scanner/detail', async (req, res) => {
 });
 
 // ─── Update Outcomes — Check if past signals were correct ────────────────────
-app.post('/api/signal-scanner/update-outcomes', async (req, res) => {
+app.post('/api/signal-scanner/update-outcomes', requireAdminKey, async (req, res) => {
   try {
     const toStr = d => (d instanceof Date ? d.toISOString().split('T')[0] : String(d).split('T')[0]);
 

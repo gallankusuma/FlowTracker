@@ -3,6 +3,16 @@ DB_PASSWORD="${DB_PASSWORD:?DB_PASSWORD environment variable must be set}"
 DATES="2026-06-13 2026-06-16 2026-06-17 2026-06-18 2026-06-19"
 API="http://127.0.0.1:3100"
 
+# Admin endpoints now require a key (2026-08-02). Port 3100 is bound to
+# 0.0.0.0 with no firewall, so every unauthenticated route was reachable from
+# the public internet. Sourced from .env when not already exported, the same
+# way DB_PASSWORD is supplied.
+if [ -z "${ADMIN_API_KEY:-}" ] && [ -f "$(dirname "$0")/.env" ]; then
+  ADMIN_API_KEY=$(grep -E '^ADMIN_API_KEY=' "$(dirname "$0")/.env" | head -1 | cut -d= -f2- | tr -d '"'"'"'"')
+fi
+ADMIN_API_KEY="${ADMIN_API_KEY:?ADMIN_API_KEY must be set or present in .env}"
+AUTH=(-H "x-admin-key: $ADMIN_API_KEY")
+
 echo "=== BACKFILL START ==="
 for D in $DATES; do
   echo ""
@@ -30,7 +40,7 @@ done
 
 echo ""
 echo "--- Triggering FT.id concentration pull for today ---"
-curl -s -X POST $API/api/ft-pull -H 'Content-Type: application/json' -d '{"date":"2026-06-20"}'
+curl -s -X POST "${AUTH[@]}" $API/api/ft-pull -H 'Content-Type: application/json' -d '{"date":"2026-06-20"}'
 echo ""
 
 echo ""
