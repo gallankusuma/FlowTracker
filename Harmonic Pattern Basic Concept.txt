@@ -1,0 +1,874 @@
+1. Struktur dasar X-A-B-C-D
+Bullish harmonic
+
+Ini pattern untuk cari potensi BUY di titik D.
+
+        A
+       / \
+      /   C
+     /   / \
+    X   B   D
+
+D = area potensi reversal naik
+
+Cara bacanya:
+
+X = swing low awal
+A = swing high setelah impulse naik
+B = koreksi turun dari A
+C = pantulan naik dari B
+D = turun lagi ke area PRZ
+
+Di bullish pattern, lo berharap harga mantul naik dari D.
+
+Bearish harmonic
+
+Ini pattern untuk cari potensi SELL di titik D.
+
+    X   B   D
+     \   \ /
+      \   C
+       \ /
+        A
+
+D = area potensi reversal turun
+
+Cara bacanya:
+
+X = swing high awal
+A = swing low setelah impulse turun
+B = koreksi naik dari A
+C = pantulan turun dari B
+D = naik lagi ke area PRZ
+
+Di bearish pattern, lo berharap harga turun dari D.
+
+2. Rules memilih titik X
+
+X adalah titik awal swing besar, bukan titik random.
+
+Pilih X kalau:
+
+1. Dia swing high / swing low yang jelas.
+2. Setelah X, harga bergerak cukup kuat ke A.
+3. X terlihat penting secara visual, bukan noise kecil.
+4. X biasanya muncul di area support/resistance, supply/demand, atau awal perubahan struktur.
+
+Untuk bullish, X biasanya swing low.
+
+Untuk bearish, X biasanya swing high.
+
+Contoh salah:
+
+Lo ambil X dari candle kecil di tengah sideways.
+
+Itu biasanya bikin pattern palsu.
+
+Contoh benar:
+
+Lo ambil X dari titik reversal yang jelas, lalu harga bergerak impulsif ke A.
+3. Rules memilih titik A
+
+A adalah ujung dari impulse pertama XA.
+
+Kalau bullish:
+
+X = low
+A = high pertama setelah harga naik kuat
+
+Kalau bearish:
+
+X = high
+A = low pertama setelah harga turun kuat
+
+Kaki XA harus kelihatan sebagai gerakan utama, bukan gerakan kecil. StockCharts menyebut XA sebagai impulse wave setelah origin X, lalu AB sebagai corrective wave. Jadi kalau XA tidak jelas, pattern lo dari awal sudah lemah.
+
+Checklist A:
+
+1. A adalah swing ekstrem setelah X.
+2. Dari X ke A ada dorongan harga yang jelas.
+3. Jangan ambil A terlalu cepat kalau harga masih lanjut impulse.
+4. A harus jadi titik yang bisa ditarik Fibonacci dari X.
+4. Rules memilih titik B
+
+B adalah koreksi dari XA.
+
+Ini titik paling penting buat “menebak jenis pattern”.
+
+Kalau bullish:
+
+Harga naik dari X ke A
+Lalu turun koreksi ke B
+
+Kalau bearish:
+
+Harga turun dari X ke A
+Lalu naik koreksi ke B
+
+B harus berada di area retracement Fibonacci dari XA. Investopedia menjelaskan B sebagai retracement dari gerakan X ke A, dan titik-titik X-A-B-C-D membentuk empat kaki: XA, AB, BC, dan CD.
+
+Rules penting:
+
+B tidak boleh melewati X.
+
+Kalau B melewati X, itu bukan koreksi normal dari XA. Pattern harmonic standar seperti Gartley, Bat, Butterfly, dan Crab biasanya invalid.
+
+Rasio B yang umum
+Gartley    : B sekitar 0.618 dari XA
+Bat        : B sekitar 0.382 - 0.500 dari XA
+Butterfly  : B sekitar 0.786 dari XA
+Crab       : B sekitar 0.382 - 0.618 dari XA
+
+IG mencatat Gartley punya aturan penting: B retrace 0.618 dari XA, sedangkan D retrace 0.786 dari XA. Untuk Bat, IG menjelaskan bahwa jika retracement B berhenti sekitar 50% dari XA, itu kemungkinan Bat, dengan CD extension minimal 1.618 dari BC dan bisa sampai 2.618.
+
+5. Rules memilih titik C
+
+C adalah pantulan dari B.
+
+Kalau bullish:
+
+X naik ke A
+A turun ke B
+B naik ke C
+
+Kalau bearish:
+
+X turun ke A
+A naik ke B
+B turun ke C
+
+Rules penting:
+
+C biasanya retrace 0.382 - 0.886 dari AB.
+C idealnya tidak melewati A.
+
+Kenapa tidak boleh melewati A? Karena kalau C melewati A, struktur koreksi normal sudah berubah. Bisa jadi itu pattern lain, tapi untuk pemula jangan dipaksakan jadi Gartley/Bat/Butterfly/Crab.
+
+Cara mikirnya:
+
+B = koreksi dari XA
+C = koreksi dari AB
+D = proyeksi akhir dari BC/CD
+6. Rules memilih titik D
+
+Nah ini yang paling penting bro.
+
+D bukan titik pasti. D adalah area penyelesaian pattern.
+
+Nama lainnya:
+
+PRZ = Potential Reversal Zone
+PCZ = Pattern Completion Zone
+
+StockCharts menjelaskan bahwa D/PCZ dibangun dari confluence Fibonacci retracement, extension, dan projection dari swing sebelumnya; pattern biasanya menyelesaikan kaki CD di zona itu, lalu trader menunggu price reversal action.
+
+Jadi jangan entry cuma karena harga menyentuh D.
+
+Cara benar:
+
+Harga masuk PRZ
+?
+Lihat reaksi candle
+?
+Lihat volume / absorption
+?
+Tunggu confirmation
+?
+Baru rencanakan entry
+
+StockCharts juga menekankan bahwa saat harga masuk reversal zone, itu adalah opportunity, bukan sinyal entry otomatis.
+
+7. Cheat sheet rasio pattern utama
+
+Ini yang lo pakai buat validasi.
+
+Pattern	Titik B	Titik C	Titik D / PRZ
+Gartley	0.618 XA	0.382 - 0.886 AB	0.786 XA + 1.27/1.618 BC + AB=CD
+Bat	0.382 - 0.500 XA	0.382 - 0.886 AB	0.886 XA + 1.618/2.618 BC
+Butterfly	0.786 XA	0.382 - 0.886 AB	1.272 - 1.618 XA
+Crab	0.382 - 0.618 XA	0.382 - 0.886 AB	1.618 XA + 2.618/3.618 BC
+
+Untuk Butterfly, Investopedia mencatat AB sekitar 78.6% dari XA, BC sekitar 38.2% sampai 88.6% dari AB, dan CD bisa 161.8% sampai 261.8% dari AB atau 127% sampai 161.8% dari XA. Untuk Crab, Investopedia mencatat AB sekitar 38.2% sampai 61.8% dari XA, BC sekitar 38.2% sampai 88.6% dari AB, dan CD menuju 161.8% dari XA serta bisa memanjang 261.8% sampai 361.8% dari BC.
+
+8. Urutan kerja di chart
+
+Pakai urutan ini bro.
+
+Step 1 — Cari swing besar dulu
+
+Jangan langsung buka Fibonacci.
+
+Lihat chart dan cari struktur seperti ini:
+
+Bullish candidate:
+
+        A
+       / \
+      /   C
+     /   / \
+    X   B   D
+
+atau
+
+Bearish candidate:
+
+    X   B   D
+     \   \ /
+      \   C
+       \ /
+        A
+
+Kalau bentuknya terlalu berantakan, skip.
+
+Step 2 — Tarik Fibonacci dari X ke A
+
+Untuk bullish:
+
+Tarik Fib dari X low ke A high
+
+Untuk bearish:
+
+Tarik Fib dari X high ke A low
+
+Tujuannya untuk cek titik B.
+
+Pertanyaan pertama:
+
+B retrace berapa persen dari XA?
+
+Kalau B dekat 0.618, lo mulai curiga Gartley.
+
+Kalau B dekat 0.382 - 0.500, lo mulai curiga Bat.
+
+Kalau B dekat 0.786, lo mulai curiga Butterfly.
+
+Kalau B dekat 0.382 - 0.618, bisa juga Crab.
+
+Step 3 — Cek C dari kaki AB
+
+Setelah B valid, tarik Fibonacci dari A ke B.
+
+Pertanyaannya:
+
+C retrace berapa persen dari AB?
+
+Umumnya C yang sehat berada di:
+
+0.382 - 0.886 dari AB
+
+Kalau C terlalu kecil, pattern bisa lemah.
+
+Kalau C melewati A, jangan dipaksakan jadi pattern standar.
+
+Step 4 — Proyeksikan D
+
+D ditentukan dari beberapa confluence:
+
+1. Retracement / extension dari XA
+2. Extension dari BC
+3. Kadang AB = CD
+4. Area support/resistance
+5. Liquidity pool
+6. Candle reaction
+7. Volume reaction
+
+Contoh untuk Gartley bullish:
+
+X ke A sudah terbentuk
+B sekitar 0.618 XA
+C valid di 0.382 - 0.886 AB
+D dicari dekat 0.786 XA
+Lalu cocokkan dengan 1.27 / 1.618 BC dan AB=CD
+
+StockCharts memberi contoh PCZ Gartley bullish yang dibangun dari 0.78 XA, 1.27 BC, 1.62 BC, dan AB=CD.
+
+9. Contoh angka biar kebayang
+
+Misal bullish Gartley.
+
+X = 100
+A = 120
+XA = 20 poin
+
+Untuk Gartley:
+
+B ideal = retracement 0.618 dari XA
+B kira-kira di area 107.6
+
+Lalu harga naik lagi ke C, misalnya:
+
+C = 115
+
+Kemudian D dicari dekat retracement 0.786 XA:
+
+D kira-kira di area 104.3
+
+Jadi lo tidak asal bilang:
+
+“Oh ini kelihatan M, berarti buy.”
+
+Tapi lo bilang:
+
+B masuk 0.618 XA
+C masih valid
+D dekat 0.786 XA
+Ada confluence BC extension
+Harga masuk PRZ
+Tunggu rejection candle
+
+Itu baru harmonic mindset.
+
+10. Rules invalidation
+
+Pattern lo batal kalau:
+
+1. X-A bukan impulse yang jelas.
+2. B melewati X.
+3. C melewati A untuk pattern standar.
+4. Rasio B tidak cocok dengan pattern apa pun.
+5. D tidak punya confluence Fibonacci.
+6. Harga tembus PRZ dengan candle kuat tanpa rejection.
+7. Lo baru sadar pattern setelah harga sudah jauh reversal.
+8. Pattern cuma dipaksakan karena lo pengen entry.
+
+Rule paling keras:
+
+Kalau rasio tidak masuk, jangan dipaksa.
+
+Harmonic itu disiplin angka, bukan seni menggambar bebas.
+
+11. Entry rules setelah D
+
+Di titik D, lo cari bukti.
+
+Untuk bullish D:
+
+Lower wick panjang
+Hammer
+Bullish engulfing
+Volume besar tapi harga gagal turun
+Break minor structure ke atas
+
+Untuk bearish D:
+
+Upper wick panjang
+Shooting star
+Bearish engulfing
+Volume besar tapi harga gagal naik
+Break minor structure ke bawah
+
+Flow-nya:
+
+Pattern valid
+?
+Harga masuk D / PRZ
+?
+Ada rejection
+?
+Ada confirmation
+?
+Entry
+?
+Stop loss di luar D / luar X / luar PRZ
+?
+Target ke B, C, atau Fibonacci retracement CD
+
+Investopedia juga menekankan bahwa harmonic pattern tidak guaranteed, perlu stop-loss dan risk management; stop bisa disesuaikan dengan toleransi risiko, tidak terlalu sempit atau terlalu lebar.
+
+12. Rules timeframe buat spotting titik
+
+Untuk pemula, jangan mulai dari M5/M15.
+
+Pakai ini:
+
+1D = cari pattern utama
+4H = lihat detail struktur
+1H = cari confirmation entry
+
+Kalau di saham Indonesia:
+
+Weekly = konteks besar
+Daily = pattern harmonic
+4H / 1H = konfirmasi
+
+Jangan kebalik:
+
+Jangan cari pattern di 5 menit,
+lalu memaksa daily harus ikut.
+
+Yang benar:
+
+Timeframe besar = konteks
+Timeframe tengah = pattern
+Timeframe kecil = entry confirmation
+13. Kesimpulan rules of game
+
+Pegang 7 aturan ini bro:
+
+1. X harus swing awal yang jelas.
+2. A harus ujung impulse XA.
+3. B harus retracement dari XA dan tidak boleh melewati X.
+4. C harus retracement dari AB dan idealnya tidak melewati A.
+5. D harus datang dari confluence Fibonacci, bukan feeling.
+6. Entry tidak dilakukan hanya karena harga sampai D.
+7. Tunggu candle, volume, dan structure confirmation.
+
+Versi paling simpel:
+
+X-A-B-C-D itu dipilih dari swing utama.
+B menentukan jenis pattern.
+D menentukan zona peluang.
+Confirmation menentukan entry.
+
+Jangan buru-buru hafal semua pattern. Untuk level lo sekarang, kuasai dulu:
+
+ABCD ? Gartley ? Bat ? Butterfly ? Crab
+
+Itu urutan paling sehat.
+
+Bagaimana cara mengkaitkan dengan time frame bro
+Thought for 1m 59s
+
+Bisa bro. Cara mengkaitkan harmonic pattern dengan timeframe itu pakai konsep:
+
+Timeframe besar = konteks
+Timeframe utama = tempat gambar XABCD
+Timeframe kecil = konfirmasi entry
+
+Yang paling penting:
+
+Titik X, A, B, C, D harus diambil dari SATU timeframe yang sama.
+Jangan X dari 1D, A dari 4H, B dari 1H. Itu bikin rasio harmonic jadi kacau.
+
+1. Cara pikir paling gampang
+
+Bayangin market itu kayak peta.
+
+1M / Monthly = peta negara
+1W / Weekly  = peta kota
+1D / Daily   = peta jalan utama
+4H / 1H      = peta gang/detail entry
+
+Kalau lo mau trading harmonic, jangan langsung zoom ke timeframe kecil. Mulai dari atas dulu.
+
+Flow-nya:
+
+Timeframe besar
+? lihat trend, support/resistance, supply/demand, liquidity
+
+Timeframe utama
+? gambar harmonic X-A-B-C-D
+
+Timeframe kecil
+? cari candle confirmation, volume absorption, entry trigger
+2. Rule utama: pattern digambar di timeframe utama
+
+Misal lo pilih 1D sebagai timeframe harmonic.
+
+Berarti:
+
+X = swing di 1D
+A = swing di 1D
+B = retracement di 1D
+C = rebound di 1D
+D = PRZ di 1D
+
+Setelah harga masuk area D / PRZ, baru lo turun ke 4H atau 1H untuk lihat reaksi.
+
+Yang tidak boleh:
+
+X di 1D
+A di 4H
+B di 1H
+C di 15M
+D di 5M
+
+Itu bukan harmonic yang bersih. Itu namanya maksa gambar.
+
+3. Kombinasi timeframe yang enak untuk pemula
+
+Untuk lo yang masih belajar, pakai kombinasi ini dulu:
+
+Gaya Trading	Timeframe Besar	Timeframe Harmonic	Timeframe Entry
+Investor / position	1M	1W	1D
+Swing trading santai	1W	1D	4H / 1H
+Short swing	1D	4H	1H
+Intraday	4H	1H	15M
+Scalping	1H	15M	5M / 1M
+
+Untuk beginner, saran gue:
+
+Best combo: 1W ? 1D ? 4H/1H
+
+Artinya:
+
+1W = konteks besar
+1D = gambar harmonic pattern
+4H/1H = cari konfirmasi entry
+
+Kalau saham Indonesia, biasanya 1D dan 1W lebih bersih daripada timeframe kecil. Di timeframe kecil, noise-nya lebih banyak, apalagi saham yang likuiditasnya tidak terlalu besar.
+
+4. Cara pakai 1M, 1W, 1D, 4H, 1H
+A. Monthly / 1M
+
+Monthly dipakai buat lihat big picture.
+
+Pertanyaan di 1M:
+
+Market secara besar lagi uptrend, downtrend, atau sideways?
+Harga dekat support besar atau resistance besar?
+Ada area supply/demand historis?
+Harga sudah terlalu tinggi atau terlalu rendah secara struktur besar?
+
+Jangan entry dari 1M kecuali lo investor jangka panjang. Untuk harmonic, 1M lebih cocok sebagai arah besar.
+
+Contoh:
+
+Monthly lagi di resistance besar
+?
+Kalau di Daily muncul bearish harmonic di area itu
+?
+Pattern bearish jadi lebih kuat
+B. Weekly / 1W
+
+Weekly adalah timeframe konteks yang paling bagus buat swing trader.
+
+Di 1W, lo cari:
+
+Trend utama
+Support/resistance besar
+Area demand/supply
+Liquidity high/low besar
+Apakah market sedang akumulasi atau distribusi?
+
+Contoh:
+
+Weekly uptrend
+Harga pullback ke demand weekly
+?
+Di Daily muncul bullish Bat / Gartley
+?
+Ini setup lebih menarik
+
+Kenapa? Karena harmonic Daily-nya searah dengan konteks Weekly.
+
+C. Daily / 1D
+
+Daily adalah timeframe favorit buat gambar harmonic pattern.
+
+Di sini lo tandai:
+
+X
+A
+B
+C
+D / PRZ
+
+Daily enak karena:
+
+Swing lebih jelas
+Noise lebih kecil
+Rasio Fibonacci lebih bersih
+Cocok untuk saham
+Tidak terlalu cepat
+
+Untuk beginner, lo sebaiknya banyak latihan harmonic di Daily chart.
+
+D. 4H
+
+4H dipakai untuk lihat detail reaksi saat harga mendekati PRZ.
+
+Misal di Daily ada bullish harmonic dan titik D ada di bawah.
+
+Saat harga masuk D, lo turun ke 4H dan cari:
+
+Lower wick panjang
+Bullish engulfing
+Volume besar tapi harga gagal turun
+Break minor structure ke atas
+Harga mulai bikin higher low
+
+4H membantu lo supaya tidak entry terlalu cepat hanya karena harga menyentuh D.
+
+E. 1H
+
+1H lebih detail lagi. Ini dipakai buat trigger entry.
+
+Misal Daily bullish harmonic sudah valid, 4H mulai rejection, lalu di 1H muncul:
+
+Break struktur kecil
+Retest
+Bullish candle
+Volume mendukung
+
+Baru lo punya alasan entry yang lebih presisi.
+
+Tapi hati-hati:
+
+1H bukan tempat mengubah titik XABCD Daily.
+1H cuma untuk konfirmasi.
+5. Contoh workflow lengkap
+
+Misal lo trading saham atau index dengan style swing.
+
+Step 1 — Buka Weekly
+
+Lo lihat:
+
+Weekly masih uptrend
+Harga sedang pullback ke area support besar
+Volume turun saat pullback
+
+Artinya:
+
+Konteks besar masih cenderung bullish
+Step 2 — Turun ke Daily
+
+Di Daily lo cari harmonic.
+
+Misalnya muncul bullish Gartley:
+
+X = swing low Daily
+A = swing high Daily
+B = retrace 0.618 dari XA
+C = rebound valid
+D = dekat 0.786 XA dan support Weekly
+
+Nah ini bagus karena:
+
+Daily harmonic D
++
+Weekly support
+=
+Confluence
+Step 3 — Tunggu harga masuk D / PRZ
+
+Jangan entry sebelum sampai D.
+
+Harga masuk PRZ
+?
+Lo tunggu reaksi
+
+Kalau harga masuk PRZ tapi candle Daily langsung breakdown kuat, jangan maksa buy.
+
+Step 4 — Turun ke 4H / 1H
+
+Di 4H atau 1H lo cari bukti buyer masuk.
+
+Contoh konfirmasi bullish:
+
+Lower wick panjang
+Bullish engulfing
+Volume besar tapi harga tidak turun jauh
+Break minor high
+Retest berhasil
+
+Kalau sudah ada, baru setup lebih valid.
+
+Step 5 — Entry dan risk management
+
+Entry bisa diambil setelah confirmation.
+
+Stop loss jangan terlalu kecil ikut 1H doang kalau pattern-nya Daily.
+
+Rule-nya:
+
+Pattern Daily ? SL harus menghormati area Daily PRZ
+Pattern 4H ? SL menghormati area 4H PRZ
+Pattern 1H ? SL menghormati area 1H PRZ
+
+Kalau lo gambar pattern di Daily tapi stop loss pakai wick kecil 5M, biasanya gampang kena noise.
+
+6. Contoh mapping bullish harmonic
+
+Misal:
+
+Weekly:
+Harga dekat support besar.
+
+Daily:
+Muncul bullish Bat pattern.
+
+4H:
+Harga masuk PRZ dan muncul lower wick.
+
+1H:
+Break struktur kecil ke atas.
+
+Maka bacaannya:
+
+Weekly = area besar mendukung buy
+Daily = pattern harmonic bullish valid
+4H = ada rejection di D
+1H = entry trigger muncul
+
+Ini setup yang rapi.
+
+Strukturnya:
+
+1W  ? Kenapa mau cari buy?
+1D  ? Di mana area buy potensial?
+4H  ? Apakah buyer mulai muncul?
+1H  ? Kapan entry lebih presisi?
+7. Contoh mapping bearish harmonic
+
+Misal:
+
+Weekly:
+Harga dekat resistance besar.
+
+Daily:
+Muncul bearish Butterfly.
+
+4H:
+Harga masuk PRZ dan muncul upper wick.
+
+1H:
+Break struktur kecil ke bawah.
+
+Bacaannya:
+
+Weekly = area besar mendukung sell
+Daily = harmonic bearish valid
+4H = seller mulai tahan harga
+1H = entry trigger sell muncul
+
+Strukturnya:
+
+1W  ? Kenapa hati-hati di atas?
+1D  ? Ada bearish harmonic di resistance
+4H  ? Ada rejection
+1H  ? Ada confirmation turun
+8. Hubungan timeframe dengan validitas pattern
+
+Semakin besar timeframe, biasanya:
+
+Pattern lebih kuat
+Noise lebih kecil
+Target lebih jauh
+Stop loss lebih lebar
+Butuh waktu lebih lama
+
+Semakin kecil timeframe, biasanya:
+
+Pattern lebih sering muncul
+Noise lebih tinggi
+Fake signal lebih banyak
+Target lebih kecil
+Stop loss lebih sempit
+Butuh eksekusi cepat
+
+Jadi jangan cuma mikir:
+
+“Timeframe kecil lebih cepat profit.”
+
+Karena timeframe kecil juga lebih cepat kena fakeout.
+
+9. Cara memilih timeframe sesuai karakter lo
+
+Kalau lo kerja/kuliah dan tidak bisa mantau chart terus:
+
+Pakai 1W ? 1D ? 4H
+
+Kalau lo swing trader saham:
+
+Pakai 1W ? 1D ? 1H/4H
+
+Kalau lo trading crypto/forex dan bisa mantau lebih sering:
+
+Pakai 1D ? 4H ? 1H
+
+Kalau lo intraday:
+
+Pakai 4H ? 1H ? 15M
+
+Kalau masih beginner, jangan mulai dari:
+
+15M ? 5M ? 1M
+
+Itu terlalu noisy.
+
+10. Cara baca kalau timeframe konflik
+
+Ini penting bro.
+
+Kondisi terbaik
+Weekly bullish
+Daily bullish harmonic
+4H bullish confirmation
+
+Ini bagus karena semua searah.
+
+Kondisi sedang
+Weekly sideways
+Daily bullish harmonic
+4H bullish confirmation
+
+Masih bisa, tapi target jangan terlalu ambisius.
+
+Kondisi berbahaya
+Weekly bearish kuat
+Daily bullish harmonic
+4H bullish confirmation kecil
+
+Ini counter-trend. Bisa tetap mantul, tapi risikonya lebih tinggi. Kalau trade, size lebih kecil dan target lebih pendek.
+
+11. Jangan pakai timeframe kecil untuk melawan timeframe besar
+
+Contoh:
+
+Weekly downtrend kuat
+Daily breakdown support
+Tapi di 15M muncul bullish harmonic kecil
+
+Beginner sering tergoda buy.
+
+Padahal harmonic kecil itu bisa cuma pullback kecil sebelum turun lagi.
+
+Bacaannya:
+
+15M bullish pattern
+di dalam
+Daily/Weekly bearish trend
+=
+kemungkinan hanya retracement kecil
+
+Jadi lo harus tanya:
+
+Pattern kecil ini searah konteks besar atau melawan?
+12. Rules praktis yang bisa lo pakai
+
+Pegang ini:
+
+1. Pilih dulu style trading lo.
+2. Tentukan timeframe utama untuk gambar harmonic.
+3. Gambar XABCD hanya di timeframe utama.
+4. Pakai timeframe besar untuk cek trend dan area penting.
+5. Pakai timeframe kecil hanya untuk confirmation.
+6. Stop loss dan target harus mengikuti timeframe pattern.
+7. Jangan campur titik XABCD dari timeframe berbeda.
+
+Versi simple:
+
+HTF = arah
+MTF = pattern
+LTF = entry
+
+Atau:
+
+Big timeframe  = boleh cari buy/sell atau tidak?
+Main timeframe = pattern harmonic valid atau tidak?
+Small timeframe = kapan masuk?
+13. Template analisa harmonic multi-timeframe
+
+Setiap kali lo buka chart, jawab ini:
+
+1. Weekly trend-nya apa?
+2. Harga Weekly dekat area penting apa?
+3. Di Daily ada pattern XABCD yang clean atau tidak?
+4. Titik D Daily ada confluence dengan support/resistance Weekly?
+5. Saat harga masuk D, di 4H/1H ada rejection?
+6. Ada volume absorption?
+7. Ada break struktur kecil?
+8. Stop loss masuk akal tidak?
+9. Target minimal ke mana?

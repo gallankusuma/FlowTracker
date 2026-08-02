@@ -1,0 +1,1 @@
+﻿const fs = require('fs'); let code = fs.readFileSync('/var/www/flowtracker-scraper/server.js', 'utf8'); code = code.replace(/\\\\\/g, '\'); fs.writeFileSync('/var/www/flowtracker-scraper/server.js', code);

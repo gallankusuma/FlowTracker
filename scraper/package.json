@@ -1,0 +1,20 @@
+{
+  "name": "flowtracker-scraper",
+  "version": "1.0.0",
+  "description": "IDX Broker Data Scraper for FlowTracker",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test_awo_factors.js && node test_regime_engine.js && node test_macd_fix.js && node test_optimizer_fixes.js && node test_score_parity.js && node test_paper_trading.js && node test_technical_availability.js && node test_trade_policy.js && node test_cross_sectional.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.0",
+    "mysql2": "^3.11.0",
+    "puppeteer": "^23.0.0",
+    "puppeteer-extra": "^3.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2"
+  }
+}

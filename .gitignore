@@ -1,0 +1,66 @@
+# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+# dependencies
+/node_modules
+/.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# testing
+/coverage
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# env files (can opt-in for committing if needed)
+.env*
+
+# vercel
+.vercel
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# ── scraper (Node/Python backend) ──────────────────────────────────────────
+scraper/node_modules/
+scraper/__pycache__/
+scraper/.venv/
+scraper/*.pyc
+
+# AWO runtime state — rewritten by the nightly cron, not source.
+# Committing these would make every pull a merge conflict against the server.
+scraper/awo-weights.json
+scraper/awo-challenger.json
+scraper/awo-optimization-result.json
+
+# ── ad-hoc backups ─────────────────────────────────────────────────────────
+# The whole point of introducing version control here is to stop doing this.
+*.bak
+*.bak[0-9]
+*.backup_*
+backup-*/
+revise/
+Revisi/
+*.rar
+
+# ── local scratch ──────────────────────────────────────────────────────────
+*.log
