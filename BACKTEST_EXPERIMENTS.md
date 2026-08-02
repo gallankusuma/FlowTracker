@@ -664,6 +664,63 @@ Cross-sectional mean |dn0| runs smoothly across the 2026-01-19 boundary (13.9, 1
 
 ---
 
+## EXP-2026-08-02-016 — Broker/Bandarmology Factor IC Grid: the sign is inverted
+
+**Script**: `scraper/backtest_broker_factor_ic.js`. First possible run of this test — `idx_concentration` only reached back far enough after the same-day backfill. 605 dates (2024-01-02..2026-07-31), 145 tickers with ≥200 days of concentration, median cross-section 91 after the Rp 5bn liquidity screen, 98 weekly / 487 daily ranking dates. Ranking-only: no timing, stop, target or fees.
+
+**Design**: separates three things the project had always conflated — raw signal vs the production transform (DN0 vs F1_SCORE), magnitude vs consistency (DN0_MA20 vs POSFRAC_20), and short vs long persistence (MA5 / MA20 / MA60). The last split is the point: the actual bandarmology thesis is *persistence* — a large buyer accumulating quietly over weeks — and nothing in the system had ever tested it. F2 reads five days, F8 a short streak; both far shorter than the 2-8 week horizon now traded.
+
+### Result: every broker signal is significantly NEGATIVE, and longer windows are more negative
+
+Weekly sampling, `*` = bootstrap 95% CI excludes zero:
+
+| signal | IC 20D | IC 40D | IC 60D | IR 60D | %pos 60D | D10−D1 60D |
+|---|---|---|---|---|---|---|
+| DN0 (today) | −0.0200 | −0.0195 | −0.0152 | −0.13 | 43.9% | +0.38% |
+| DN0_MA5 | −0.0306 \* | −0.0478 \* | −0.0510 \* | −0.43 | 33.7% | −4.55% |
+| DN0_MA20 | −0.0420 \* | −0.0783 \* | −0.0771 \* | −0.63 | 22.4% | −6.11% |
+| DN0_MA60 | −0.0711 \* | −0.0944 \* | −0.0978 \* | −0.78 | 23.5% | −7.97% |
+| POSFRAC_20 | −0.0477 \* | −0.0829 \* | −0.0814 \* | −0.62 | 18.4% | −7.11% |
+| **POSFRAC_60** | **−0.0808 \*** | **−0.1024 \*** | **−0.1052 \*** | **−0.83** | **16.3%** | **−10.95%** |
+| STREAK | −0.0269 \* | −0.0389 \* | −0.0363 \* | −0.28 | 39.8% | n/a |
+| NETFLOW_20 | −0.0357 \* | −0.0702 \* | −0.0701 \* | −0.58 | 24.5% | −4.21% |
+| F1_SCORE (production) | −0.0200 | −0.0195 | −0.0152 | −0.13 | 43.9% | +0.38% |
+| F2_SCORE (production) | — | ≈−0.045 | — | — | — | — |
+
+Per-year mean IC at 40D — **the sign does not flip once, in either sampling**:
+
+```
+signal          2024    2025    2026        (daily sampling in brackets)
+DN0_MA60      -0.063  -0.122  -0.083   [-0.062 -0.116 -0.096]
+POSFRAC_20    -0.027  -0.125  -0.085   [-0.030 -0.122 -0.089]
+POSFRAC_60    -0.065  -0.136  -0.087   [-0.065 -0.128 -0.100]
+```
+
+### What this means
+
+**Stocks whose top-3 brokers have been persistently net buyers over 1-3 months subsequently underperform — and the more persistent and consistent the "accumulation", the worse the forward return.** POSFRAC_60, which measures pure consistency and ignores magnitude entirely, is the strongest signal in the grid.
+
+For scale: this is **the strongest relationship found anywhere in this registry.** POSFRAC_60 at 60D has |IC| 0.105 and |IR| 0.83, against HI52W's best of +0.044 / 0.25 — roughly 2.4× the IC and 3.3× the information ratio. It is simply pointing the other way.
+
+Three candidate explanations, none tested here:
+1. **"Accumulation" is frequently distribution.** A bandar exiting into retail demand appears as broker-side net buying while the beneficial owner sells; a broker warehousing inventory looks identical until it unloads.
+2. **Crowding / late signal.** By the time concentration has been visibly persistent for 60 days, the move has already happened and what follows is mean reversion.
+3. **`dn0` measures concentration of *activity*, not informed buying** — it may simply not be the quantity practitioners mean.
+
+**The production factors are the weakest members of the family.** F1 (`IC −0.0195` @40D) reads one day; F2 reads five. The signal lives at 20-60 days, which neither looks at. F1_SCORE's IC is *identical* to DN0's at every horizon — expected, since `f1_concentration` is a monotone transform of `dn0` and Spearman is rank-based, and a useful confirmation that the implementation is correct.
+
+**A tooling bug this run exposed**: the script's verdict block originally tested only for *positive* significant IC and duly printed "no broker signal sorts forward returns" above a table of strongly significant negative ones. Fixed to report both directions. A factor that reliably sorts returns the "wrong" way is information, not its absence — and an automated verdict that can only see one sign will hide the most valuable finding on the page.
+
+### Status and caveats
+
+**Do not trade this yet.** What is established is a *ranking* relationship, on 2.5 years spanning only 3 calendar years, ~91 names, survivorship-biased, with no costs, timing or stops. EXP-013 is the cautionary precedent: a positive IC of comparable size died completely once turnover and a walk-forward were applied.
+
+Also note what a negative IC can and cannot become on IDX: retail cannot readily short, so the usable form is a **veto on the long book** — avoid names showing persistent broker accumulation — not a short leg.
+
+**Decision this drives**: test POSFRAC_60 as a veto overlay on the existing HI52W + regime-filter book, using the EXP-013/014 harness unchanged (mean across all 9 cells, split-half walk-forward, net of costs). That is a small, well-defined change to a book that already exists, and it is the first time this project has had two signals with genuinely different sources to combine — EXP-012 having established that the price-momentum family is internally correlated 0.49-0.67 and adds nothing to itself.
+
+---
+
 ## Open follow-ups (not yet done)
 
 - **Re-run EXP-001 through EXP-010 on 10-year data under both horizons** — this is now the highest-value open item. The headline finding ("AWO Full is worse than random entry") was established on a single ~2-year regime with a 15-bar exit; both of those constraints are gone. Report SWING and POSITION side by side rather than replacing one with the other, and label everything survivorship-biased.
