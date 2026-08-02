@@ -8,6 +8,7 @@ Saves results to ft_sentiment_cache table.
 Schedule: Every 15 min during market hours
 """
 
+import os
 import pymysql
 import requests
 import json
@@ -19,7 +20,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 log = logging.getLogger('MarketIntel')
 
 DB_CFG = dict(
-    host='localhost', user='erp_user', password='__REDACTED_SEE_ENV__',
+    host=os.environ.get('DB_HOST', 'localhost'),
+    user=os.environ.get('DB_USER', 'erp_user'),
+    password=os.environ.get('DB_PASSWORD'),
     database='erp_manufacturing', charset='utf8mb4',
     cursorclass=pymysql.cursors.DictCursor
 )
