@@ -721,6 +721,64 @@ Also note what a negative IC can and cannot become on IDX: retail cannot readily
 
 ---
 
+## EXP-2026-08-02-017 — Broker veto on the HI52W book: the first result to pass every control
+
+**Script**: `scraper/backtest_broker_veto.js`. HI52W ranking and the 200d-SMA regime filter held FIXED; 8 positions; mean *and median* across all 9 (rebalance × buffer) cells; split-half walk-forward; net of costs.
+
+**Window caveat, read first**: concentration data begins 2024-01-02 and POSFRAC_60 needs 60 days of it, so this runs on **2.2 years** versus EXP-013/014's ~9. The BASE row is re-run on the same shortened window; its numbers deliberately do not match EXP-014's.
+
+**Question**: EXP-016 found persistent broker accumulation predicts underperformance (POSFRAC_60, IC −0.105, IR −0.83). Retail cannot short on IDX, so the usable form is a veto — don't buy names showing it. Does that survive costs and a walk-forward?
+
+### Three controls, all passed
+
+| variant | CAGR | excess (median) | maxDD | ret/vol | +cells |
+|---|---|---|---|---|---|
+| BASE (no veto) | 7.48% | −0.54% (−1.50%) | 18.12% | 0.36 | 4/9 |
+| RANDOM 20% *(control)* | 7.33% | −0.69% (−0.47%) | 16.60% | 0.36 | 4/9 |
+| REVERSE bot 20% *(control)* | — | **−6.14%** | — | — | — |
+| REVERSE bot 30% *(control)* | 2.80% | **−5.22%** (−6.99%) | 18.15% | 0.14 | 1/9 |
+| VETO top 30% | 16.38% | +8.35% (+12.01%) | 15.20% | 0.80 | 6/9 |
+| **VETO top 20% +exit** | **16.73%** | **+8.71% (+11.44%)** | **13.83%** | **0.83** | **7/9** |
+
+**1. Dose response is smooth and monotone** — the earlier impression that 10% hurt while 20% helped was a gap in the grid, not a real reversal:
+
+```
+5%: −4.52   10%: −3.16   15%: +1.02   20%: +1.97   25%: +2.65   30%: +8.35   40%: +7.09
+```
+
+Rising monotonically 5% → 30%, then saturating at 40%. The small doses are near-noise for a mechanical reason: vetoing 5-10% of ~91 names rarely removes anything that would have reached the top-8 HI52W list anyway.
+
+**2. The random control does nothing.** Vetoing a seeded-random 20% gives −0.69% versus BASE's −0.54% — indistinguishable. So the benefit is not the mechanical effect of removing candidates and changing turnover.
+
+**3. The reverse control hurts, which is the decisive one.** Banning the *least*-accumulated names costs 5-6pp of excess, while banning the *most*-accumulated gains 8-9pp. The effect is directional, tied to the sign of the signal, and not an artifact of filtering per se.
+
+Additionally the **median across cells exceeds the mean** (+11.44% vs +8.71%) — the opposite of EXP-015's failure mode, where a mean was carried by three outlier cells. And drawdown improves alongside return (18.12% → 13.83%), which is unusual and welcome.
+
+### What is NOT established
+
+**The strategy still loses to the universe in the first half.** Every single variant has negative P1 excess — the best is −2.50%. All positive excess comes from P2:
+
+```
+                    P1 excess   P2 excess
+BASE                  −7.45%      +2.84%
+VETO top 30%          −2.50%      +7.88%
+VETO top 20% +exit    −3.86%     +12.43%
+```
+
+"Beats BASE in both halves" is true. "Beats the universe in both halves" is **false**. The veto reliably makes the book *less bad* in P1 and clearly better in P2, but a strategy that underperforms its own universe for a year is not yet something to trade.
+
+Other limits: 2.2 years total (each half ~1.1 years), 12 variants tested with the best selected, ~91-name cross-section, survivorship-biased throughout, and VETO 40% swings from −9.38% in P1 to +16.80% in P2 — instability that argues against reading any single cell precisely.
+
+### This is the data ceiling
+
+Concentration cannot be extended further: Index Alpha serves back to 2024-01-02 and no earlier (verified 2026-08-02), and there is no other source of IDX broker-summary history. **More backtesting cannot resolve the remaining uncertainty** — the sample simply does not exist.
+
+**Decision this drives**: stop backtesting this and start forward-testing it. The project already has exactly the right infrastructure for a question of this shape — `awo_paper_trades`, the frozen-challenger mechanism, and promotion gates requiring ≥30 resolved trades, ≥20 calendar days, positive avg net R and profit factor ≥1.10. That machinery was built in the 2026-07-31 review rounds and has never had a candidate worth putting through it. This is the first one.
+
+Recommended configuration to freeze: **HI52W top-8 + 200d-SMA regime filter + POSFRAC_60 top-20% veto with forced exit**, biweekly rebalance, buffer ×2. Not because that cell is the maximum — it is, which is exactly why it should be treated as an upper bound — but because it sits in the middle of a smooth dose plateau (20-30% all work) rather than on a spike, and because the +exit variant is the one whose advantage holds in both halves and across the most cells (7/9).
+
+---
+
 ## Open follow-ups (not yet done)
 
 - **Re-run EXP-001 through EXP-010 on 10-year data under both horizons** — this is now the highest-value open item. The headline finding ("AWO Full is worse than random entry") was established on a single ~2-year regime with a 15-bar exit; both of those constraints are gone. Report SWING and POSITION side by side rather than replacing one with the other, and label everything survivorship-biased.
