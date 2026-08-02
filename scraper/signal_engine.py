@@ -47,9 +47,12 @@ class NumpyEncoder(json.JSONEncoder):
         return super().default(obj)
 
 # ── DB Config ──────────────────────────────────────────────────────────
+import env_loader
+env_loader.load_env()
+
 DB_CFG = dict(host=os.environ.get('DB_HOST', 'localhost'),
               user=os.environ.get('DB_USER', 'erp_user'),
-              password=os.environ.get('DB_PASSWORD'),
+              password=env_loader.require('DB_PASSWORD'),
               database='erp_manufacturing',
               charset='utf8mb4', cursorclass=pymysql.cursors.DictCursor)
 

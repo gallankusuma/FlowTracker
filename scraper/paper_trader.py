@@ -34,10 +34,13 @@ from decimal import Decimal
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('PaperTrader')
 
+import env_loader
+env_loader.load_env()
+
 DB_CFG = dict(
     host=os.environ.get('DB_HOST', 'localhost'),
     user=os.environ.get('DB_USER', 'erp_user'),
-    password=os.environ.get('DB_PASSWORD'),
+    password=env_loader.require('DB_PASSWORD'),
     database='erp_manufacturing', charset='utf8mb4',
     cursorclass=pymysql.cursors.DictCursor
 )
