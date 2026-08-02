@@ -259,6 +259,32 @@ async function main() {
 
   const i = o.date ? ctx.dateIdx.get(o.date) : lastI;
   if (i === undefined) { console.error(`Date ${o.date} is not a trading date on the IHSG axis`); process.exit(1); }
+
+  // REBALANCE CADENCE IS OWNED BY THIS SCRIPT, NOT BY THE CRON SCHEDULE.
+  // The frozen configuration rebalances every REBAL_BARS trading days. If the
+  // cadence were left to however often cron happens to fire, a weekly cron would
+  // silently run a weekly-rebalance strategy — a different strategy from the one
+  // EXP-017 tested, with different turnover and different costs. Self-throttling
+  // here means the schedule can be as frequent as you like (daily is best: a
+  // failed run is simply retried tomorrow) without changing what is being tested.
+  // An explicit --date overrides, for backfilling a specific decision.
+  if (!o.date) {
+    const [last] = await pool.query(
+      'SELECT MAX(as_of_date) AS d FROM ft_strategy_log WHERE strategy_id=?', [STRATEGY_ID]);
+    if (last[0].d) {
+      const lastIdx = ctx.dateIdx.get(toDateStr(last[0].d));
+      if (lastIdx !== undefined) {
+        const elapsed = i - lastIdx;
+        if (elapsed < REBAL_BARS) {
+          console.log(`${ctx.tradingDates[i]}: no decision due — ${elapsed}/${REBAL_BARS} trading days since ${toDateStr(last[0].d)}.`);
+          console.log(`Next decision in ${REBAL_BARS - elapsed} trading day(s). Nothing written.`);
+          await pool.end();
+          return;
+        }
+      }
+    }
+  }
+
   const r = await decideFor(pool, ctx, i, false);
   if (r.skipped) console.log(`${ctx.tradingDates[i]}: ${r.skipped}`);
   await pool.end();

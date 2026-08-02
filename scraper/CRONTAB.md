@@ -72,6 +72,20 @@ exists only on the VPS.
  0  9   * * 1-5   paper_trader.py settle idx                    # 16:00 WIB
 ```
 
+### EXP-017 forward paper test — `ft_strategy_positions` / `ft_strategy_log`
+```
+ 0  1 * * 1-5   node strategy_forward.js                       # 08:00 WIB
+```
+Added 2026-08-02. Runs **daily on purpose** even though the strategy rebalances
+biweekly: `strategy_forward.js` owns its own cadence internally (it refuses to
+decide until `REBAL_BARS` trading days have passed since the last recorded
+decision), so a missed day is simply retried the next morning and the strategy
+being tested is unaffected. Leaving the cadence to the cron schedule would have
+meant a weekly cron silently running a weekly-rebalance strategy — a *different*
+strategy from the one EXP-017 tested, with different turnover and costs.
+
+Records intentions only. It places no orders and touches no broker.
+
 ## Log files
 
 `/var/log/ft-pull.log`, `/var/log/signal_engine.log`, `/var/log/flowtracker-intel.log`,
