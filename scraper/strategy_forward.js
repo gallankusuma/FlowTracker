@@ -31,11 +31,12 @@
  * Idempotent: running twice for the same date changes nothing.
  *
  * Usage:
- *   node strategy_forward.js                    # decide for the latest data date (LIVE)
- *   node strategy_forward.js --date 2026-07-30
- *   node strategy_forward.js --replay 60        # seed history, recorded as REPLAY
- *   node strategy_forward.js --status           # full report, LIVE only
- *   node strategy_forward.js --status --include-replay   # both, reported separately
+ *   node strategy_forward.js            # the daily cycle: fill, then plan, then mark
+ *   node strategy_forward.js plan       # freeze a decision, reading NO execution price
+ *   node strategy_forward.js fill       # execute any plan whose bar has since landed
+ *   node strategy_forward.js mark       # record today's NAV
+ *   node strategy_forward.js status [--include-replay]
+ *   node strategy_forward.js --replay 60   # seed history, recorded as REPLAY
  */
 'use strict';
 require('dotenv').config();
@@ -45,6 +46,7 @@ const { execSync } = require('child_process');
 const mysql = require('mysql2/promise');
 const sb = require('./modules/strategy_book');
 const fg = require('./modules/forward_gate');
+const exec = require('./modules/execution');
 
 const DB = {
   host: process.env.DB_HOST || 'localhost',
@@ -85,7 +87,11 @@ const num = (v, d = 2) => v === null || v === undefined ? 'n/a' : (v === Infinit
 
 function parseArgs() {
   const a = process.argv.slice(2);
-  const o = { date: null, replay: 0, status: false, includeReplay: false };
+  const o = { cmd: null, date: null, replay: 0, status: false, includeReplay: false };
+  if (a.length && ['plan', 'fill', 'mark', 'status'].includes(a[0])) {
+    o.cmd = a.shift();
+    if (o.cmd === 'status') o.status = true;
+  }
   for (let i = 0; i < a.length; i++) {
     if (a[i] === '--date') o.date = a[++i];
     else if (a[i] === '--replay') o.replay = Number(a[++i]);
@@ -136,6 +142,45 @@ async function setup(pool) {
       target_json TEXT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE KEY uq_day (strategy_id, as_of_date)
+    )`);
+
+  // The frozen plan (review P0.3). Written after the close of bar T with no
+  // reference whatsoever to bar T+1, which does not exist in idx_stock_prices
+  // yet. `fill` later records what it actually cost to execute it.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ft_strategy_plan (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      strategy_id VARCHAR(64) NOT NULL,
+      as_of_date DATE NOT NULL,
+      run_mode ENUM('LIVE','REPLAY','BACKFILL') NOT NULL DEFAULT 'LIVE',
+      generated_at DATETIME NOT NULL,
+      data_snapshot_hash VARCHAR(32) NULL,
+      strategy_hash VARCHAR(32) NULL,
+      code_commit VARCHAR(40) NULL,
+      exposure DECIMAL(4,2) NOT NULL,
+      reason VARCHAR(128) NOT NULL,
+      eligible INT NOT NULL,
+      vetoed INT NOT NULL,
+      target_json TEXT NULL,
+      reference_json TEXT NULL,
+      status ENUM('PLANNED','EXECUTED','EXPIRED') NOT NULL DEFAULT 'PLANNED',
+      executed_at DATETIME NULL,
+      execution_date DATE NULL,
+      UNIQUE KEY uq_plan (strategy_id, as_of_date),
+      KEY idx_plan_status (strategy_id, run_mode, status)
+    )`);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ft_strategy_nav (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      strategy_id VARCHAR(64) NOT NULL,
+      mark_date DATE NOT NULL,
+      run_mode ENUM('LIVE','REPLAY','BACKFILL') NOT NULL DEFAULT 'LIVE',
+      open_positions INT NOT NULL,
+      unrealised_pct DECIMAL(10,4) NULL,
+      unmarkable VARCHAR(255) NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_mark (strategy_id, mark_date, run_mode)
     )`);
 
   await migrateProvenance(pool);
@@ -282,13 +327,227 @@ async function loadSeries(pool) {
 }
 
 /**
- * Decide and record for one date. Entry/exit price is the NEXT bar's open,
- * matching the backtest's T+1 execution convention exactly.
+ * Fingerprint of the data the decision was made from. Stored on the plan so a
+ * later reader can tell whether the plan was produced from the data that
+ * existed at plan time, rather than taking the timestamp's word for it.
+ */
+function snapshotHash(ctx) {
+  let bars = 0, conc = 0;
+  for (const s of ctx.series.values()) {
+    for (let i = 0; i < s.close.length; i++) {
+      if (s.close[i] !== null) bars++;
+      if (s.dn0[i] !== null) conc++;
+    }
+  }
+  return crypto.createHash('sha256')
+    .update(JSON.stringify({ lastDate: ctx.tradingDates[ctx.tradingDates.length - 1], n: ctx.tradingDates.length, tickers: ctx.series.size, bars, conc }))
+    .digest('hex').slice(0, 16);
+}
+
+/**
+ * PLAN — decide, and write the intention down WITHOUT any price from the
+ * execution bar (review P0.3).
  *
- * @param {'LIVE'|'REPLAY'} runMode - stamped on every row this writes. REPLAY
- *   rows are excluded from every forward statistic; see migrateProvenance.
+ * The point is that the plan is frozen before the execution price is observable
+ * anywhere in this system. `decideFor` below cannot demonstrate that: it reads
+ * `open[i + 1]` in the same pass that makes the decision, so its output is only
+ * ever produced once the execution bar has already landed. That is a delayed
+ * replay, however honest the ranking inputs are.
+ *
+ * HONEST LIMIT OF THIS SETUP. We hold end-of-day data only. The T+1 open does
+ * not enter idx_stock_prices until that evening's pull, so `fill` necessarily
+ * runs the following night, and no real intraday slippage, queue position or
+ * broker rejection can be measured. What IS established is the thing the review
+ * asked for: the decision existed, in the database, before the price that
+ * executes it was knowable. Everything beyond that needs a live feed and a
+ * broker, and this system has neither.
+ */
+async function cmdPlan(pool, ctx, quiet) {
+  const { tradingDates, series, ihsgClose, ihsgSma } = ctx;
+  const i = tradingDates.length - 1;              // the latest COMPLETE bar
+  const asOf = tradingDates[i];
+  const nowSql = new Date().toISOString().slice(0, 19).replace('T', ' ');
+
+  const [dup] = await pool.query(
+    'SELECT id, status FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?', [STRATEGY_ID, asOf]);
+  if (dup.length) return { skipped: `plan for ${asOf} already exists (${dup[0].status}) — never recomputed` };
+
+  const [last] = await pool.query(
+    'SELECT MAX(as_of_date) d FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=?', [STRATEGY_ID, 'LIVE']);
+  if (last[0].d) {
+    const lastIdx = ctx.dateIdx.get(toDateStr(last[0].d));
+    if (lastIdx !== undefined && i - lastIdx < REBAL_BARS) {
+      return { skipped: `no decision due — ${i - lastIdx}/${REBAL_BARS} trading days since ${toDateStr(last[0].d)}` };
+    }
+  }
+
+  // Holdings come from FILLED positions only. A plan that has not executed yet
+  // is not a holding, and treating it as one would let an unfilled intention
+  // silently become part of the next decision's starting book.
+  const [openRows] = await pool.query(
+    'SELECT ticker FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
+    [STRATEGY_ID, 'OPEN', 'LIVE']);
+
+  const d = sb.targetBook({
+    series, i, ihsgClose, ihsgSma, currentHoldings: openRows.map(r => r.ticker), opts: PARAMS,
+  });
+
+  // Decision-time reference price, for implementation shortfall at fill. This is
+  // the last price the decision could possibly have seen — bar i's close.
+  const reference = {};
+  for (const t of d.target) {
+    const s = series.get(t);
+    if (s && s.close[i] > 0) reference[t] = s.close[i];
+  }
+
+  await pool.query(
+    `INSERT INTO ft_strategy_plan
+       (strategy_id, as_of_date, run_mode, generated_at, data_snapshot_hash, strategy_hash, code_commit,
+        exposure, reason, eligible, vetoed, target_json, reference_json, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'PLANNED')`,
+    [STRATEGY_ID, asOf, 'LIVE', nowSql, snapshotHash(ctx), STRATEGY_HASH, CODE_COMMIT,
+     d.exposure, d.reason, d.eligible, d.vetoedCount, JSON.stringify(d.target), JSON.stringify(reference)]);
+
+  if (!quiet) {
+    console.log(`PLAN  ${asOf}  ${d.reason}`);
+    console.log(`  eligible ${d.eligible}, vetoed ${d.vetoedCount}`);
+    console.log(`  book: ${d.target.length ? d.target.join(', ') : '(flat)'}`);
+    console.log('  status PLANNED — no execution price read. Run `fill` once the next bar lands.');
+  }
+  return { asOf, target: d.target, exposure: d.exposure };
+}
+
+/**
+ * FILL — execute PLANNED books whose execution bar has since arrived.
+ *
+ * Reads prices for the first trading bar strictly after the plan's as_of_date,
+ * which is robust to holidays in a way a stored calendar date would not be. The
+ * plan itself is never recomputed here; only its execution is recorded.
+ */
+async function cmdFill(pool, ctx, quiet) {
+  const { tradingDates, dateIdx, series } = ctx;
+  const nowSql = new Date().toISOString().slice(0, 19).replace('T', ' ');
+  const [plans] = await pool.query(
+    `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND status=? ORDER BY as_of_date`,
+    [STRATEGY_ID, 'LIVE', 'PLANNED']);
+
+  let executed = 0, opened = 0, closed = 0, missed = 0, waiting = 0;
+  let shortfallSum = 0, shortfallN = 0;
+
+  for (const p of plans) {
+    const asOf = toDateStr(p.as_of_date);
+    const i = dateIdx.get(asOf);
+    if (i === undefined) continue;
+    const execI = i + 1;
+    if (execI >= tradingDates.length) { waiting++; continue; }   // genuinely not knowable yet
+
+    const target = JSON.parse(p.target_json || '[]');
+    const reference = JSON.parse(p.reference_json || '{}');
+    const tset = new Set(target);
+    const exposure = Number(p.exposure);
+
+    const [openRows] = await pool.query(
+      'SELECT ticker, entry_price, entry_date FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
+      [STRATEGY_ID, 'OPEN', 'LIVE']);
+
+    for (const row of openRows) {
+      if (tset.has(row.ticker)) continue;
+      const px = exec.sellFill(series.get(row.ticker), execI);
+      if (px === null) { missed++; continue; }        // keep holding, retry next plan (review P0.1)
+      const entry = Number(row.entry_price);
+      const gross = ((px - entry) / entry) * 100;
+      await pool.query(
+        `UPDATE ft_strategy_positions SET status='CLOSED', exit_date=?, exit_price=?, exit_reason=?,
+                gross_pct=?, net_pct=?, execution_observed_at=?
+          WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=?`,
+        [tradingDates[execI], px, exposure === 0 ? 'REGIME_FLAT' : 'REBALANCE',
+         gross.toFixed(4), (gross - (BUY_COST + SELL_COST) * 100).toFixed(4), nowSql,
+         STRATEGY_ID, row.ticker, toDateStr(row.entry_date), 'LIVE']);
+      closed++;
+    }
+
+    const heldNow = new Set(openRows.filter(r => tset.has(r.ticker)).map(r => r.ticker));
+    for (const t of target) {
+      if (heldNow.has(t)) continue;
+      const px = exec.buyFill(series.get(t), execI);
+      if (px === null) { missed++; continue; }
+      // Implementation shortfall: what the decision saw vs what it paid.
+      if (reference[t] > 0) { shortfallSum += (px - reference[t]) / reference[t]; shortfallN++; }
+      await pool.query(
+        `INSERT IGNORE INTO ft_strategy_positions
+           (strategy_id, ticker, entry_date, entry_price, weight,
+            run_mode, decision_date, decision_created_at, data_available_at, execution_observed_at,
+            strategy_hash, code_commit)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [STRATEGY_ID, t, tradingDates[execI], px, (1 / Math.max(target.length, 1)).toFixed(5),
+         'LIVE', asOf, p.generated_at, p.generated_at, nowSql, STRATEGY_HASH, CODE_COMMIT]);
+      opened++;
+    }
+
+    await pool.query(
+      `INSERT IGNORE INTO ft_strategy_log
+         (strategy_id, as_of_date, exposure, reason, eligible, vetoed, n_target, opened, closed, target_json,
+          run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [STRATEGY_ID, asOf, exposure, p.reason, p.eligible, p.vetoed, target.length, opened, closed,
+       p.target_json, 'LIVE', p.generated_at, p.generated_at, STRATEGY_HASH, CODE_COMMIT]);
+
+    await pool.query(
+      `UPDATE ft_strategy_plan SET status='EXECUTED', executed_at=?, execution_date=? WHERE id=?`,
+      [nowSql, tradingDates[execI], p.id]);
+    executed++;
+  }
+
+  if (!quiet) {
+    console.log(`FILL  executed ${executed} plan(s)   opened ${opened}, closed ${closed}, no-fill ${missed}`);
+    if (waiting) console.log(`      ${waiting} plan(s) still awaiting an execution bar — correct, not an error`);
+    if (shortfallN) console.log(`      implementation shortfall ${(shortfallSum / shortfallN * 100).toFixed(3)}% mean (decision close -> execution open)`);
+    if (!executed && !waiting) console.log('      nothing to do.');
+  }
+  return { executed, opened, closed, missed, waiting };
+}
+
+/** MARK — record today's net asset value so the LIVE equity curve is observed, not reconstructed. */
+async function cmdMark(pool, ctx, quiet) {
+  const { tradingDates, series } = ctx;
+  const i = tradingDates.length - 1;
+  const [openRows] = await pool.query(
+    'SELECT ticker, entry_price, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
+    [STRATEGY_ID, 'OPEN', 'LIVE']);
+
+  let mtm = 0;
+  const unmarkable = [];
+  for (const p of openRows) {
+    const px = exec.markPrice(series.get(p.ticker), i);
+    if (px === null) { unmarkable.push(p.ticker); continue; }
+    mtm += ((px - Number(p.entry_price)) / Number(p.entry_price)) * Number(p.weight);
+  }
+
+  await pool.query(
+    `INSERT INTO ft_strategy_nav (strategy_id, mark_date, run_mode, open_positions, unrealised_pct, unmarkable)
+     VALUES (?,?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE open_positions=VALUES(open_positions), unrealised_pct=VALUES(unrealised_pct), unmarkable=VALUES(unmarkable)`,
+    [STRATEGY_ID, tradingDates[i], 'LIVE', openRows.length, (mtm * 100).toFixed(4), unmarkable.join(',') || null]);
+
+  if (!quiet) {
+    console.log(`MARK  ${tradingDates[i]}   ${openRows.length} open   unrealised ${(mtm * 100).toFixed(2)}% (gross)`);
+    if (unmarkable.length) console.log(`      unmarkable (no price found at all): ${unmarkable.join(', ')}`);
+  }
+  return { openPositions: openRows.length, unrealisedPct: mtm * 100, unmarkable };
+}
+
+/**
+ * Decide AND execute in one pass. This is the REPLAY path and only the replay
+ * path: collapsing the two stages is exactly what makes replay replay. The LIVE
+ * lifecycle goes through cmdPlan then cmdFill so the decision is provably frozen
+ * before its execution price is observable (review P0.3).
+ *
+ * @param {'REPLAY'} runMode
  */
 async function decideFor(pool, ctx, i, quiet, runMode) {
+  if (runMode !== 'REPLAY') {
+    throw new Error('decideFor is the replay path only — LIVE must use cmdPlan/cmdFill so the plan is frozen before execution (review P0.3)');
+  }
   const { tradingDates, series, ihsgClose, ihsgSma } = ctx;
   const asOf = tradingDates[i];
   const execI = i + 1;
@@ -545,40 +804,38 @@ async function main() {
     return;
   }
 
-  const i = o.date ? ctx.dateIdx.get(o.date) : lastI;
-  if (i === undefined) { console.error(`Date ${o.date} is not a trading date on the IHSG axis`); process.exit(1); }
-
-  // REBALANCE CADENCE IS OWNED BY THIS SCRIPT, NOT BY THE CRON SCHEDULE.
-  // The frozen configuration rebalances every REBAL_BARS trading days. If the
-  // cadence were left to however often cron happens to fire, a weekly cron would
-  // silently run a weekly-rebalance strategy — a different strategy from the one
-  // EXP-017 tested, with different turnover and different costs. Self-throttling
-  // here means the schedule can be as frequent as you like (daily is best: a
-  // failed run is simply retried tomorrow) without changing what is being tested.
-  // An explicit --date overrides, for backfilling a specific decision.
-  if (!o.date) {
-    const [last] = await pool.query(
-      'SELECT MAX(as_of_date) AS d FROM ft_strategy_log WHERE strategy_id=? AND run_mode=?', [STRATEGY_ID, 'LIVE']);
-    if (last[0].d) {
-      const lastIdx = ctx.dateIdx.get(toDateStr(last[0].d));
-      if (lastIdx !== undefined) {
-        const elapsed = i - lastIdx;
-        if (elapsed < REBAL_BARS) {
-          console.log(`${ctx.tradingDates[i]}: no decision due — ${elapsed}/${REBAL_BARS} trading days since ${toDateStr(last[0].d)}.`);
-          console.log(`Next decision in ${REBAL_BARS - elapsed} trading day(s). Nothing written.`);
-          await pool.end();
-          return;
-        }
-      }
-    }
+  // LIFECYCLE (review P0.3). `plan` freezes the decision; `fill` executes any
+  // plan whose execution bar has since landed; `mark` records the NAV.
+  //
+  // ORDER MATTERS in the daily run: fill BEFORE plan. Filling settles the
+  // previous plan into real positions, so the new plan sees the true holdings.
+  // Planning first would decide against a stale book.
+  //
+  // REBALANCE CADENCE IS OWNED BY THIS SCRIPT, NOT BY THE CRON SCHEDULE. The
+  // frozen configuration rebalances every REBAL_BARS trading days. If the cadence
+  // were left to however often cron fires, a weekly cron would silently run a
+  // weekly-rebalance strategy -- a different strategy from the one EXP-017
+  // tested, with different turnover and different costs. cmdPlan self-throttles,
+  // so the schedule can be as frequent as you like without changing what is
+  // being tested.
+  if (o.cmd === 'fill') {
+    await cmdFill(pool, ctx, false);
+  } else if (o.cmd === 'plan') {
+    const r = await cmdPlan(pool, ctx, false);
+    if (r.skipped) console.log(r.skipped);
+  } else if (o.cmd === 'mark') {
+    await cmdMark(pool, ctx, false);
+  } else {
+    // Default: the whole daily cycle, in the only order that is correct.
+    await cmdFill(pool, ctx, false);
+    const r = await cmdPlan(pool, ctx, false);
+    if (r.skipped) console.log(r.skipped);
+    await cmdMark(pool, ctx, false);
   }
-
-  const r = await decideFor(pool, ctx, i, false, 'LIVE');
-  if (r.skipped) console.log(`${ctx.tradingDates[i]}: ${r.skipped}`);
   await pool.end();
 }
 
-module.exports = { periodReturns, STRATEGY_HASH };
+module.exports = { periodReturns, snapshotHash, cmdPlan, cmdFill, cmdMark, STRATEGY_HASH };
 
 if (require.main === module) {
   main().catch(e => { console.error('FATAL', e); process.exit(1); });

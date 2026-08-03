@@ -54,13 +54,64 @@ const CHECKS = [
     why: 'Feeds paper_trader.py. When it goes stale the paper trader still runs and still reports zero trades, which reads as a quiet market rather than a broken pipeline.' },
 ];
 
-/** Trading days between two dates, using the IHSG calendar as the authority. */
-async function tradingDayLag(pool, fromDate) {
-  const [r] = await pool.query(
-    'SELECT COUNT(*) AS n FROM idx_ihsg_history WHERE date > ? AND date <= (SELECT MAX(date) FROM idx_ihsg_history)',
-    [fromDate]
-  );
-  return Number(r[0].n) || 0;
+/**
+ * Trading days between `fromDate` and the reference bar, using the IHSG
+ * calendar to skip weekends and IDX holidays.
+ *
+ * FIXED 2026-08-03. This used to compare every table against
+ * `(SELECT MAX(date) FROM idx_ihsg_history)` — including the `ihsg` check
+ * itself, which therefore compared MAX(date) with MAX(date) and returned 0 no
+ * matter how stale the table was. The one check whose own comment says it
+ * exists because "idx_ihsg_history silently went stale for a week in July 2026"
+ * was structurally incapable of detecting that.
+ *
+ * It was also wrong for the other tables, in the dangerous direction: with the
+ * axis frozen, every table is fresh relative to a frozen yardstick, so a total
+ * ingest outage reports all-green.
+ *
+ * `referenceDate` is now passed in by the caller — the freshest date ANY
+ * monitored feed has produced — so one dead feed cannot make the others look
+ * healthy, and `absoluteStaleness` below measures that reference against the
+ * actual clock so a complete outage is still caught.
+ */
+async function tradingDayLag(pool, fromDate, referenceDate) {
+  const [[cal]] = await pool.query('SELECT MAX(date) AS d FROM idx_ihsg_history');
+  const maxCal = cal.d ? (cal.d instanceof Date ? cal.d.toISOString().slice(0, 10) : String(cal.d).slice(0, 10)) : null;
+
+  // The calendar can only speak for dates it actually contains. If the
+  // reference has moved past the calendar's own last row, the calendar is
+  // itself behind, and counting rows inside a window it cannot see returns 0 --
+  // which is precisely how the ihsg check reported "fresh" while stale. The
+  // portion beyond the calendar is counted in weekdays instead.
+  const calEnd = (maxCal && maxCal < referenceDate) ? maxCal : referenceDate;
+  let lag = 0;
+  if (fromDate < calEnd) {
+    const [r] = await pool.query(
+      'SELECT COUNT(*) AS n FROM idx_ihsg_history WHERE date > ? AND date <= ?', [fromDate, calEnd]);
+    lag = Number(r[0].n) || 0;
+  }
+  const beyond = fromDate > calEnd ? fromDate : calEnd;
+  return lag + weekdaysSince(beyond, new Date(`${referenceDate}T12:00:00Z`));
+}
+
+/**
+ * Weekdays between a date and today. Deliberately does NOT consult the IHSG
+ * calendar: this is the check that has to work when that calendar is the thing
+ * that has stopped. It over-counts across an IDX holiday, which is the safe
+ * direction — a false "stale" prompts a look, a false "fresh" does not.
+ */
+function weekdaysSince(dateStr, today = new Date()) {
+  const from = new Date(`${dateStr}T00:00:00Z`);
+  const to = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  if (!(from < to)) return 0;
+  let n = 0;
+  const d = new Date(from);
+  while (d < to) {
+    d.setUTCDate(d.getUTCDate() + 1);
+    const day = d.getUTCDay();
+    if (day !== 0 && day !== 6) n++;
+  }
+  return n;
 }
 
 /**
@@ -68,8 +119,39 @@ async function tradingDayLag(pool, fromDate) {
  * calendar days — a Monday check must not report the weekend as two days of
  * staleness.
  */
-async function dataFreshness(pool) {
+/**
+ * Absolute tolerance for the reference feed itself, in weekdays. Generous
+ * enough to ride out a long IDX holiday, tight enough that a dead ingest is
+ * caught within a week rather than the two months the signal pipeline managed.
+ */
+const MAX_REFERENCE_WEEKDAYS = 5;
+
+async function dataFreshness(pool, today = new Date()) {
+  // The reference bar is the freshest date ANY monitored feed has produced, so
+  // one dead feed cannot make the rest look healthy by freezing the yardstick.
+  let reference = null;
+  for (const c of CHECKS) {
+    try {
+      const [r] = await pool.query(`SELECT MAX(${c.col}) AS d FROM ${c.table}`);
+      if (!r[0].d) continue;
+      const d = r[0].d instanceof Date ? r[0].d.toISOString().slice(0, 10) : String(r[0].d).slice(0, 10);
+      if (reference === null || d > reference) reference = d;
+    } catch { /* a broken table is reported per-check below */ }
+  }
+
   const out = [];
+  if (reference !== null) {
+    const drift = weekdaysSince(reference, today);
+    out.push({
+      key: 'ingest', table: '(all monitored feeds)', critical: true,
+      why: 'Measured against the clock, not against another table. Every per-table lag below is relative to this bar, so if this is stale everything else is fresh relative to a frozen yardstick and a total outage reads as all-green.',
+      latest: reference, lagTradingDays: drift, maxLag: MAX_REFERENCE_WEEKDAYS, rows: null,
+      ok: drift <= MAX_REFERENCE_WEEKDAYS,
+      detail: drift <= MAX_REFERENCE_WEEKDAYS ? 'fresh'
+        : `no feed has produced data for ${drift} weekdays (tolerance ${MAX_REFERENCE_WEEKDAYS})`,
+    });
+  }
+
   for (const c of CHECKS) {
     try {
       const [r] = await pool.query(`SELECT MAX(${c.col}) AS d, COUNT(*) AS n FROM ${c.table}`);
@@ -79,7 +161,7 @@ async function dataFreshness(pool) {
         continue;
       }
       const d = latest instanceof Date ? latest.toISOString().slice(0, 10) : String(latest).slice(0, 10);
-      const lag = await tradingDayLag(pool, d);
+      const lag = await tradingDayLag(pool, d, reference);
       out.push({ key: c.key, table: c.table, critical: c.critical, why: c.why,
                  latest: d, lagTradingDays: lag, maxLag: c.maxLag, rows: Number(r[0].n),
                  ok: lag <= c.maxLag,
@@ -156,7 +238,7 @@ async function jobHealth(pool) {
  */
 async function signalState(pool, opts = {}) {
   const reasons = [];
-  const fresh = await dataFreshness(pool);
+  const fresh = await dataFreshness(pool, opts.today || new Date());
 
   for (const f of fresh) {
     if (f.ok) continue;
@@ -188,4 +270,4 @@ async function signalState(pool, opts = {}) {
   };
 }
 
-module.exports = { CHECKS, dataFreshness, recordJobRun, jobHealth, signalState, ensureTable };
+module.exports = { CHECKS, dataFreshness, recordJobRun, jobHealth, signalState, ensureTable, weekdaysSince, MAX_REFERENCE_WEEKDAYS };
