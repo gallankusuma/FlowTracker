@@ -39,6 +39,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const mysql = require('mysql2/promise');
+const exec = require('./modules/execution');
 const sb = require('./modules/strategy_book');
 
 const DB = {
@@ -121,22 +122,23 @@ function replay(ctx, firstI, lastI, params) {
   let cash = 1.0;
   const held = new Map();
   const decisions = [], equity = [];
-  let trades = 0, costPaid = 0, noFill = 0;
+  let trades = 0, costPaid = 0, noFill = 0, sellNoFill = 0;
 
   for (let i = firstI; i <= lastI; i += REBAL_BARS) {
     const execI = i + 1;
     if (execI > lastI + 1) break;
     const d = sb.targetBook({ series, i, ihsgClose, ihsgSma, currentHoldings: [...held.keys()], opts: params });
 
-    let pv = cash;
-    for (const [t, u] of held) { const px = series.get(t).open[execI]; if (px > 0) pv += u * px; }
+    // Halted holdings mark off their last real close, not zero (review P0.1).
+    const pv = cash + exec.markToMarket(held, series, execI).value;
 
     const tset = new Set(d.target);
     const closed = [], opened = [];
     for (const [t, u] of [...held]) {
       if (tset.has(t)) continue;
-      const px = series.get(t).open[execI];
-      if (!(px > 0)) { held.delete(t); continue; }
+      // A seller who cannot sell still owns the shares (review P0.1).
+      const px = exec.sellFill(series.get(t), execI);
+      if (px === null) { sellNoFill++; continue; }
       const fee = u * px * SELL_COST;
       cash += u * px - fee; costPaid += fee; trades++;
       closed.push(t); held.delete(t);
@@ -152,8 +154,7 @@ function replay(ctx, firstI, lastI, params) {
       opened.push(t);
     }
 
-    let mv = cash;
-    for (const [t, u] of held) { const px = series.get(t).open[execI]; if (px > 0) mv += u * px; }
+    const mv = cash + exec.markToMarket(held, series, execI).value;
     equity.push(r6(mv));
     decisions.push({
       date: tradingDates[i], exposure: d.exposure, eligible: d.eligible,
@@ -173,13 +174,13 @@ function replay(ctx, firstI, lastI, params) {
 
   return {
     decisions, equity,
-    trades, noFill,
+    trades, noFill, sellNoFill,
     costPaid: r6(costPaid),
     finalEquity: r6(final),
     maxDrawdown: r6(mdd),
     cagr: r6(Math.pow(final, 1 / years) - 1),
     hash: crypto.createHash('sha256')
-      .update(JSON.stringify({ decisions, equity, trades, costPaid: r6(costPaid), finalEquity: r6(final) }))
+      .update(JSON.stringify({ decisions, equity, trades, noFill, sellNoFill, costPaid: r6(costPaid), finalEquity: r6(final) }))
       .digest('hex').slice(0, 32),
   };
 }
@@ -198,7 +199,7 @@ function replay(ctx, firstI, lastI, params) {
   console.log(`Window ${ctx.tradingDates[firstI]} .. ${ctx.tradingDates[lastI]}   universe ${ctx.series.size}\n`);
 
   const run = replay(ctx, firstI, lastI, PARAMS);
-  console.log(`  decisions ${run.decisions.length}  trades ${run.trades}  noFill ${run.noFill}`);
+  console.log(`  decisions ${run.decisions.length}  trades ${run.trades}  buy NO_FILL ${run.noFill}  sell NO_FILL ${run.sellNoFill}`);
   console.log(`  finalEquity ${run.finalEquity}  maxDD ${(run.maxDrawdown * 100).toFixed(2)}%  cagr ${(run.cagr * 100).toFixed(2)}%`);
   console.log(`  hash ${run.hash}\n`);
 
@@ -220,7 +221,8 @@ function replay(ctx, firstI, lastI, params) {
     check('decision count matches', g.decisions.length === run.decisions.length,
       `${g.decisions.length} vs ${run.decisions.length}`);
     check('trade count matches', g.trades === run.trades, `${g.trades} vs ${run.trades}`);
-    check('NO_FILL count matches', g.noFill === run.noFill, `${g.noFill} vs ${run.noFill}`);
+    check('buy NO_FILL count matches', g.noFill === run.noFill, `${g.noFill} vs ${run.noFill}`);
+    check('sell NO_FILL count matches', g.sellNoFill === run.sellNoFill, `${g.sellNoFill} vs ${run.sellNoFill}`);
     check('costs paid match', g.costPaid === run.costPaid, `${g.costPaid} vs ${run.costPaid}`);
     check('final equity matches', g.finalEquity === run.finalEquity, `${g.finalEquity} vs ${run.finalEquity}`);
     check('max drawdown matches', g.maxDrawdown === run.maxDrawdown, `${g.maxDrawdown} vs ${run.maxDrawdown}`);

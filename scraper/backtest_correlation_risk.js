@@ -40,6 +40,7 @@
 require('dotenv').config();
 
 const mysql = require('mysql2/promise');
+const exec = require('./modules/execution');
 const stats = require('./modules/statistics');
 
 const DB = {
@@ -345,6 +346,7 @@ async function main() {
   // ── Simulation ────────────────────────────────────────────────────────────
   function simulate({ rebalBars, buffer, variant, lo, hi }) {
     const loI = lo === undefined ? firstI : lo, hiI = hi === undefined ? lastI : hi;
+    let sellNoFill = 0;
     let cash = 1.0;
     const held = new Map();
     const curve = [];
@@ -392,8 +394,10 @@ async function main() {
 
       for (const [t, u] of [...held]) {
         if (targetSet.has(t)) continue;
-        const px = series.get(t).open[execI];
-        if (px > 0) cash += u * px * (1 - SELL_COST);
+        // A seller who cannot sell still owns the shares (review P0.1).
+        const px = exec.sellFill(series.get(t), execI);
+        if (px === null) { sellNoFill++; continue; }
+        cash += u * px * (1 - SELL_COST);
         held.delete(t);
       }
 

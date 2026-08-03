@@ -43,6 +43,7 @@
 require('dotenv').config();
 
 const mysql = require('mysql2/promise');
+const exec = require('./modules/execution');
 const stats = require('./modules/statistics');
 const cs = require('./modules/cross_sectional');
 
@@ -195,7 +196,7 @@ async function main() {
     let cash = 1.0;
     const held = new Map(); // ticker -> units (value = units * price)
     const curve = [], curveDates = [];
-    let trades = 0, rebalances = 0, costPaid = 0;
+    let trades = 0, rebalances = 0, costPaid = 0, sellNoFill = 0;
 
     for (let i = loI; i <= hiI; i += rebalBars) {
       const xs = crossSection(i);
@@ -231,8 +232,10 @@ async function main() {
       // SELL everything not in target.
       for (const [t, units] of [...held]) {
         if (targetSet.has(t)) continue;
-        const p = series.get(t).open[execI];
-        if (p === null || !(p > 0)) { held.delete(t); continue; }
+        // A seller who cannot sell still owns the shares (review P0.1). This used
+        // to drop the position with no proceeds, pricing an untradeable exit at zero.
+        const p = exec.sellFill(series.get(t), execI);
+        if (p === null) { sellNoFill++; continue; }
         const proceeds = units * p * (1 - SELL_COST);
         costPaid += units * p * SELL_COST;
         cash += proceeds;
@@ -288,7 +291,7 @@ async function main() {
     return {
       total, cagr, mdd: maxDrawdown(curve), vol: perYearVol,
       sharpeish: perYearVol > 0 ? cagr / perYearVol : null,
-      trades, rebalances, costPaid,
+      trades, rebalances, costPaid, sellNoFill,
       turnoverPerRebal: rebalances ? trades / (2 * rebalances * opts.positions) : null,
       curve, curveDates,
     };

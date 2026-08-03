@@ -28,6 +28,7 @@
 require('dotenv').config();
 
 const mysql = require('mysql2/promise');
+const exec = require('./modules/execution');
 const sb = require('./modules/strategy_book');
 
 const DB = {
@@ -123,7 +124,7 @@ async function main() {
   const held = new Map();          // ticker -> {lots, entryPx, entryDate}
   const equityCurve = [];
   const closedTrades = [];
-  let decisions = 0, flatDecisions = 0, totalFees = 0, lotDragTotal = 0;
+  let decisions = 0, flatDecisions = 0, totalFees = 0, lotDragTotal = 0, sellNoFill = 0;
   let peak = o.capital, maxDD = 0, ddStart = null, worstDDWindow = null;
 
   const equityAt = (i, field) => {
@@ -148,8 +149,10 @@ async function main() {
     for (const t of d.dropped) {
       const p = held.get(t);
       if (!p) continue;
-      const px = series.get(t).open[execI];
-      if (!(px > 0)) { held.delete(t); continue; }
+      // A seller who cannot sell still owns the shares (review P0.1) -- the
+      // position stays in the book and is retried at the next rebalance.
+      const px = exec.sellFill(series.get(t), execI);
+      if (px === null) { sellNoFill++; lines.push(`    HOLD  ${t.padEnd(5)} no fill -- not tradeable at the open`); continue; }
       const gross = p.lots * LOT * px;
       const fee = gross * (FEE_SELL + SLIP);
       cash += gross - fee; totalFees += fee;

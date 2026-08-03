@@ -50,6 +50,7 @@ const mysql = require('mysql2/promise');
 const stats = require('./modules/statistics');
 const cs = require('./modules/cross_sectional');
 const sb = require('./modules/strategy_book');
+const exec = require('./modules/execution');
 
 const DB = {
   host: process.env.DB_HOST || 'localhost',
@@ -217,7 +218,7 @@ async function main() {
     const held = new Map();
     const curve = [];
     const rng = cs.mulberry32(RANDOM_SEED + rebalBars * 100 + buffer);
-    let vetoed = 0, shortfall = 0, periods = 0, noFill = 0, fills = 0;
+    let vetoed = 0, shortfall = 0, periods = 0, noFill = 0, fills = 0, sellNoFill = 0;
 
     for (let i = loI; i <= hiI; i += rebalBars) {
       const execI = i + 1;
@@ -248,15 +249,19 @@ async function main() {
       if (exposure > 0 && decision.target.length < opts.positions) shortfall++;
 
       let pv = cash;
-      for (const [t, u] of held) { const px = series.get(t).open[execI]; if (px > 0) pv += u * px; }
+      pv += exec.markToMarket(held, series, execI).value;   // halted holdings mark off their last close, not zero
 
       const target = decision.target;
       const targetSet = new Set(target);
 
       for (const [t, u] of [...held]) {
         if (targetSet.has(t)) continue;
-        const px = series.get(t).open[execI];
-        if (px > 0) cash += u * px * (1 - SELL_COST);
+        // A seller who cannot sell still owns the shares (review P0.1). This used
+        // to delete the position with no proceeds, which prices an untradeable
+        // exit at zero and makes it look free.
+        const px = exec.sellFill(series.get(t), execI);
+        if (px === null) { sellNoFill++; continue; }
+        cash += u * px * (1 - SELL_COST);
         held.delete(t);
       }
       const toBuy = target.filter(t => !held.has(t));
@@ -292,12 +297,13 @@ async function main() {
     const cagr = annualise(final - 1, hiI - loI);
     return { cagr, mdd: maxDrawdown(curve), vol, retVol: vol > 0 ? cagr / vol : null,
              vetoed, shortfallPct: periods ? shortfall / periods : 0,
-             noFill, fills, noFillPct: (fills + noFill) ? noFill / (fills + noFill) : 0 };
+             noFill, fills, sellNoFill,
+             noFillPct: (fills + noFill) ? noFill / (fills + noFill) : 0 };
   }
 
   function universeCagr(rebalBars, lo, hi) {
     const loI = lo === undefined ? firstI : lo, hiI = hi === undefined ? lastI : hi;
-    let cash = 1.0; const held = new Map();
+    let cash = 1.0; const held = new Map(); let sellNoFill = 0;
     for (let i = loI; i <= hiI; i += rebalBars) {
       const execI = i + 1;
       // The benchmark must use the SAME eligibility as the strategy, or the
@@ -308,12 +314,16 @@ async function main() {
       });
       if (xs.length < MIN_ELIGIBLE) continue;
       let pv = cash;
-      for (const [t, u] of held) { const px = series.get(t).open[execI]; if (px > 0) pv += u * px; }
+      pv += exec.markToMarket(held, series, execI).value;   // halted holdings mark off their last close, not zero
       const tset = new Set(xs.map(x => x.ticker));
       for (const [t, u] of [...held]) {
         if (tset.has(t)) continue;
-        const px = series.get(t).open[execI];
-        if (px > 0) cash += u * px * (1 - SELL_COST);
+        // A seller who cannot sell still owns the shares (review P0.1). This used
+        // to delete the position with no proceeds, which prices an untradeable
+        // exit at zero and makes it look free.
+        const px = exec.sellFill(series.get(t), execI);
+        if (px === null) { sellNoFill++; continue; }
+        cash += u * px * (1 - SELL_COST);
         held.delete(t);
       }
       const per = pv / tset.size;
@@ -345,6 +355,7 @@ async function main() {
       meanCagr: stats.mean(f('cagr')), meanMDD: stats.mean(f('mdd')),
       meanRetVol: stats.mean(f('retVol')), positive: rows.filter(r => r.excess > 0).length,
       shortfall: stats.mean(f('shortfallPct')), noFillPct: stats.mean(f('noFillPct')),
+      sellNoFill: stats.mean(f('sellNoFill')),
     };
   }
 
@@ -353,12 +364,12 @@ async function main() {
   console.log('='.repeat(112));
   console.log('FULL WINDOW — mean across 9 cells (median in brackets: EXP-015 showed means hide outlier cells)');
   console.log('='.repeat(112));
-  console.log('  variant                 CAGR   excess (median)    maxDD   ret/vol  +cells  under-filled  NO_FILL');
+  console.log('  variant                 CAGR   excess (median)    maxDD   ret/vol  +cells  under-filled  NO_FILL  sellNoFill');
   const full = {};
   for (const v of VARIANTS) {
     const s = score(v);
     full[v.key] = s;
-    console.log(`  ${v.key.padEnd(20)} ${pct(s.meanCagr)}  ${pct(s.meanExcess)} (${pct(s.medExcess)})  ${pct(s.meanMDD)}    ${s.meanRetVol.toFixed(2).padStart(5)}    ${String(s.positive).padStart(2)}/9   ${pct(s.shortfall, 1)}  ${pct(s.noFillPct, 2)}`);
+    console.log(`  ${v.key.padEnd(20)} ${pct(s.meanCagr)}  ${pct(s.meanExcess)} (${pct(s.medExcess)})  ${pct(s.meanMDD)}    ${s.meanRetVol.toFixed(2).padStart(5)}    ${String(s.positive).padStart(2)}/9   ${pct(s.shortfall, 1)}  ${pct(s.noFillPct, 2)}  ${(s.sellNoFill ?? 0).toFixed(1).padStart(7)}`);
   }
 
   console.log('\n' + '='.repeat(112));

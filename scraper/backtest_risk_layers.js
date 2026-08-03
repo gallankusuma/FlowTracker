@@ -44,6 +44,7 @@
 require('dotenv').config();
 
 const mysql = require('mysql2/promise');
+const exec = require('./modules/execution');
 const stats = require('./modules/statistics');
 
 const DB = {
@@ -209,7 +210,7 @@ async function main() {
     let cash = 1.0;
     const held = new Map(); // ticker -> { units, stop }
     const curve = [];
-    let trades = 0, stopExits = 0, flatPeriods = 0, periods = 0;
+    let trades = 0, stopExits = 0, flatPeriods = 0, periods = 0, sellNoFill = 0;
 
     const markValue = (i, priceField) => {
       let v = cash;
@@ -268,8 +269,9 @@ async function main() {
       // Sell everything not targeted.
       for (const [t, p] of [...held]) {
         if (targetSet.has(t)) continue;
-        const px = series.get(t).open[execI];
-        if (px === null || !(px > 0)) { held.delete(t); continue; }
+        // A seller who cannot sell still owns the shares (review P0.1).
+        const px = exec.sellFill(series.get(t), execI);
+        if (px === null) { sellNoFill++; continue; }
         cash += p.units * px * (1 - SELL_COST);
         held.delete(t); trades++;
       }
@@ -322,7 +324,7 @@ async function main() {
     for (let k = 1; k < curve.length; k++) rets.push(curve[k] / curve[k - 1] - 1);
     const vol = rets.length > 1 ? stats.stdDev(rets) * Math.sqrt(TRADING_DAYS_YEAR / rebalBars) : null;
     const cagr = annualise(final - 1, hiI - loI);
-    return { cagr, mdd: maxDrawdown(curve), vol, retVol: vol > 0 ? cagr / vol : null, trades, stopExits, flatPeriods, periods };
+    return { cagr, mdd: maxDrawdown(curve), vol, retVol: vol > 0 ? cagr / vol : null, trades, stopExits, flatPeriods, periods, sellNoFill };
   }
 
   function universeCagr(rebalBars, lo, hi) {
@@ -338,8 +340,9 @@ async function main() {
       const targetSet = new Set(xs.map(x => x.ticker));
       for (const [t, u] of [...held]) {
         if (targetSet.has(t)) continue;
-        const px = series.get(t).open[execI];
-        if (px > 0) cash += u * px * (1 - SELL_COST);
+        const px = exec.sellFill(series.get(t), execI);
+        if (px === null) continue;             // sell NO_FILL: keep holding (review P0.1)
+        cash += u * px * (1 - SELL_COST);
         held.delete(t);
       }
       const toBuy = [...targetSet].filter(t => !held.has(t));
@@ -422,8 +425,9 @@ async function main() {
       const targetSet = exposure === 0 ? new Set() : new Set(xs.map(x => x.ticker));
       for (const [t, u] of [...held]) {
         if (targetSet.has(t)) continue;
-        const px = series.get(t).open[execI];
-        if (px > 0) cash += u * px * (1 - SELL_COST);
+        const px = exec.sellFill(series.get(t), execI);
+        if (px === null) continue;             // sell NO_FILL: keep holding (review P0.1)
+        cash += u * px * (1 - SELL_COST);
         held.delete(t);
       }
       const toBuy = [...targetSet].filter(t => !held.has(t));
