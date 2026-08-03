@@ -25,6 +25,7 @@ const { analyzeFactorContributions, getFactorStats } = require('./awo_analyzer')
 const { optimizeWeights, saveOptimizationResult, loadOptimizationResult, rescoreSignal, computeWinRate } = require('./awo_optimizer');
 const { detectRegime, getRegimeWeights, getRegimeHistory, REGIME_WEIGHTS } = require('./awo_regime');
 const tradePolicy = require('./modules/trade_policy');
+const systemHealth = require('./modules/system_health');
 const fs = require('fs');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -2966,6 +2967,40 @@ app.post('/api/cron/run', requireAdminKey, async (req, res) => {
 // GET /api/cron/status — Check cron status
 app.get('/api/cron/status', (req, res) => {
   res.json({ ...cronStatus, auxRefreshStatus });
+});
+
+// ─── System health & the signal kill switch (2026-08-03) ─────────────────────
+// auxRefreshStatus above is in-process and lost on restart, and it depends on a
+// job surviving long enough to report itself. `signal_engine.py hk` failed 45
+// consecutive times with a SyntaxError and nothing here noticed, because a job
+// that crashes cannot report that it crashed. These two routes derive health
+// from the DATA instead, which cannot lie about whether it arrived.
+app.get('/api/system/health', async (req, res) => {
+  try {
+    const [fresh, jobs] = await Promise.all([
+      systemHealth.dataFreshness(pool),
+      systemHealth.jobHealth(pool),
+    ]);
+    res.json({ ok: true, freshness: fresh, jobs, auxRefreshStatus, checkedAt: new Date().toISOString() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// The kill switch. DISABLED means produce no actionable output — a warning shown
+// beside a signal still reads as a signal.
+app.get('/api/system/signal-state', async (req, res) => {
+  try {
+    const state = await systemHealth.signalState(pool, {
+      expectedModelVersion: AWO_MODEL_VERSION,
+      actualModelVersion: AWO_MODEL_VERSION,
+    });
+    res.json(state);
+  } catch (e) {
+    // Fail CLOSED: if the health check itself is broken we cannot claim the
+    // inputs are sound, so signals are disabled rather than assumed fine.
+    res.status(500).json({ enabled: false, reasons: [`HEALTH_CHECK_FAILED:${e.message}`], checkedAt: new Date().toISOString() });
+  }
 });
 
 // GET /api/indexalpha/pull — Pull broker summary for specific stock(s) via Index Alpha
