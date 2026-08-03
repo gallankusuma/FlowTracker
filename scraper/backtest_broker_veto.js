@@ -175,7 +175,14 @@ async function main() {
     s.dn0[i] = Math.abs(x) > DN_BOUND ? Math.sign(x) * DN_BOUND : x;  // same clip as EXP-016
     s.nConc++;
   }
-  for (const [t, s] of series) if (s.placed < 400 || s.nConc < 200) series.delete(t);
+  // NO UNIVERSE FILTER HERE. Eligibility is decided per decision bar inside
+  // strategy_book.crossSection(), from data through bar i only. This loader
+  // used to run `if (s.placed < 400 || s.nConc < 200) series.delete(t)` --
+  // lifetime counts over the WHOLE sample, so a ticker entered the 2024
+  // universe only if the code already knew it would eventually reach 400 bars
+  // and 200 broker observations by the end of the data (review P0.2). Deleting
+  // here also made strategy_book.js's "ALL INPUTS ARE AS-OF" header vacuous:
+  // the Map arrived pre-filtered with future knowledge before the module ran.
 
   const concIdx = concRows.map(r => dateIdx.get(toDateStr(r.data_date))).filter(v => v !== undefined);
   const concStart = Math.min(...concIdx);
@@ -389,13 +396,26 @@ async function main() {
   const beatsRandom = best.meanExcess > ctrl.meanExcess;
   const sp = split[best.key], spB = split['BASE (no veto)'];
   const bothHalves = sp.p1.meanExcess > spB.p1.meanExcess && sp.p2.meanExcess > spB.p2.meanExcess;
+  // Beating BASE in a half where BOTH lose to the benchmark is not evidence of
+  // edge — it is a smaller loss. This second, stricter test asks whether the
+  // variant actually made money relative to the benchmark in each half, which
+  // is the claim a reader takes away from "holds in both halves". Added
+  // 2026-08-03 after the P0.2 as-of universe re-run: the loose test said YES
+  // while P1 excess was -6.84%.
+  const positiveBothHalves = sp.p1.meanExcess > 0 && sp.p2.meanExcess > 0;
 
   console.log(`\n  beats BASE:              ${beatsBase ? 'YES' : 'no'}   (${pct(best.meanExcess - base.meanExcess)} of excess)`);
   console.log(`  beats RANDOM control:    ${beatsRandom ? 'YES' : 'no'}   (${pct(best.meanExcess - ctrl.meanExcess)})`);
-  console.log(`  beats BASE in BOTH halves: ${bothHalves ? 'YES' : 'no'}`);
-  console.log('\n  All three must be YES. Beating BASE alone proves nothing — removing candidates');
-  console.log('  changes concentration and turnover on its own, which is what RANDOM measures.');
-  console.log('  And a veto that only works in one half is the EXP-013 failure mode repeating.');
+  console.log(`  beats BASE in BOTH halves: ${bothHalves ? 'YES' : 'no'}   (P1 ${pct(sp.p1.meanExcess)} vs base ${pct(spB.p1.meanExcess)}, P2 ${pct(sp.p2.meanExcess)} vs base ${pct(spB.p2.meanExcess)})`);
+  console.log(`  POSITIVE excess in BOTH halves: ${positiveBothHalves ? 'YES' : 'no'}   <- the honest bar`);
+  console.log('\n  The first three test the mechanism; the fourth tests whether it made money.');
+  console.log('  Beating BASE alone proves nothing — removing candidates changes concentration');
+  console.log('  and turnover on its own, which is what RANDOM measures. And a veto that only');
+  console.log('  works in one half is the EXP-013 failure mode repeating.');
+  if (bothHalves && !positiveBothHalves) {
+    console.log('\n  NOTE: this variant beats BASE in both halves while still LOSING to the');
+    console.log('  benchmark in at least one of them. Read that as "less bad", not as "works".');
+  }
 
   if (opts.json) {
     require('fs').writeFileSync(opts.json, JSON.stringify({ full, split }, null, 2));

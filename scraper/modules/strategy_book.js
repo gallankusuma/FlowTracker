@@ -43,6 +43,13 @@ const DEFAULTS = {
   minAdv: 5e9,
   advWindow: 20,
   hiBars: 252,
+  // As-of replacements for the whole-sample screens the loaders used to apply
+  // (review P0.2). `placed >= 400 lifetime bars` becomes "enough real bars
+  // INSIDE the trailing hiBars window", and `nConc >= 200 lifetime broker
+  // observations` becomes "POSFRAC_60 is computable at this bar" — which is
+  // what the strategy actually needs and already tests via posfracMinReal.
+  minHiWindowBars: 200,
+  requirePosfrac: true,
   posfracWindow: 60,
   posfracMinReal: 35,
   regimeSma: 200,
@@ -92,17 +99,40 @@ function crossSection(series, i, opts) {
   const p = { ...DEFAULTS, ...(opts || {}) };
   const rows = [];
   for (const [ticker, s] of series) {
-    if (i < p.hiBars) continue;
     if (s.close[i] === null || s.close[i] === undefined) continue;
     const adv = rollingMedian(s.value, i, p.advWindow);
     if (adv === null || adv < p.minAdv) continue;
-    let hi = -Infinity;
-    for (let j = i - p.hiBars + 1; j <= i; j++) {
+
+    // One pass for the 52-week high and the depth check. `realBars` counts only
+    // bars inside [i-hiBars+1, i], so it is causal by construction: nothing
+    // after `i` can change it.
+    //
+    // This replaces `if (i < p.hiBars) continue`, which tested a position on the
+    // shared IHSG date axis rather than the ticker's own history — wrong for any
+    // name that listed after the axis began, and unable to say anything at all
+    // about coverage gaps. It also replaces the loaders' `placed >= 400`
+    // lifetime screen, which asked whether a ticker would EVENTUALLY accumulate
+    // 400 bars by the end of the sample (review P0.2).
+    let hi = -Infinity, realBars = 0;
+    for (let j = Math.max(0, i - p.hiBars + 1); j <= i; j++) {
+      const c = s.close[j];
+      if (c !== null && c !== undefined) realBars++;
       const h = s.high[j];
       if (h !== null && h !== undefined && h > hi) hi = h;
     }
+    if (realBars < p.minHiWindowBars) continue;
     if (!(hi > 0)) continue;
-    rows.push({ ticker, hi52w: (s.close[i] / hi) * 100, posfrac: posfrac(s.dn0, i, p), vetoed: false });
+
+    // POSFRAC_60 needs posfracMinReal real dn0 readings inside the trailing
+    // window. Requiring it here is the as-of form of the loaders' lifetime
+    // `nConc >= 200`, and it matches this module's own documented universe
+    // ("enough concentration history for POSFRAC_60"). Without it a name with
+    // no broker data at all was eligible AND unvetoable — it could only ever
+    // be selected, never excluded.
+    const pf = posfrac(s.dn0, i, p);
+    if (p.requirePosfrac && pf === null) continue;
+
+    rows.push({ ticker, hi52w: (s.close[i] / hi) * 100, posfrac: pf, vetoed: false });
   }
   rows.sort((a, b) => b.hi52w - a.hi52w);
   rows.forEach((r, k) => { r.rank = k; });
@@ -147,13 +177,30 @@ function targetBook({ series, i, ihsgClose, ihsgSma, currentHoldings, opts }) {
   const held = currentHoldings || [];
   const xs = crossSection(series, i, p);
 
-  if (xs.length < p.minEligible) {
-    return { target: held.slice(), exposure: 1, reason: `INSUFFICIENT_UNIVERSE (${xs.length} < ${p.minEligible}) — book unchanged`,
-             vetoedCount: 0, eligible: xs.length, kept: held.slice(), added: [], dropped: [] };
-  }
-
+  // The regime is computed BEFORE the universe check, and deliberately so. It
+  // depends only on IHSG, so a failure to build a cross-section says nothing
+  // about it. This used to return `exposure: 1` on an insufficient universe
+  // without ever reading ihsgSma — meaning a broker-data outage would hold the
+  // book at full exposure through a bear market, with the one signal that did
+  // not need the missing data never consulted. Reachable in production: a stale
+  // idx_concentration nulls POSFRAC for every ticker at once.
   const belowSma = ihsgSma[i] !== null && ihsgSma[i] !== undefined && ihsgClose[i] < ihsgSma[i];
   const exposure = belowSma ? 0 : 1;
+
+  if (xs.length < p.minEligible) {
+    // Can't rank, so don't churn — but standing aside IS computable, so honour it.
+    return {
+      target: exposure === 0 ? [] : held.slice(),
+      exposure,
+      reason: exposure === 0
+        ? `INSUFFICIENT_UNIVERSE (${xs.length} < ${p.minEligible}) + REGIME_FLAT — stand aside`
+        : `INSUFFICIENT_UNIVERSE (${xs.length} < ${p.minEligible}) — book unchanged`,
+      vetoedCount: 0, eligible: xs.length,
+      kept: exposure === 0 ? [] : held.slice(),
+      added: [],
+      dropped: exposure === 0 ? held.slice() : [],
+    };
+  }
 
   const rank = new Map(xs.map(r => [r.ticker, r.rank]));
   const vetoed = new Set(xs.filter(r => r.vetoed).map(r => r.ticker));

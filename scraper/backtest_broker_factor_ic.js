@@ -177,7 +177,14 @@ async function main() {
     s.dnWin[i] = [clip(r.dn0), clip(r.dn1), clip(r.dn2), clip(r.dn3), clip(r.dn4)].filter(v => v !== null);
     if (s.dn0[i] !== null) s.nConc++;
   }
-  for (const [t, s] of series) if (s.nConc < 200) series.delete(t);
+  // NO UNIVERSE FILTER HERE. Eligibility is decided per decision bar inside
+  // strategy_book.crossSection(), from data through bar i only. This loader
+  // used to run `if (s.placed < 400 || s.nConc < 200) series.delete(t)` --
+  // lifetime counts over the WHOLE sample, so a ticker entered the 2024
+  // universe only if the code already knew it would eventually reach 400 bars
+  // and 200 broker observations by the end of the data (review P0.2). Deleting
+  // here also made strategy_book.js's "ALL INPUTS ARE AS-OF" header vacuous:
+  // the Map arrived pre-filtered with future knowledge before the module ran.
 
   const concDates = [...new Set(concRows.map(r => toDateStr(r.data_date)))].sort();
   console.log(`\nConcentration span : ${concDates[0]} .. ${concDates[concDates.length - 1]} (${concDates.length} dates)`);

@@ -101,7 +101,14 @@ async function load(pool) {
     s.dn0[i] = v; s.nConc++;
     if (i < concStart) concStart = i;
   }
-  for (const [t, s] of series) if (s.placed < 400 || s.nConc < 200) series.delete(t);
+  // NO UNIVERSE FILTER HERE. Eligibility is decided per decision bar inside
+  // strategy_book.crossSection(), from data through bar i only. This loader
+  // used to run `if (s.placed < 400 || s.nConc < 200) series.delete(t)` --
+  // lifetime counts over the WHOLE sample, so a ticker entered the 2024
+  // universe only if the code already knew it would eventually reach 400 bars
+  // and 200 broker observations by the end of the data (review P0.2). Deleting
+  // here also made strategy_book.js's "ALL INPUTS ARE AS-OF" header vacuous:
+  // the Map arrived pre-filtered with future knowledge before the module ran.
   return { tradingDates, ihsgClose, ihsgSma: sb.smaSeries(ihsgClose, sb.DEFAULTS.regimeSma), series, concStart };
 }
 
@@ -253,18 +260,40 @@ function replay(ctx, firstI, lastI, params) {
     reverse.cagr < run.cagr, `${(reverse.cagr * 100).toFixed(2)}% vs ${(run.cagr * 100).toFixed(2)}%`);
 
   // ── No lookahead ─────────────────────────────────────────────────────────
+  //
+  // TRUNCATE AT A MIDDLE BAR, NOT THE LAST ONE. The earlier version of this test
+  // truncated at lastI, where it could not fail: at the final bar a count over
+  // the whole array and a count over data through `i` are numerically identical,
+  // so it could not tell an as-of counter from the lifetime counter that review
+  // P0.2 was about. Truncating with real future data present is what makes the
+  // assertion bite. Both bars are checked — the middle one for the strength, the
+  // last one because that is the bar production actually decides on.
   console.log('\nNO-LOOKAHEAD');
-  const a = sb.targetBook({ series: ctx.series, i: lastI, ihsgClose: ctx.ihsgClose, ihsgSma: ctx.ihsgSma, currentHoldings: [], opts: PARAMS });
-  const truncated = new Map();
-  for (const [t, s] of ctx.series) truncated.set(t, {
-    open: s.open.slice(0, lastI + 1), high: s.high.slice(0, lastI + 1),
-    close: s.close.slice(0, lastI + 1), value: s.value.slice(0, lastI + 1), dn0: s.dn0.slice(0, lastI + 1),
-  });
-  const b = sb.targetBook({ series: truncated, i: lastI, ihsgClose: ctx.ihsgClose.slice(0, lastI + 1), ihsgSma: ctx.ihsgSma.slice(0, lastI + 1), currentHoldings: [], opts: PARAMS });
-  check('truncating every future bar leaves the book identical',
-    JSON.stringify(a.target) === JSON.stringify(b.target), `${JSON.stringify(a.target)} vs ${JSON.stringify(b.target)}`);
+  const midI = Math.floor((firstI + lastI) / 2);
+  const truncateAt = (cut) => {
+    const m = new Map();
+    for (const [t, s] of ctx.series) m.set(t, {
+      open: s.open.slice(0, cut + 1), high: s.high.slice(0, cut + 1),
+      close: s.close.slice(0, cut + 1), value: s.value.slice(0, cut + 1), dn0: s.dn0.slice(0, cut + 1),
+    });
+    return m;
+  };
+  const bookAt = (series, i, ihsgClose, ihsgSma) =>
+    sb.targetBook({ series, i, ihsgClose, ihsgSma, currentHoldings: [], opts: PARAMS });
 
-  const c = sb.targetBook({ series: ctx.series, i: lastI, ihsgClose: ctx.ihsgClose, ihsgSma: ctx.ihsgSma, currentHoldings: [], opts: PARAMS });
+  for (const cut of [midI, lastI]) {
+    const full = bookAt(ctx.series, cut, ctx.ihsgClose, ctx.ihsgSma);
+    const trunc = bookAt(truncateAt(cut), cut, ctx.ihsgClose.slice(0, cut + 1), ctx.ihsgSma.slice(0, cut + 1));
+    const label = cut === lastI ? `last bar ${ctx.tradingDates[cut]}` : `mid-sample bar ${ctx.tradingDates[cut]} (${lastI - cut} future bars discarded)`;
+    check(`truncating every future bar leaves the book identical — ${label}`,
+      JSON.stringify(full.target) === JSON.stringify(trunc.target),
+      `${JSON.stringify(full.target)}\n          vs ${JSON.stringify(trunc.target)}`);
+    check(`eligible count is unchanged by truncation — ${label}`,
+      full.eligible === trunc.eligible, `${full.eligible} vs ${trunc.eligible}`);
+  }
+
+  const a = bookAt(ctx.series, lastI, ctx.ihsgClose, ctx.ihsgSma);
+  const c = bookAt(ctx.series, lastI, ctx.ihsgClose, ctx.ihsgSma);
   check('targetBook is deterministic', JSON.stringify(a.target) === JSON.stringify(c.target));
 
   console.log(`\n${pass} passed, ${fail} failed`);

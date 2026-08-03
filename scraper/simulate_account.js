@@ -101,7 +101,14 @@ async function main() {
     s.dn0[i] = v; s.nConc++;
     if (i < concStart) concStart = i;
   }
-  for (const [t, s] of series) if (s.placed < 400 || s.nConc < 200) series.delete(t);
+  // NO UNIVERSE FILTER HERE. Eligibility is decided per decision bar inside
+  // strategy_book.crossSection(), from data through bar i only. This loader
+  // used to run `if (s.placed < 400 || s.nConc < 200) series.delete(t)` --
+  // lifetime counts over the WHOLE sample, so a ticker entered the 2024
+  // universe only if the code already knew it would eventually reach 400 bars
+  // and 200 broker observations by the end of the data (review P0.2). Deleting
+  // here also made strategy_book.js's "ALL INPUTS ARE AS-OF" header vacuous:
+  // the Map arrived pre-filtered with future knowledge before the module ran.
 
   const firstI = Math.max(concStart + sb.DEFAULTS.posfracWindow, sb.DEFAULTS.hiBars, sb.DEFAULTS.regimeSma);
   const lastI = n - 2;

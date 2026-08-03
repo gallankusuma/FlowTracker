@@ -877,6 +877,53 @@ It does not say the signals are bad. It says they are **not intraday signals**. 
 
 ---
 
+## EXP-2026-08-03-020 — Removing the universe look-ahead (review P0.2), and what EXP-017 looks like without it
+
+Eight loaders screened their ticker universe with whole-sample counts before any date loop began — `placed >= 400 || nConc >= 200` in four, `nConc >= 200` in one, `placed >= WARMUP + 100` in three. Every one asks whether a ticker will *eventually* accumulate enough data by the end of the sample, which cannot be answered as of any decision date. `modules/strategy_book.js` was clean and says so in its header ("ALL INPUTS ARE AS-OF"), but the look-ahead lived in the **loader**, which was never centralised — so the Map arrived pre-filtered with future knowledge and the module's guarantee was vacuous.
+
+Replaced with as-of terms evaluated per decision bar: real bars inside the trailing 252-day window (`minHiWindowBars = 200`), and POSFRAC_60 computable at that bar (`requirePosfrac`). The stale `i < hiBars` axis-position test went too — it tested a position on the shared IHSG date axis, not the ticker's own history, and was wrong for any name that listed after the axis began.
+
+### The single diff is uninterpretable, so each term was measured alone
+
+Removing the screen ADMITS names; both new terms EXCLUDE them. The net −3.50pp attributes nothing, so `measure_universe_lookahead.js` runs each configuration in isolation on one loader, same dates, same execution:
+
+| config | CAGR | maxDD | trades | avg eligible |
+|---|---|---|---|---|
+| A — old: lifetime screen, no as-of terms | 23.76% | 11.39% | 266 | 97.4 |
+| B — look-ahead removed, no as-of terms | 25.22% | 14.82% | 280 | 100.5 |
+| C — B + minHiWindowBars=200 | 27.55% | 14.82% | 274 | 99.2 |
+| D — C + requirePosfrac (**shipped**) | **20.26%** | 13.45% | 272 | 90.0 |
+| E — D **plus** the lifetime screen (diagnostic) | 25.37% | 13.44% | 268 | 89.5 |
+
+**E − D = +5.10pp.** That is the honest price of the look-ahead: with the as-of terms in place, letting the universe be chosen with knowledge of the future is worth 5.1 points of annual return that was never available in real time — roughly a fifth of what was previously reported.
+
+Two results worth not smoothing over. A→B is **+1.46pp**: removing the screen *on its own* improved returns, so the bias was not a simple one-directional inflation — its sign flips depending on whether the as-of terms are present. And C→D is **−7.29pp**: requiring broker coverage is by far the most expensive term, which says the names we have no bandarmology for were performing well. Coverage is not random with respect to returns.
+
+### EXP-017 re-run on the corrected universe
+
+| | before | after |
+|---|---|---|
+| best variant excess | +8.71% | **+6.20%** |
+| best variant CAGR | 16.73% | 14.02% |
+| maxDD | — | 13.61% |
+| beats BASE | YES | YES (+11.64%) |
+| beats RANDOM control | YES | YES (+11.56%) |
+| NO_FILL | 0.00% | 0.00% |
+
+It still clears all three mechanical controls, and the reverse control still hurts as it should (−11.10% vs BASE −5.44%).
+
+**But the split-half check was flattering itself, and that is the more important finding.** The test asked "beats BASE in both halves" and answered YES — while P1 excess was **−6.84%**. It beats a baseline that loses 13.04%, so both are losing to the benchmark; the entire positive excess comes from P2 (+18.58%). A stricter criterion, *positive* excess in both halves, was added and **it answers no**.
+
+The dose-response also stopped being clean at the low end: vetoing the top 5% gives −7.31% excess, *worse* than not vetoing at all (−5.44%). It rises monotonically from there (−4.26 → −2.08 → +0.97 → +5.79 → +5.98), but a curve that dips below zero-dose before climbing is more consistent with a concentration/turnover effect than with the top-accumulated names specifically underperforming.
+
+**Status**: EXP-017 remains the best candidate in the registry and remains **not proven**. The corrected numbers are lower, the strongest control now returns "no", and the survivorship component of P0.2 is untouched and untouchable — see below.
+
+### What this does NOT fix
+
+Survivorship, which is baked in at **ingest**, not at screen time. `backfill_price_history.js` fetches only for `SELECT DISTINCT stock_code FROM idx_broker_summary`, populated solely from the 245 hardcoded names in `modules/tickers.js` — from which 12 were deleted 2026-07-22 for being "almost certainly suspended/delisted" (BOSS, ERPT, FASW, FREN, LOTTE, MASA, SCPI, SMCB, SRIL, TELE, WIKA, WSKT). Those are exactly the names that blew up. No as-of predicate can restore a row that was never written; checked, and 12/12 have zero concentration rows. **Every `*** SURVIVORSHIP-BIASED RESEARCH RESULT ***` banner stays.**
+
+---
+
 ## Open follow-ups (not yet done)
 
 - **Re-run EXP-001 through EXP-010 on 10-year data under both horizons** — this is now the highest-value open item. The headline finding ("AWO Full is worse than random entry") was established on a single ~2-year regime with a 15-bar exit; both of those constraints are gone. Report SWING and POSITION side by side rather than replacing one with the other, and label everything survivorship-biased.

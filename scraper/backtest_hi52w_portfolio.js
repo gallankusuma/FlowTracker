@@ -60,6 +60,7 @@ const MIN_ELIGIBLE = 25;
 const BUY_COST = 0.20 / 100;
 const SELL_COST = 0.30 / 100;
 const HI_BARS = 252;
+const MIN_HI_WINDOW_BARS = 200;   // real bars required INSIDE the trailing HI_BARS window (as-of; review P0.2)
 const TRADING_DAYS_YEAR = 245;
 
 const REBALANCES = [
@@ -147,7 +148,11 @@ async function main() {
     s.value[i] = Number(r.value) || Number(r.close_price) * Number(r.volume || 0);
     s.placed++;
   }
-  for (const [t, s] of series) if (s.placed < WARMUP + 100) series.delete(t);
+  // NO UNIVERSE FILTER HERE -- see review P0.2. This used to delete any ticker
+  // whose LIFETIME bar count fell short, which asks whether a name will
+  // eventually accumulate enough data by the end of the sample. Depth is now
+  // checked per decision bar in this script's own crossSection(), over the
+  // trailing window only.
   console.log(`\nAxis ${tradingDates[0]}..${tradingDates[tradingDates.length - 1]} (${tradingDates.length} days)   universe ${series.size} tickers`);
   console.log(`Costs: buy ${(BUY_COST * 100).toFixed(2)}% / sell ${(SELL_COST * 100).toFixed(2)}% (${((BUY_COST + SELL_COST) * 100).toFixed(2)}% round trip)   liquidity floor Rp ${(opts.minAdv / 1e9).toFixed(1)}bn\n`);
 
@@ -155,11 +160,18 @@ async function main() {
   function crossSection(i) {
     const out = [];
     for (const [ticker, s] of series) {
-      if (s.close[i] === null || i < HI_BARS) continue;
+      if (s.close[i] === null) continue;   // eligibility uses data through bar i only
       const adv = rollingMedian(s.value, i, ADV_WINDOW);
       if (adv === null || adv < opts.minAdv) continue;
-      let hi = -Infinity;
-      for (let j = i - HI_BARS + 1; j <= i; j++) if (s.high[j] !== null && s.high[j] > hi) hi = s.high[j];
+      let hi = -Infinity, realBars = 0;
+      for (let j = Math.max(0, i - HI_BARS + 1); j <= i; j++) {
+        if (s.close[j] !== null && s.close[j] !== undefined) realBars++;
+        if (s.high[j] !== null && s.high[j] > hi) hi = s.high[j];
+      }
+      // As-of depth check, replacing the loader's lifetime `placed < WARMUP+100`
+      // delete (review P0.2). Counts only bars inside the trailing window, so
+      // nothing after `i` can affect it.
+      if (realBars < MIN_HI_WINDOW_BARS) continue;
       if (!(hi > 0)) continue;
       out.push({ ticker, score: (s.close[i] / hi) * 100 });
     }
