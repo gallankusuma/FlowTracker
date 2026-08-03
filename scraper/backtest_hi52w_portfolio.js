@@ -156,7 +156,6 @@ async function main() {
     const out = [];
     for (const [ticker, s] of series) {
       if (s.close[i] === null || i < HI_BARS) continue;
-      if (s.open[i + 1] === null || !(s.open[i + 1] > 0)) continue; // must be tradeable next bar
       const adv = rollingMedian(s.value, i, ADV_WINDOW);
       if (adv === null || adv < opts.minAdv) continue;
       let hi = -Infinity;

@@ -223,7 +223,7 @@ async function main() {
   function crossSection(i) {
     const out = [];
     for (const [ticker, s] of series) {
-      if (s.close[i] === null || s.open[i + 1] === null || !(s.open[i + 1] > 0)) continue;
+      if (s.close[i] === null) continue;   // eligibility uses data through bar i only
       const adv = rollingMedian(s.value, i, ADV_WINDOW);
       if (adv === null || adv < MIN_ADV) continue;
       let hi = -Infinity;

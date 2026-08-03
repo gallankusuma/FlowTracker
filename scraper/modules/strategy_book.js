@@ -109,7 +109,19 @@ function crossSection(series, i, opts) {
 
   // Veto the most persistently accumulated. Names with no POSFRAC reading are
   // never vetoed: absence of data is not evidence of accumulation.
-  if (p.vetoFrac > 0) {
+  //
+  // `vetoSelector` exists so an experiment can swap the SELECTION RULE (reverse
+  // control, random control, a different dose) without reimplementing
+  // eligibility, ranking, POSFRAC or buffering. Before this hook, EXP-017 had
+  // its own copy of all of that, and the copy had a look-ahead the live module
+  // did not — which is exactly the drift a "single source of truth" module is
+  // supposed to make impossible. One implementation, one injected decision.
+  if (typeof p.vetoSelector === 'function') {
+    const banned = p.vetoSelector(rows, p);
+    if (banned && typeof banned.has === 'function') {
+      for (const r of rows) if (banned.has(r.ticker)) r.vetoed = true;
+    }
+  } else if (p.vetoFrac > 0) {
     const withPf = rows.filter(r => r.posfrac !== null).sort((a, b) => b.posfrac - a.posfrac);
     const k = Math.floor(withPf.length * p.vetoFrac);
     for (let z = 0; z < k; z++) withPf[z].vetoed = true;

@@ -49,6 +49,7 @@ require('dotenv').config();
 const mysql = require('mysql2/promise');
 const stats = require('./modules/statistics');
 const cs = require('./modules/cross_sectional');
+const sb = require('./modules/strategy_book');
 
 const DB = {
   host: process.env.DB_HOST || 'localhost',
@@ -183,30 +184,24 @@ async function main() {
   console.log(`\nWindow    : ${tradingDates[firstI]} .. ${tradingDates[lastI]}  (${((lastI - firstI) / TRADING_DAYS_YEAR).toFixed(1)} years — SHORTER than EXP-013/014's ~9y)`);
   console.log(`Universe  : ${series.size} tickers with both price and concentration history\n`);
 
-  /** Share of the last 60 days with dn0 > 0. Uses data through i only. */
-  function posfrac60(s, i) {
-    let pos = 0, cnt = 0;
-    for (let j = Math.max(0, i - POSFRAC_WINDOW + 1); j <= i; j++) {
-      if (s.dn0[j] === null) continue;
-      if (s.dn0[j] > 0) pos++;
-      cnt++;
-    }
-    return cnt >= POSFRAC_MIN_REAL ? pos / cnt : null;
-  }
-
-  function crossSection(i) {
-    const out = [];
-    for (const [ticker, s] of series) {
-      if (s.close[i] === null || s.open[i + 1] === null || !(s.open[i + 1] > 0)) continue;
-      const adv = rollingMedian(s.value, i, ADV_WINDOW);
-      if (adv === null || adv < MIN_ADV) continue;
-      let hi = -Infinity;
-      for (let j = i - HI_BARS + 1; j <= i; j++) if (s.high[j] !== null && s.high[j] > hi) hi = s.high[j];
-      if (!(hi > 0)) continue;
-      out.push({ ticker, score: (s.close[i] / hi) * 100, pf: posfrac60(s, i) });
-    }
-    out.sort((a, b) => b.score - a.score);
-    return out;
+  /**
+   * Veto selection rule per variant. Injected into the live module so the
+   * experiment varies ONLY this, never eligibility/ranking/buffering.
+   */
+  function makeSelector(variant, rng) {
+    if (variant.veto === null) return null;
+    return (rows) => {
+      const banned = new Set();
+      if (variant.random) {
+        for (const r of rows) if (rng() < variant.veto) banned.add(r.ticker);
+        return banned;
+      }
+      const withPf = rows.filter(r => r.posfrac !== null)
+        .sort((a, b) => variant.reverse ? a.posfrac - b.posfrac : b.posfrac - a.posfrac);
+      const k = Math.floor(withPf.length * variant.veto);
+      for (let z = 0; z < k; z++) banned.add(withPf[z].ticker);
+      return banned;
+    };
   }
 
   function simulate({ rebalBars, buffer, variant, lo, hi }) {
@@ -215,55 +210,40 @@ async function main() {
     const held = new Map();
     const curve = [];
     const rng = cs.mulberry32(RANDOM_SEED + rebalBars * 100 + buffer);
-    let vetoed = 0, shortfall = 0, periods = 0;
+    let vetoed = 0, shortfall = 0, periods = 0, noFill = 0, fills = 0;
 
     for (let i = loI; i <= hiI; i += rebalBars) {
       const execI = i + 1;
-      const xs = crossSection(i);
-      if (xs.length < MIN_ELIGIBLE) continue;
+
+      // THE DECISION comes from the live module — the same function
+      // strategy_forward.js calls in production. Its eligibility uses data
+      // through bar i only; the previous local copy screened on open[i+1],
+      // which quietly discarded names that turned out to be untradeable the
+      // NEXT day. That is information the decision could not have had.
+      const decision = sb.targetBook({
+        series, i, ihsgClose: ihsg, ihsgSma: ihsgSMA,
+        currentHoldings: [...held.keys()],
+        opts: {
+          positions: opts.positions, bufferMult: buffer,
+          exitOnVeto: !!variant.exitOnVeto,
+          vetoFrac: variant.veto === null ? 0 : variant.veto,
+          vetoSelector: makeSelector(variant, rng),
+          minAdv: MIN_ADV, advWindow: ADV_WINDOW, hiBars: HI_BARS,
+          posfracWindow: POSFRAC_WINDOW, posfracMinReal: POSFRAC_MIN_REAL,
+          regimeSma: REGIME_SMA, minEligible: MIN_ELIGIBLE,
+        },
+      });
+      if (decision.eligible < MIN_ELIGIBLE) continue;
       periods++;
 
-      let exposure = 1;
-      if (ihsgSMA[i] !== null && ihsg[i] < ihsgSMA[i]) exposure = 0;
+      const exposure = decision.exposure;
+      vetoed += decision.vetoedCount;
+      if (exposure > 0 && decision.target.length < opts.positions) shortfall++;
 
       let pv = cash;
       for (const [t, u] of held) { const px = series.get(t).open[execI]; if (px > 0) pv += u * px; }
 
-      // Veto set: names in the top X% by POSFRAC_60 (most persistent broker
-      // accumulation). Names with no POSFRAC reading are never vetoed — absence
-      // of data is not evidence.
-      const banned = new Set();
-      if (variant.veto !== null) {
-        if (variant.random) {
-          for (const x of xs) if (rng() < variant.veto) banned.add(x.ticker);
-        } else {
-          // Descending POSFRAC = most persistently accumulated first; reverse
-          // flips it so the control bans the least-accumulated names instead.
-          const withPf = xs.filter(x => x.pf !== null)
-            .sort((a, b) => variant.reverse ? a.pf - b.pf : b.pf - a.pf);
-          const k = Math.floor(withPf.length * variant.veto);
-          for (let z = 0; z < k; z++) banned.add(withPf[z].ticker);
-        }
-      }
-
-      const rank = new Map(xs.map((x, k) => [x.ticker, k]));
-      let keep = [...held.keys()].filter(t => rank.has(t) && rank.get(t) < opts.positions * buffer);
-      if (variant.exitOnVeto) keep = keep.filter(t => !banned.has(t));
-      keep = keep.sort((a, b) => rank.get(a) - rank.get(b)).slice(0, opts.positions);
-      const keepSet = new Set(keep);
-
-      let target;
-      if (exposure === 0) target = [];
-      else {
-        target = [...keep];
-        for (const x of xs) {
-          if (target.length >= opts.positions) break;
-          if (keepSet.has(x.ticker) || target.includes(x.ticker)) continue;
-          if (banned.has(x.ticker)) { vetoed++; continue; }
-          target.push(x.ticker);
-        }
-        if (target.length < opts.positions) shortfall++;
-      }
+      const target = decision.target;
       const targetSet = new Set(target);
 
       for (const [t, u] of [...held]) {
@@ -277,7 +257,14 @@ async function main() {
         const per = (pv * exposure) / Math.max(target.length, 1);
         for (const t of toBuy) {
           const px = series.get(t).open[execI];
-          if (!(px > 0)) continue;
+          // NO_FILL: the name was eligible and selected on the evidence
+          // available at T, but there is no opening price at T+1 — suspension,
+          // halt, or no trade. A real book would carry the intent and simply
+          // miss the fill, holding cash. It must NOT be removed from the
+          // cross-section retroactively, which is what the old eligibility
+          // screen did and why results were flattered.
+          if (!(px > 0)) { noFill++; continue; }
+          fills++;
           const spend = Math.min(per, cash);
           if (spend <= 0) break;
           cash -= spend;
@@ -297,14 +284,21 @@ async function main() {
     const vol = rets.length > 1 ? stats.stdDev(rets) * Math.sqrt(TRADING_DAYS_YEAR / rebalBars) : null;
     const cagr = annualise(final - 1, hiI - loI);
     return { cagr, mdd: maxDrawdown(curve), vol, retVol: vol > 0 ? cagr / vol : null,
-             vetoed, shortfallPct: periods ? shortfall / periods : 0 };
+             vetoed, shortfallPct: periods ? shortfall / periods : 0,
+             noFill, fills, noFillPct: (fills + noFill) ? noFill / (fills + noFill) : 0 };
   }
 
   function universeCagr(rebalBars, lo, hi) {
     const loI = lo === undefined ? firstI : lo, hiI = hi === undefined ? lastI : hi;
     let cash = 1.0; const held = new Map();
     for (let i = loI; i <= hiI; i += rebalBars) {
-      const execI = i + 1, xs = crossSection(i);
+      const execI = i + 1;
+      // The benchmark must use the SAME eligibility as the strategy, or the
+      // comparison silently measures the screen instead of the selection.
+      const xs = sb.crossSection(series, i, {
+        minAdv: MIN_ADV, advWindow: ADV_WINDOW, hiBars: HI_BARS,
+        posfracWindow: POSFRAC_WINDOW, posfracMinReal: POSFRAC_MIN_REAL, vetoFrac: 0,
+      });
       if (xs.length < MIN_ELIGIBLE) continue;
       let pv = cash;
       for (const [t, u] of held) { const px = series.get(t).open[execI]; if (px > 0) pv += u * px; }
@@ -343,7 +337,7 @@ async function main() {
       meanExcess: stats.mean(f('excess')), medExcess: med(f('excess')),
       meanCagr: stats.mean(f('cagr')), meanMDD: stats.mean(f('mdd')),
       meanRetVol: stats.mean(f('retVol')), positive: rows.filter(r => r.excess > 0).length,
-      shortfall: stats.mean(f('shortfallPct')),
+      shortfall: stats.mean(f('shortfallPct')), noFillPct: stats.mean(f('noFillPct')),
     };
   }
 
@@ -352,12 +346,12 @@ async function main() {
   console.log('='.repeat(112));
   console.log('FULL WINDOW — mean across 9 cells (median in brackets: EXP-015 showed means hide outlier cells)');
   console.log('='.repeat(112));
-  console.log('  variant                 CAGR   excess (median)    maxDD   ret/vol  +cells  under-filled');
+  console.log('  variant                 CAGR   excess (median)    maxDD   ret/vol  +cells  under-filled  NO_FILL');
   const full = {};
   for (const v of VARIANTS) {
     const s = score(v);
     full[v.key] = s;
-    console.log(`  ${v.key.padEnd(20)} ${pct(s.meanCagr)}  ${pct(s.meanExcess)} (${pct(s.medExcess)})  ${pct(s.meanMDD)}    ${s.meanRetVol.toFixed(2).padStart(5)}    ${String(s.positive).padStart(2)}/9   ${pct(s.shortfall, 1)}`);
+    console.log(`  ${v.key.padEnd(20)} ${pct(s.meanCagr)}  ${pct(s.meanExcess)} (${pct(s.medExcess)})  ${pct(s.meanMDD)}    ${s.meanRetVol.toFixed(2).padStart(5)}    ${String(s.positive).padStart(2)}/9   ${pct(s.shortfall, 1)}  ${pct(s.noFillPct, 2)}`);
   }
 
   console.log('\n' + '='.repeat(112));
