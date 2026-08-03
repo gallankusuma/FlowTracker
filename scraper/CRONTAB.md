@@ -32,11 +32,20 @@ exists only on the VPS.
 
 ## Schedule (times are UTC; WIB = UTC+7)
 
-### flowtracker.id concentration pull
-```
-30 10 * * 1-5   curl -X POST localhost:3100/api/ft-pull        # 17:30 WIB
- 0 11 * * 1-5   curl -X POST localhost:3100/api/ft-pull        # 18:00 WIB
-```
+### flowtracker.id concentration pull — REMOVED 2026-08-03
+Two entries used to call `ft_pull.sh` (→ `/api/ft-pull`) at 17:30 and 18:00 WIB.
+Both are gone, for two independent reasons:
+
+1. The flowtracker.id account was banned, so the pull cannot succeed.
+2. They were never doing useful work anyway. On failure `/api/ft-pull` fell
+   through to `autoCalculateConcentration()`, but 17:30/18:00 WIB is *before*
+   the 19:30 WIB IDX data pull, so there was nothing to calculate from — every
+   run returned `stocks: 0`, and returned it as `success: true`. Concentration
+   has always actually been produced by the nightly job below, which calls
+   `autoCalculateConcentration()` as its PRIMARY step after the data lands.
+
+Concentration needs no replacement entry. `POST /api/calc-concentration` is the
+manual equivalent if a specific date ever needs recomputing.
 
 ### Signal engine — writes `ft_signals`
 ```

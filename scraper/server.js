@@ -803,282 +803,28 @@ async function pullDetailedFlowForStock(ticker, date) {
 }
 
 // ─── FT.id Concentration Puller ─────────────────────────────────────────────
-// Pulls pre-calculated dn-0..dn-4 values directly from flowtracker.id API
-// This gives EXACT match with FT.id's concentration numbers.
+// FT.id concentration pull — RETIRED 2026-08-03.
+//
+// The flowtracker.id account this depended on was banned, so this path cannot
+// be repaired, only removed. It was never load-bearing: autoCalculateConcentration()
+// computes dn-0..dn-4 from our own idx_broker_summary and is the PRIMARY source
+// (245 tickers, current). FT.id was a bonus that additionally covered ~620 thin
+// tickers, and only ever did so between 2026-05-22 and 2026-06-17.
+//
+// It also failed silently for 47 days. /api/ft-pull caught the error, fell through
+// to autoCalculateConcentration, and returned `success: true, fallback: true` with
+// `stocks: 0` — so every health check reading `success` saw green while nothing
+// landed. That is the third instance of this exact pattern in this codebase (the
+// signal pipeline logged 'Found 0 signals' for two months; scheduleDailyCron threw
+// with no trace). A job that cannot report its own failure is worse than no job.
+//
+// Removed with it: FT_HOST/FT_EMAIL/FT_PASS/FT_KEY (FT_EMAIL was a hardcoded
+// personal address), cryptoJsAesEncrypt, httpsPost, httpsGet, getFTToken and
+// pullFTConcentration — none had another caller.
 
 const crypto  = require('crypto');
 const https   = require('https');
 
-const FT_HOST  = 'flowtracker.id';
-const FT_EMAIL = 'gmineku24@gmail.com';
-const FT_PASS  = process.env.FT_PASS;
-const FT_KEY   = process.env.FT_KEY;
-
-let _ftToken   = null;
-let _ftTokenAt = 0;
-
-// Replicate CryptoJS.AES.encrypt(text, passphrase) using Node.js crypto
-// CryptoJS uses OpenSSL EVP_BytesToKey with MD5 for key derivation
-function cryptoJsAesEncrypt(text, passphrase) {
-  const salt = crypto.randomBytes(8);
-  // EVP_BytesToKey: derive 32-byte key + 16-byte IV from passphrase + salt
-  let key = Buffer.alloc(0);
-  let prev = Buffer.alloc(0);
-  while (key.length < 48) {
-    prev = crypto.createHash('md5').update(Buffer.concat([prev, Buffer.from(passphrase), salt])).digest();
-    key  = Buffer.concat([key, prev]);
-  }
-  const aesKey = key.slice(0, 32);
-  const iv     = key.slice(32, 48);
-  const cipher = crypto.createCipheriv('aes-256-cbc', aesKey, iv);
-  const enc    = Buffer.concat([cipher.update(Buffer.from(text, 'utf8')), cipher.final()]);
-  return Buffer.concat([Buffer.from('Salted__'), salt, enc]).toString('base64');
-}
-
-async function httpsPost(host, path, body, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const buf = Buffer.from(typeof body === 'string' ? body : JSON.stringify(body));
-    const req = https.request({
-      hostname: host, path, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': buf.length,
-                 'User-Agent': 'Mozilla/5.0', 'Referer': `https://${host}/`, ...headers },
-    }, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => resolve({ status: res.statusCode, body: d }));
-    });
-    req.on('error', reject);
-    req.write(buf); req.end();
-  });
-}
-
-async function httpsGet(host, path, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: host, path, method: 'GET',
-      headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': `https://${host}/`, ...headers },
-    }, res => {
-      let d = '';
-      res.on('data', c => d += c);
-      res.on('end', () => resolve({ status: res.statusCode, body: d }));
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
-async function getFTToken() {
-  if (_ftToken && (Date.now() - _ftTokenAt) < 4 * 3600 * 1000) return _ftToken;
-  console.log('🔐 FT.id: logging in...');
-  const encPass = cryptoJsAesEncrypt(FT_PASS, FT_KEY);
-  const res = await httpsPost(FT_HOST, '/api/login', { email: FT_EMAIL, password: encPass });
-  const json = JSON.parse(res.body);
-  _ftToken   = json.token || json.data?.token || json.access_token || null;
-  _ftTokenAt = Date.now();
-  if (!_ftToken) throw new Error(`FT login failed: ${res.body.slice(0, 200)}`);
-  console.log('✅ FT.id: login OK');
-  return _ftToken;
-}
-
-// JWT token cache - persists across calls to avoid repeated logins (which cause bans)
-let _ftJwtCache = { token: null, expiresAt: 0 };
-
-// Pull market-summary from FT.id using Puppeteer
-// VERIFIED: login=api.flowtracker.id/api/login, token key=flowTrackerToken
-async function pullFTConcentration(targetDate) {
-  console.log('🔍 FT.id: Puppeteer scraper...');
-  let browser;
-  try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--window-size=1280,800'],
-    });
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1280, height: 800 });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
-    await page.evaluateOnNewDocument(() => {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false });
-      window.chrome = { runtime: {} };
-    });
-    let capturedData = null;
-    page.on('response', async response => {
-      if (capturedData) return;
-      const url = response.url();
-      if (!url.includes('api.flowtracker.id')) return;
-      if (response.status() !== 200) return;
-      try {
-        const ct = response.headers()['content-type'] || '';
-        if (!ct.includes('json')) return;
-        const text = await response.text().catch(() => '');
-        if (!text.startsWith('{') && !text.startsWith('[')) return;
-        const json = JSON.parse(text);
-        const arr = json.data || json.content || (Array.isArray(json) ? json : null);
-        if (arr && arr.length > 50) {
-          const sample = arr.find(x => x['dn-0'] !== undefined || x.dn0 !== undefined);
-          if (sample) { capturedData = json; console.log(`  ?? Captured from ${url}: ${arr.length} items`); }
-        }
-      } catch(_) {}
-    });
-    console.log('  ? Opening flowtracker.id...');
-    await page.goto('https://flowtracker.id', { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await new Promise(r => setTimeout(r, 4000));
-
-    // Step 2: Use cached JWT if still valid (avoid login = avoid ban)
-    const now = Date.now();
-    let jwt = null;
-    if (_ftJwtCache.token && _ftJwtCache.expiresAt > now + 60000) {
-      jwt = _ftJwtCache.token;
-      console.log(`  ✅ Using cached JWT (expires in ${Math.round((_ftJwtCache.expiresAt - now)/60000)}m)`);
-    } else {
-      // Check page localStorage
-      jwt = await page.evaluate(() => {
-        try { return localStorage.getItem('flowTrackerToken') || null; } catch(_) { return null; }
-      });
-      if (jwt) {
-        console.log('  ✅ flowTrackerToken from page localStorage');
-        // Parse JWT expiry
-        try {
-          const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64').toString());
-          _ftJwtCache = { token: jwt, expiresAt: payload.exp * 1000 };
-        } catch(_) { _ftJwtCache = { token: jwt, expiresAt: now + 3600000 }; }
-      }
-    }
-
-    if (!jwt) {
-      console.log('  → No cached token, logging in via UI...');
-      await page.evaluate(() => {
-        const b = Array.from(document.querySelectorAll('button,a')).find(el => el.textContent.trim().toLowerCase().includes('login'));
-        if (b) b.click();
-      });
-      await new Promise(r => setTimeout(r, 2500));
-      await page.waitForSelector('input[type="email"]', { timeout: 8000 }).catch(() => {});
-      const emailEl = await page.$('input[type="email"]').catch(() => null);
-      if (emailEl) {
-        await emailEl.click({ clickCount: 3 });
-        await emailEl.type(FT_EMAIL, { delay: 80 });
-        const passEl = await page.$('input[type="password"]').catch(() => null);
-        if (passEl) {
-          await passEl.click({ clickCount: 3 });
-          await passEl.type(FT_PASS, { delay: 80 });
-          await new Promise(r => setTimeout(r, 500));
-          await page.evaluate(() => {
-            const b = Array.from(document.querySelectorAll('button'))
-              .find(el => el.textContent.trim().toLowerCase().includes('sign in') || el.textContent.trim().toLowerCase().includes('login'));
-            if (b) b.click();
-          });
-          await new Promise(r => setTimeout(r, 8000));
-          jwt = await page.evaluate(() => {
-            try { return localStorage.getItem('flowTrackerToken') || null; } catch(_) { return null; }
-          });
-          console.log(`  ? flowTrackerToken: ${jwt ? '? found (' + jwt.length + ' chars)' : '? not found'}`);
-        }
-      }
-    }
-    if (jwt && !capturedData) {
-      const endpoints = [
-        'https://api.flowtracker.id/api/market-summary/latest',
-        'https://api.flowtracker.id/api/market-summary',
-        'https://api.flowtracker.id/api/flow-analyzer',
-        'https://api.flowtracker.id/api/broker-concentration',
-      ];
-      for (const ep of endpoints) {
-        if (capturedData) break;
-        console.log(`  → GET ${ep.replace('https://api.flowtracker.id','')}...`);
-        const r = await page.evaluate(async (url, tok) => {
-          try {
-            const res = await fetch(url, { headers: { 'Authorization': `Bearer ${tok}`, 'Accept': 'application/json' } });
-            const text = await res.text();
-            return { status: res.status, text, preview: text.slice(0, 300) };
-          } catch(e) { return { error: e.message }; }
-        }, ep, jwt);
-        console.log(`     status=${r.status} preview=${r.preview?.slice(0,150)}`);
-        if (r.status === 200 && r.text?.startsWith('{')) {
-          try {
-            const j = JSON.parse(r.text);
-            // Deep recursive search for array with dn-0 anywhere in the JSON tree
-            function findDnArr(obj, depth) {
-              if (depth > 25 || !obj || typeof obj !== 'object') return null;
-              if (Array.isArray(obj)) {
-                if (obj.length > 20) {
-                  const hasDn = obj.find(x => x && typeof x === 'object' && ('dn-0' in x || 'dn0' in x));
-                  if (hasDn) return obj;
-                }
-                for (const item of obj) { const f = findDnArr(item, depth+1); if (f) return f; }
-              } else {
-                for (const [k,v] of Object.entries(obj)) {
-                  if (k === 'data' && Array.isArray(v) && v.length > 20) {
-                    const hasDn = v.find(x => x && typeof x === 'object' && ('dn-0' in x || 'dn0' in x));
-                    if (hasDn) return v;
-                  }
-                  const f = findDnArr(v, depth+1); if (f) return f;
-                }
-              }
-              return null;
-            }
-            const arr = findDnArr(j, 0);
-            if (arr && arr.length > 0) {
-              const hasDn = arr.find(x => x['dn-0'] !== undefined || x.dn0 !== undefined);
-              if (hasDn) { capturedData = j; capturedData._arr = arr; console.log(`  ✅ Got ${arr.length} items!`); break; }
-              else { console.log(`     ⚠️ ${arr.length} items, no dn-0. Check keys above`); }
-            } else { console.log(`     ⚠️ arr empty or null. Top keys: ${Object.keys(j).slice(0,8).join(',')}`); }
-          } catch(e) { console.log(`     ❌ parse err: ${e.message}`); }
-        }
-      }
-    }
-    // Fallback: client-side nav to flow-analyzer (avoids SSR redirect)
-    // FT.id uses JWT in localStorage (not cookie), so page.goto triggers SSR redirect
-    // Clicking nav link uses client-side router and respects localStorage JWT
-    if (!capturedData) {
-      if (jwt) await page.evaluate((tok) => { try { localStorage.setItem('flowTrackerToken', tok); } catch(_) {} }, jwt);
-      console.log('  → Client-side nav to flow-analyzer (clicking nav link)...');
-      const clicked = await page.evaluate(() => {
-        const links = Array.from(document.querySelectorAll('a, button, nav a, [href]'));
-        const flowLink = links.find(el => {
-          const t = el.textContent.trim().toLowerCase();
-          const h = (el.getAttribute('href') || '').toLowerCase();
-          return (t.includes('flow') && t.includes('anal')) || h.includes('flow-anal');
-        });
-        if (flowLink) { flowLink.click(); return true; }
-        // Fallback: use Next.js router
-        window.history.pushState({}, '', '/flow-analyzer');
-        window.dispatchEvent(new Event('popstate'));
-        return false;
-      });
-      console.log(`  → Nav clicked: ${clicked}. Waiting 20s...`);
-      await new Promise(r => setTimeout(r, 20000));
-      console.log(`  → capturedData after nav: ${capturedData ? 'yes' : 'none'}`);
-    }
-    await page.screenshot({ path: '/tmp/ft-debug.png', fullPage: false }).catch(() => {});
-    if (!capturedData) throw new Error(`No data. JWT: ${jwt ? 'yes' : 'no'}. Page: "${await page.title()}"`);
-    const dateStr = targetDate || getTodayDate();
-    const dataArr = capturedData._arr || capturedData.data || capturedData.content || (Array.isArray(capturedData) ? capturedData : []);
-    if (typeof dataArr === 'string') { try { dataArr = JSON.parse(dataArr); } catch(_) {} }
-    let saved = 0;
-    console.log(`  ? Parsing ${dataArr.length} items for ${dateStr}...`);
-    for (const item of dataArr) {
-      if (item['dn-0'] === undefined && item['dn-1'] === undefined) continue;
-      const sym = item.symbol || item.stock_code || item.ticker || '';
-      const match = sym.match(/add_watchlist\('([A-Z0-9]{1,10})'\)/) || (sym.match(/^[A-Z0-9]{2,10}$/) ? [sym, sym] : null);
-      if (!match) continue;
-      const ticker = match[1];
-      const dn0=parseFloat(item['dn-0']??0), dn1=parseFloat(item['dn-1']??0);
-      const dn2=parseFloat(item['dn-2']??0), dn3=parseFloat(item['dn-3']??0);
-      const dn4=parseFloat(item['dn-4']??0);
-      const price=parseFloat(item.price??0), chg=parseFloat(item['%1d']??item.change_pct??0);
-      await pool.query(`
-        INSERT INTO idx_concentration (data_date, stock_code, dn0, dn1, dn2, dn3, dn4, price, change_pct)
-        VALUES (?,?,?,?,?,?,?,?,?)
-        ON DUPLICATE KEY UPDATE dn0=VALUES(dn0),dn1=VALUES(dn1),dn2=VALUES(dn2),
-          dn3=VALUES(dn3),dn4=VALUES(dn4),price=VALUES(price),change_pct=VALUES(change_pct),fetched_at=NOW()
-      `, [dateStr, ticker, dn0, dn1, dn2, dn3, dn4, price, chg]);
-      saved++;
-    }
-    console.log(`? FT.id: ${saved} stocks stored for ${dateStr}`);
-    return { saved, date: dateStr, method: 'puppeteer' };
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-}
 async function fetchYahooPrice(ticker) {
   try {
     const url = `https://query2.finance.yahoo.com/v8/finance/chart/${ticker}.JK?interval=1d&range=1d`;
@@ -1385,23 +1131,19 @@ app.get('/api/flow-analyzer', async (req, res) => {
   }
 });
 
-// POST /api/ft-pull — Manually trigger FT.id concentration pull (with auto-calc fallback)
-app.post('/api/ft-pull', requireAdminKey, async (req, res) => {
-  const { date } = req.body || {};
-  const targetDate = date || getTodayDate();
-  try {
-    const result = await pullFTConcentration(targetDate);
-    res.json({ success: true, ...result });
-  } catch (err) {
-    console.error('FT pull error:', err.message, '— falling back to auto-calculate');
-    // Fallback: calculate from our own broker data
-    try {
-      const calcResult = await autoCalculateConcentration(targetDate);
-      res.json({ success: true, ...calcResult, fallback: true, ftError: err.message });
-    } catch (calcErr) {
-      res.json({ success: false, error: err.message, calcError: calcErr.message });
-    }
-  }
+// POST /api/ft-pull — RETIRED. The flowtracker.id account was banned; this
+// endpoint cannot work and is kept only so a stale caller gets a clear answer
+// instead of a 404 that looks like a routing bug. Use /api/calc-concentration,
+// which computes the same values from our own broker data and never depended
+// on FT.id at all.
+// No requireAdminKey: the point of this stub is to TELL a stale caller what
+// happened, and a 401 does not do that. Nothing here is sensitive — it performs
+// no work and reveals only that a retired endpoint is retired.
+app.post('/api/ft-pull', async (req, res) => {
+  res.status(410).json({
+    success: false,
+    error: 'FT.id concentration pull was retired 2026-08-03 (account banned). Use POST /api/calc-concentration.',
+  });
 });
 
 // POST /api/calc-concentration — Calculate concentration from broker data (no FT.id dependency)
@@ -2461,8 +2203,10 @@ async function autoCalculateConcentration(targetDate, force = false) {
 
     // total_turnover was already computed for this ticker in the stockRows query
     // above — it's the same value the (broken) Daily Picks liquidity filter
-    // (last_val > 10B) needs. Neither this function nor pullFTConcentration ever
-    // wrote last_val before, so that filter has been silently returning zero rows.
+    // (last_val > 10B) needs. Neither this function nor the since-retired FT.id
+    // pull wrote last_val before, so that filter had been silently returning zero
+    // rows. This is now the only writer of last_val, which is why the ~620 tickers
+    // the FT.id pull left behind have dn0 but no turnover figure.
     const lastVal = Math.round(Number(stock.total_turnover) || 0);
 
     await pool.query(`
@@ -2749,10 +2493,6 @@ function scheduleDailyCron() {
         })
         .then(calcResult => {
           console.log(`✅ [CRON] Concentration auto-calc complete: ${calcResult?.stocks || 0} stocks`);
-          // BONUS: Also try FT.id pull (may fail, that's OK)
-          return pullFTConcentration(today).catch(e => {
-            console.log(`⚠️ [CRON] FT.id pull failed (OK, we have calculated data): ${e.message}`);
-          });
         })
         .then(() => {
           // AUTO: Run harmonic pattern scan on all tracked stocks
