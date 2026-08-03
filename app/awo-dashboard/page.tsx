@@ -1,6 +1,7 @@
 "use client";
 import Navbar from "@/components/Navbar";
 import { API_BASE } from "@/lib/apiConfig";
+import { adminFetch, getAdminKey, setAdminKey } from "@/lib/adminKey";
 import { useState, useEffect, useCallback } from "react";
 
 type FactorAnalysisItem = {
@@ -206,6 +207,9 @@ export default function AWODashboard() {
   const [analysis, setAnalysis] = useState<AnalysisData | null>(null);
   const [optimizeResult, setOptimizeResult] = useState<OptimizeResult | null>(null);
   const [loading, setLoading] = useState(true);
+  const [adminKeyInput, setAdminKeyInput] = useState("");
+  const [adminError, setAdminError] = useState<string | null>(null);
+  const [keyBoxOpen, setKeyBoxOpen] = useState(false);
   const [optimizing, setOptimizing] = useState(false);
   const [error, setError] = useState("");
 
@@ -226,11 +230,15 @@ export default function AWODashboard() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
+  useEffect(() => { setAdminKeyInput(getAdminKey()); }, []);
+
   const runOptimize = async () => {
     setOptimizing(true);
     try {
-      const res = await fetch(`${API_BASE}/api/awo/optimize/run`, { method: "POST" });
+      setAdminError(null);
+      const res = await adminFetch(`${API_BASE}/api/awo/optimize/run`, { method: "POST" });
       const data = await res.json();
+      if (!res.ok) { setAdminError(data.error || `Optimizer call failed (HTTP ${res.status})`); setOptimizing(false); return; }
       setOptimizeResult(data);
       // Reload status after optimization
       const statusRes = await fetch(`${API_BASE}/api/awo/status`).then(r => r.json());
@@ -242,7 +250,13 @@ export default function AWODashboard() {
   };
 
   const resetWeights = async () => {
-    await fetch(`${API_BASE}/api/awo/reset`, { method: "POST" });
+    setAdminError(null);
+    const res = await adminFetch(`${API_BASE}/api/awo/reset`, { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      setAdminError(body.error || `Reset failed (HTTP ${res.status})`);
+      return;
+    }
     await loadData();
     setOptimizeResult(null);
   };
@@ -291,7 +305,67 @@ export default function AWODashboard() {
             >
               Reset to Default
             </button>
+            <button
+              onClick={() => setKeyBoxOpen(v => !v)}
+              title="These two buttons change server state and require the admin key"
+              style={{
+                padding: "10px 12px", borderRadius: 8, border: "1px solid var(--border, #30363d)",
+                background: "transparent", color: getAdminKey() ? "var(--accent-green, #3fb950)" : "var(--accent-yellow, #d29922)",
+                cursor: "pointer", fontSize: 12, fontWeight: 600,
+              }}
+            >
+              {getAdminKey() ? "🔑 key set" : "🔑 set key"}
+            </button>
           </div>
+          {adminError && (
+            <div style={{
+              marginTop: 10, padding: "10px 12px", borderRadius: 8,
+              border: "1px solid var(--accent-red, #f85149)",
+              background: "color-mix(in srgb, var(--accent-red, #f85149) 12%, transparent)",
+              color: "var(--text-primary, #e6edf3)", fontSize: 13,
+            }}>{adminError}</div>
+          )}
+          {keyBoxOpen && (
+            <div style={{
+              marginTop: 10, padding: 12, borderRadius: 8,
+              border: "1px solid var(--border, #30363d)", background: "var(--bg-card, #1c2333)",
+            }}>
+              <div style={{ fontSize: 12, color: "var(--text-secondary, #8b949e)", marginBottom: 8, lineHeight: 1.5 }}>
+                Run Optimizer and Reset change server state, so they need <code>ADMIN_API_KEY</code>
+                {" "}from the server&apos;s <code>.env</code>. It is stored only in this browser and is
+                never sent anywhere except as a header to your own backend.
+              </div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <input
+                  type="password"
+                  value={adminKeyInput}
+                  onChange={e => setAdminKeyInput(e.target.value)}
+                  placeholder="paste ADMIN_API_KEY"
+                  style={{
+                    flex: 1, padding: "8px 10px", borderRadius: 6,
+                    border: "1px solid var(--border, #30363d)", background: "var(--bg-secondary, #161b22)",
+                    color: "var(--text-primary, #e6edf3)", fontSize: 13,
+                  }}
+                />
+                <button
+                  onClick={() => { setAdminKey(adminKeyInput.trim()); setKeyBoxOpen(false); }}
+                  style={{
+                    padding: "8px 14px", borderRadius: 6, border: "none",
+                    background: "var(--accent-blue, #2f81f7)", color: "#fff", fontWeight: 700,
+                    fontSize: 12, cursor: "pointer",
+                  }}
+                >Save</button>
+                <button
+                  onClick={() => { setAdminKey(""); setAdminKeyInput(""); }}
+                  style={{
+                    padding: "8px 12px", borderRadius: 6,
+                    border: "1px solid var(--border, #30363d)", background: "transparent",
+                    color: "var(--text-secondary, #8b949e)", fontSize: 12, cursor: "pointer",
+                  }}
+                >Clear</button>
+              </div>
+            </div>
+          )}
         </div>
 
         {loading ? (
