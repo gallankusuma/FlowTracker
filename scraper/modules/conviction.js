@@ -26,6 +26,14 @@
  *     ~36% (+5d, n=1434/798) — same direction as before the formula fix,
  *     magnitude close to the original ~54-56%/~34-38% finding, so this one
  *     replicated rather than being an artifact.
+ *   RETRACTED 2026-08-02 by EXP-018. The win rates below came from
+ *   backtest_harmonic_winrate.js, whose own header flagged them provisional;
+ *   they were computed under the F4/F6/F7/dn0 formulas fixed on 2026-07-28 and
+ *   never regenerated. EXP-018 replayed 2,112 fresh patterns over 10 years and
+ *   found mean forward return after costs of -0.44% / +0.06% / -0.00% at
+ *   20/40/60D — a population with a 73-87% win rate does not produce that.
+ *   The tiers still size positions, but the reasons no longer claim validation.
+ *
  *   - Harmonic smart_money_confirmed: 73%->87% win rate, replicated in both
  *     regime halves of backtest_harmonic_winrate.js — strongest single boost.
  *     (Not yet re-validated against the F1-F8 fix — harmonic scoring doesn't
@@ -109,16 +117,16 @@ function computeConvictionTier({ source, patternType, direction, trendAligned, s
   if (isHarmonic) {
     if (smartMoneyConfirmed) {
       return { tier: 'S', sizeMultiplier: 1.0, reason: validated
-        ? 'Smart money confirmed — 73%→87% win rate, replicated across 2 market regimes'
+        ? 'Smart money confirmed — pattern geometry + broker alignment. NOT validated: EXP-018 measured harmonic patterns at ~0% mean return after costs'
         : 'Smart money confirmed — structural heuristic, not backtested on this market' };
     }
     if (patternType === 'ABCD') {
       return { tier: 'A', sizeMultiplier: 0.8, reason: validated
-        ? 'ABCD pattern — largest validated sample (695 events), ~73-75% win rate'
+        ? 'ABCD pattern — largest sample, but EXP-018 found no predictive power in the conviction score'
         : 'ABCD pattern — structural heuristic (pattern geometry only), not backtested on this market' };
     }
     return { tier: 'B', sizeMultiplier: 0.5, reason: validated
-      ? `${patternType || 'Exotic'} pattern — too few historical instances to fully trust yet`
+      ? `${patternType || 'Exotic'} pattern — too few instances, and EXP-018 found no edge in the population`
       : `${patternType || 'Exotic'} pattern — structural heuristic, not backtested on this market` };
   }
 

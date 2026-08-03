@@ -512,7 +512,17 @@ const DEFAULT_WEIGHTS = {
   wyckoff: 15,        // max pts for category B
   smc: 20,            // max pts for category C
   volume_profile: 15, // max pts for category D
-  broker_flow: 30,    // max pts for category E
+  // Category E was the HEAVIEST at 30 points until 2026-08-02. EXP-018 found
+  // that removing it improves the score's information coefficient in every year
+  // where broker data exists (2024 +0.032->+0.074, 2025 -0.005->+0.063,
+  // 2026 +0.040->+0.050 at 40D). The cause is in the E1 block below: it awards
+  // +10 when the last three dn0 readings are all positive for a bullish setup,
+  // and EXP-016 measured exactly that persistence as predicting UNDERperformance
+  // (POSFRAC_60 IC -0.105, IR -0.83, sign stable across all three years).
+  // Set to 0 rather than inverted: inverting scored marginally better still, but
+  // building on a component whose only virtue is being backwards is not a design.
+  // The E1..E3 code is left in place so a redesign has something to start from.
+  broker_flow: 0,
 };
 
 // ─── Master Scoring (with Custom Weights) ───────────────────
