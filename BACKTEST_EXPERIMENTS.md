@@ -831,6 +831,52 @@ In every year where the component is live, **removing or inverting broker_flow b
 
 ---
 
+## EXP-2026-08-03-019 — Same-day entry/exit on IDX: negative everywhere, and our own picks are worse than average
+
+**Question asked by the project owner**: take the system's recommendations, enter an hour after the open, and auto-close at −2%, at +10%, or at that day's close — does that work?
+
+**Script**: `scraper/backtest_intraday_signal_rule.js`. Daily OHLC, entry at the next bar's open (the T+1 convention used everywhere in this codebase, and a proxy for a 10:00 entry — it slightly *overstates* stop hits because it includes the 09:00–10:00 window, and does not flatter the target side at all). Same-bar ambiguity resolves to STOP, as everywhere else. Cost 0.50% round trip.
+
+### Step 1 — the unconditional base rate, 118,463 stock-days, 2 years
+
+| outcome | share |
+|---|---|
+| hit −2% stop | 39.3% |
+| hit +10% target | 2.2% |
+| neither → exit at the close | 58.5% |
+
+**avg net −0.673% per trade, profit factor 0.482, win rate 25.1%.**
+
+The asymmetry is not a tuning problem. A sweep of stop ∈ {2,3,4,5,6,8}% × target ∈ {3,5,7,10}% produced **24 negative cells out of 24**, from −0.705% to −0.840%. Backing the 0.50% cost out, the average IDX stock drifts about **−0.2% from open to close**: the market's positive drift lives overnight, not inside the session. No same-day exit rule survives that, at any parameter.
+
+### Step 2 — the only way it could have worked, and it did not
+
+The base rate is a property of the average stock. The rule could still work if the *selection* had positive intraday drift. It has the opposite.
+
+| selection | n | stop rate | target rate | avg net | t | PF |
+|---|---|---|---|---|---|---|
+| every signalled day | 18,162 | 43.2% | 1.6% | −0.847% | −48.97 | 0.391 |
+| BUY + STRONG BUY | 2,204 | 48.9% | 1.6% | **−0.951%** | −18.54 | 0.368 |
+| STRONG BUY only | 14 | 85.7% | 0.0% | −1.982% | −3.84 | 0.146 |
+
+BUY days are **worse than the unconditional base rate**, not better (−0.951% vs −0.673%). Raw open-to-close on BUY days is −0.351% gross against a market average near −0.2%. Widening to the least-bad sweep cell (8% stop / 7% target) does not rescue it: −1.022%.
+
+This is coherent rather than surprising. The signals fire on strength, those names open at a premium, and the premium decays through the session. Buying the open and selling the close is a systematic way to capture exactly the worst hours of holding them.
+
+### What this does NOT say
+
+It does not say the signals are bad. It says they are **not intraday signals**. The system's horizon is 2–8 weeks (`modules/trade_policy.js`, POSITION); this experiment measures a one-day slice of that and finds the slice negative. A signal can be right over 40 bars and lose over 1.
+
+**Caveats**: `idx_signal_history` only spans 2026-01-19 → 2026-07-31, ~6.5 months and one regime. STRONG BUY n=14 is not a sample and is reported only for completeness. The base-rate sweep carries the same survivorship-biased universe as every other experiment here (see review P0.2, open).
+
+**Status**: **closed, negative.** No intraday harness was built. The question was answerable retrospectively with n=2,204 and t=−18.5, which is why it was answered before building anything.
+
+**Decisions this drives**:
+1. Do not add a same-day auto-close rule to the journal in any parameterisation.
+2. Any future intraday work must first demonstrate positive intraday drift on the selection — that is the binding constraint, not the exit rule.
+
+---
+
 ## Open follow-ups (not yet done)
 
 - **Re-run EXP-001 through EXP-010 on 10-year data under both horizons** — this is now the highest-value open item. The headline finding ("AWO Full is worse than random entry") was established on a single ~2-year regime with a 15-bar exit; both of those constraints are gone. Report SWING and POSITION side by side rather than replacing one with the other, and label everything survivorship-biased.
