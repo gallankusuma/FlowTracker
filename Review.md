@@ -1,243 +1,189 @@
-Hasil pemeriksaan
-Item review sebelumnya	Status
-Hapus penggunaan open[T+1] dari eligibility EXP-017	✅ Selesai
-Gunakan strategy_book.targetBook() pada EXP-017	✅ Selesai
-Bersihkan look-ahead di EXP-013/014	✅ Source sudah diperbaiki
-Perlakukan saham tanpa open sebagai NO_FILL	🟡 Hanya buy-side
-Exact parity backtest vs forward	❌ Belum
-Pisahkan LIVE dan REPLAY	❌ Belum
-Pisahkan tahap PLAN dan FILL	❌ Belum
-Promotion gate dihitung nyata	❌ Belum
-Strategy version dan code hash	❌ Belum
-Nonaktifkan sizing model yang gagal	🟡 Sebagian
-Rerun dan dokumentasikan hasil terkoreksi	❌ Belum terlihat
-Yang sudah benar-benar diperbaiki
-1. Tradeability look-ahead EXP-017 sudah dihapus
+Verdict
 
-Sekarang backtest_broker_veto.js tidak lagi menyaring kandidat berdasarkan keberadaan harga open esok hari. Keputusan dibuat lewat:
+Belum selesai sepenuhnya di repository yang sekarang terbaca.
 
-sb.targetBook({
-  series,
-  i,
-  ihsgClose: ihsg,
-  ihsgSma: ihsgSMA,
-  currentHoldings: [...held.keys()],
-  opts: { ... }
-})
+Perbaikan pada backtest EXP-017 memang sudah masuk. Namun perubahan untuk forward-test live, pemisahan replay, promotion gate, verifier, scheduler, dan pencatatan hasil rerun belum terlihat.
 
-Harga T+1 baru dibaca pada tahap execution. Jika tidak tersedia, buy dicatat sebagai NO_FILL. Ini perbaikan yang tepat dan material.
+Jadi kemungkinan:
 
-2. EXP-017 sekarang memakai decision engine yang sama
+tim baru menyelesaikan sebagian perubahan;
+perubahan sisanya belum di-push;
+atau masih berada di working copy/VPS dan belum masuk GitHub.
+Status per komentar terakhir
+Item	Status
+Decision tidak memakai open[T+1]	✅ Selesai pada EXP-017
+EXP-017 memakai strategy_book.targetBook()	✅ Selesai
+NO_FILL untuk pembelian	✅ Selesai
+Random/reverse veto melalui shared strategy module	✅ Selesai
+Harmonic signal diturunkan sizing-nya	✅ Selesai
+Sell NO_FILL mempertahankan posisi	❌ Belum
+Point-in-time universe	❌ Belum
+LIVE terpisah dari REPLAY	❌ Belum
+PLAN dan FILL dua tahap	❌ Belum
+Strategy/code/data version	❌ Belum
+Profit factor dihitung nyata	❌ Belum
+Exact backtest-live parity test	❌ Belum
+Verifier masuk npm test	❌ Belum
+Rerun EXP-017 dicatat sebagai eksperimen baru	❌ Belum
+Cron plan/fill terpisah	❌ Belum
+Temuan yang masih blocking
+1. Forward test masih versi lama
 
-strategy_book.js ditambah vetoSelector, sehingga random control, reverse control, dan dosis veto dapat diuji tanpa menyalin ulang eligibility, ranking, POSFRAC, dan buffering. Ini menutup sumber drift terbesar antara research dan production.
+strategy_forward.js yang sekarang ada masih menerima:
 
-3. Backtest HI52W dan risk layers juga dibersihkan
+--date
+--replay
+--status
 
-backtest_hi52w_portfolio.js dan backtest_risk_layers.js sudah tidak memakai open[i+1] untuk menentukan eligibility. Ranking sekarang hanya memakai data yang tersedia sampai bar keputusan i.
+Belum ada command seperti:
 
-4. Harmonic signal sudah diturunkan
+plan
+fill
+mark
+status
 
-Harmonic yang sebelumnya memperoleh tier S dan sizing 1,0× sekarang diturunkan menjadi tier C dengan multiplier 0,25 karena EXP-018 tidak menemukan predictive power. Ini sudah lebih konsisten antara bukti riset dan tindakan sistem.
+Script masih menghitung keputusan dan langsung membaca open[i+1] pada proses yang sama. Dengan begitu, keputusan belum dibekukan sebelum harga execution diketahui.
 
-Blocker yang masih tersisa
-P0.1 — Sell NO_FILL masih salah
+Ini berarti statusnya masih:
 
-Pada EXP-017, ketika sistem ingin menjual tetapi harga open T+1 tidak tersedia, kode tetap menghapus posisi:
+Delayed historical walk-forward recorder, belum live forward test yang murni.
 
-const px = series.get(t).open[execI];
-if (px > 0) cash += u * px * (1 - SELL_COST);
-held.delete(t);
+2. Replay masih bercampur dengan live
 
-Jadi jika px tidak valid:
+Schema tabel masih tidak mempunyai:
 
-tidak ada uang hasil penjualan;
-posisi tetap dihapus;
-nilainya efektif dianggap nol;
-kejadian tidak dicatat sebagai sell NO_FILL.
-
-Ini bukan simulasi eksekusi yang benar. Posisi seharusnya tetap terbuka sampai bisa dijual, bukan dihapus tanpa proceeds. Masalah yang sama masih terlihat pada backtest HI52W dan risk-layer.
-
-Bentuk yang benar:
-
-if (!(px > 0)) {
-  sellNoFill++;
-  continue; // keep holding
-}
-
-cash += units * px * (1 - SELL_COST);
-held.delete(t);
-
-Saat mark-to-market, posisi tanpa open sebaiknya dinilai memakai last known close, bukan bernilai nol.
-
-P0.2 — Universe masih memakai informasi masa depan
-
-Sebelum backtest dimulai, ticker disaring menggunakan total observasi pada seluruh dataset:
-
-if (s.placed < 400 || s.nConc < 200) series.delete(t);
-
-Ini berarti ticker pada tahun 2024 hanya masuk universe jika sistem sudah tahu ticker tersebut kelak memiliki minimal 400 price bars dan 200 broker observations.
-
-Itu masih merupakan full-sample universe look-ahead dan survivorship/coverage bias. Filter tersebut juga masih dipakai oleh forward recorder.
-
-Yang seharusnya diperiksa pada setiap tanggal keputusan:
-
-Historical bars available as-of T
-Broker observations available as-of T
-Liquidity available as-of T
-Listing and suspension status as-of T
-
-Jangan memakai jumlah data yang baru diketahui pada akhir sample.
-
-P0.3 — Forward test masih delayed replay
-
-strategy_forward.js masih menjalankan keputusan dan execution sekaligus. Script menentukan:
-
-const lastI = tradingDates.length - 2;
-execI = i + 1;
-
-Lalu langsung membaca open[execI] dan menyimpan transaksi. Artinya keputusan baru direkam setelah harga execution tersedia di database. Ini belum merupakan forward test yang membekukan keputusan sebelum market buka.
-
-Cron juga masih hanya menjalankan satu perintah pukul 08.00 WIB:
-
-node strategy_forward.js
-
-Belum ada lifecycle terpisah untuk plan setelah close dan fill setelah open.
-
-Format yang diperlukan:
-
-strategy_forward.js plan
-strategy_forward.js fill
-strategy_forward.js mark
-strategy_forward.js status
-
-plan menyimpan target tanpa harga esok hari. fill baru membaca actual open setelah market buka.
-
-P0.4 — Replay dan live masih tercampur
-
-Argument masih berupa:
-
---replay 60
-
-Tetapi tabel tidak mempunyai run_mode, source, atau is_replay. Replay menulis ke tabel yang sama dengan live forward data.
-
-Kolom minimum:
-
-run_mode: LIVE | REPLAY
+run_mode
 decision_timestamp
 execution_timestamp
 strategy_version
 code_commit
 data_snapshot
 
-Promotion gate hanya boleh membaca run_mode = LIVE.
+--replay masih menulis ke tabel ft_strategy_positions dan ft_strategy_log yang sama dengan proses normal.
 
-P0.5 — Promotion gate masih belum dihitung
+Akibatnya, historical replay masih berpotensi masuk ke:
 
-Status hanya mengambil:
+jumlah closed trades;
+win rate;
+average return;
+promotion evaluation.
 
-jumlah transaksi;
-average net;
-win rate.
+Ini harus dipisahkan sebelum angka apa pun disebut forward performance.
 
-Tetapi console tetap menyebut syarat profit factor >= 1.10, walaupun tidak ada perhitungan profit factor dalam query atau logic tersebut.
+3. Promotion gate masih berupa tulisan
 
-Belum ada perhitungan:
+Status masih hanya mengambil:
 
-profit factor;
-portfolio equity;
-benchmark return;
-excess return;
-maximum drawdown;
-independent rebalance count;
-information ratio;
-actual implementation shortfall.
+COUNT(*)
+AVG(net_pct)
+SUM(net_pct > 0)
 
-Jadi gate saat ini masih berupa teks, belum enforcement.
+Namun output tetap menyebut:
 
-P0.6 — Verifier belum diperbaiki
+profit factor >= 1.10
 
-verify_strategy_book.js masih menggunakan toleransi longgar:
+Tidak ada kalkulasi gross profit dibagi gross loss. Tidak ada benchmark-relative return, maximum drawdown, information ratio, ataupun jumlah rebalance independen.
 
-minExcessOverBase: 0.02
-maxMDD: 0.25
+Jadi gate belum benar-benar dijalankan oleh sistem.
 
-Ia hanya memeriksa arah umum, bukan exact parity transaksi dan equity curve. Selain itu, verifier masih mengirim reverseForTest: true, tetapi strategy_book.js tidak membaca parameter tersebut. Variabel reverse juga tidak pernah diuji.
+4. Point-in-time universe belum diperbaiki
 
-Verifier yang benar harus membandingkan:
+Forward dan backtest masih melakukan filter global:
 
-Target book per date
-Buy/sell/no-fill events
-Trade count
-Cost paid
-Equity curve hash
-Final value
-Maximum drawdown
-
-Dan verify_strategy_book.js belum masuk ke perintah npm test, sehingga tidak otomatis dijalankan bersama suite utama.
-
-P0.7 — Hasil rerun belum masuk experiment registry
-
-Kode backtest sudah diubah, tetapi BACKTEST_EXPERIMENTS.md masih berakhir pada EXP-018 dan masih menyimpan angka EXP-017 lama. Tidak ada entry baru yang memperlihatkan hasil setelah:
-
-menghapus open[T+1] eligibility;
-menggunakan shared strategy module;
-menambahkan no-fill execution.
-
-Registry bahkan masih menandai sejumlah follow-up predictive-validation sebagai belum selesai.
-
-Jadi angka lama seperti CAGR 16,73% dan excess +8,71% tidak boleh otomatis dianggap tetap berlaku. Perubahan eligibility dapat mengubah universe, turnover, return, dan drawdown.
-
-P1 — Random control belum exact-size
-
-Random control sekarang memakai Bernoulli selection:
-
-for (const r of rows) {
-  if (rng() < variant.veto) banned.add(r.ticker);
+if (s.placed < 400 || s.nConc < 200) {
+  series.delete(ticker);
 }
 
-Artinya “random 20%” tidak selalu menghapus jumlah nama yang sama dengan real veto 20%. Untuk kontrol mekanis yang benar-benar comparable, random control harus memilih tepat:
+Jumlah placed dan nConc tersebut dihitung memakai seluruh dataset.
 
-k = Math.floor(eligibleWithData.length * 0.20)
+Pada keputusan historis 2024, sistem sudah mengetahui bahwa sebuah saham nantinya akan memiliki 400 price bars dan 200 concentration observations. Ini masih full-sample coverage look-ahead.
 
-nama secara seeded random.
+Eligibility seharusnya diperiksa per tanggal keputusan:
 
-P1 — Model gagal masih memengaruhi sizing
+price history available through T
+concentration history available through T
+liquidity through T
+listing status through T
+5. Exact parity verifier belum masuk
 
-Harmonic sudah diturunkan menjadi 0,25×, tetapi belum benar-benar shadow-only. AWO BUY/SELL juga masih menerima multiplier 0,4× atau 0,8× walaupun flagship AWO composite belum menunjukkan edge.
+verify_strategy_book.js belum terlihat diperbarui dari versi yang:
 
-Untuk fase validasi, output yang tidak terbukti sebaiknya:
+hanya memeriksa CAGR berada pada rentang yang masuk akal;
+tidak membandingkan trade-by-trade;
+tidak membandingkan equity curve hash;
+memakai reverseForTest, sementara parameter tersebut tidak digunakan oleh strategy_book;
+tidak memverifikasi reverse control secara nyata.
 
-sizeMultiplier = 0
-mode = SHADOW_ONLY
+Lebih penting lagi, verifier tidak terdapat dalam perintah npm test. Test suite sekarang masih hanya menjalankan sepuluh test lama.
 
-Supaya performance kandidat HI52W + broker veto tidak tercampur dengan model yang sudah gagal.
+Parity test harus memverifikasi tepat:
 
-Kesimpulan audit
+target tickers per decision date
+buy events
+sell events
+NO_FILL events
+costs
+cash
+holdings
+equity value per period
+final portfolio value
+maximum drawdown
+6. Cron masih satu tahap
 
-Perbaikan core backtest sudah bagus dan substantif. Dua isu terpenting sudah ditangani:
+Dokumentasi cron masih berisi:
 
-keputusan tidak lagi melihat open[T+1];
-EXP-017 sekarang memakai strategy_book.targetBook().
+0 1 * * 1-5 node strategy_forward.js
 
-Tetapi bukti predictive edge belum dapat dinaikkan statusnya karena:
+Belum ada pemisahan:
 
-sell no-fill masih salah;
-universe masih memakai full-sample coverage;
-forward test belum benar-benar forward;
-replay masih tercampur;
-verifier masih lemah;
-corrected backtest results belum direrun dan dicatat.
-Penilaian sekarang
-Area	Sebelumnya	Sekarang
-Research discipline	8.5	8.5
-Backtest decision integrity	5.0	7.0
-Backtest/live code parity	4.0	6.5
-Execution realism	3.5	4.5
-Forward-test validity	3.0	3.0
-Evidence of tradeable edge	4.0	4.5
+plan after close
+fill after next market open
+mark after close
 
-Verdict: kandidatnya tetap menarik, dan engineering research-nya membaik. Namun sebelum corrected EXP-017 direrun dan forward pipeline benar-benar dibekukan sebelum execution, sistem masih berstatus:
+Satu command pukul 08.00 WIB masih menjalankan model lama.
 
-Promising predictive research candidate — belum proven trading edge.
+7. Experiment registry belum diperbarui
 
-Gue belum bisa memvalidasi angka hasil akhirnya karena database MySQL historis dan output rerun tidak tersedia di repository.
+BACKTEST_EXPERIMENTS.md masih berakhir pada EXP-018 dan masih memiliki bagian Open follow-ups lama. Belum ada eksperimen baru, misalnya:
+
+EXP-019 — EXP-017 re-run after look-ahead and shared-code fixes
+
+Registry belum menampilkan angka terkoreksi setelah:
+
+menghapus tradeability look-ahead;
+memakai shared target-book implementation;
+mencatat NO_FILL;
+memperbaiki benchmark eligibility.
+
+Karena itu, angka lama seperti CAGR 16,73% dan excess +8,71% belum bisa digunakan sebagai hasil dari implementasi terbaru.
+
+Perbaikan yang memang sudah bagus
+
+Pada sisi positif, tim sudah menyelesaikan bagian yang cukup penting:
+
+strategy_book.js sekarang menyediakan vetoSelector;
+backtest EXP-017 menggunakan targetBook() yang sama dengan production decision module;
+buy-side NO_FILL sudah dicatat;
+eligibility tidak lagi menghapus saham hanya karena tidak mempunyai open pada hari berikutnya;
+random dan reverse control tidak perlu membuat ulang ranking dan buffering;
+harmonic sizing sudah diturunkan setelah tidak menunjukkan edge.
+
+Perubahan ini menaikkan integritas research backtest secara nyata.
+
+Kesimpulan
+
+Research backtest-nya sudah lebih baik, tetapi forward validation infrastructure belum selesai.
+
+Status sistem saat ini:
+
+Backtest candidate improved — live predictive edge still not independently validated.
+
+Prioritas tim berikutnya seharusnya bukan menambah indikator, tetapi menyelesaikan lima hal ini:
+
+Buat plan dan fill sebagai dua proses terpisah.
+Pisahkan LIVE dan REPLAY secara permanen.
+Hilangkan full-sample universe filter.
+Buat promotion report yang menghitung metrik secara nyata.
+Jalankan ulang EXP-017 dan append hasilnya sebagai eksperimen baru.
+
+File strategy_forward.js yang ada di GitHub memiliki SHA yang sama dengan versi audit sebelumnya. Jadi bila tim merasa sudah memperbaikinya, perubahan itu belum masuk ke branch master yang terhubung ke sini.

@@ -81,11 +81,36 @@ manual equivalent if a specific date ever needs recomputing.
  0  9   * * 1-5   paper_trader.py settle idx                    # 16:00 WIB
 ```
 
-### EXP-017 forward paper test — `ft_strategy_positions` / `ft_strategy_log`
+### EXP-017 forward paper test — `ft_strategy_plan` / `ft_strategy_positions` / `ft_strategy_log` / `ft_strategy_nav`
 ```
- 0  1 * * 1-5   node strategy_forward.js                       # 08:00 WIB
+15 13 * * 1-5   node strategy_forward.js fill                  # 20:15 WIB
+20 13 * * 1-5   node strategy_forward.js plan                  # 20:20 WIB
+25 13 * * 1-5   node strategy_forward.js mark                  # 20:25 WIB
 ```
-Added 2026-08-02. Runs **daily on purpose** even though the strategy rebalances
+Split into three stages 2026-08-03 (review P0.3). Each is independently
+observable and independently retryable, and the order is load-bearing: `fill`
+settles the previous plan into real positions first, so `plan` decides against
+the true book rather than a stale one. Running `node strategy_forward.js` with
+no subcommand does all three in that order, which is the safe fallback.
+
+**Why all three run in the evening rather than plan-after-close and
+fill-after-open.** The review asked for `fill` to run after the next market
+open, and with a live price feed that would be right. This system holds
+end-of-day data only: the T+1 open does not enter `idx_stock_prices` until that
+evening's 19:30 WIB pull. A `fill` scheduled for 10:00 WIB would find no new
+data and do nothing — the same shape of mistake as the retired `ft-pull` cron,
+which ran at 17:30 WIB, before the data it needed existed, and reported success
+anyway. So `fill` runs the evening AFTER the plan it settles, once the bar has
+genuinely landed.
+
+That preserves the property the split exists for: the plan is written to the
+database before the price that executes it is observable anywhere in this
+system. What it cannot establish is real intraday slippage, queue position or
+broker rejection — those need a live feed and a broker, and this system has
+neither. The `implementation shortfall` figure `fill` reports is
+decision-close-to-execution-open, not a fill-quality measurement.
+
+Runs **daily on purpose** even though the strategy rebalances
 biweekly: `strategy_forward.js` owns its own cadence internally (it refuses to
 decide until `REBAL_BARS` trading days have passed since the last recorded
 decision), so a missed day is simply retried the next morning and the strategy
