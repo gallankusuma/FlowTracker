@@ -106,7 +106,42 @@ async function detectMarketDirection(pool) {
  * (S&P 500) market, which also has no broker-flow data (smartMoneyConfirmed
  * is structurally always false there, same as CRYPTO).
  */
-function computeConvictionTier({ source, patternType, direction, trendAligned, smartMoneyConfirmed, signal, marketDirection, market = 'IDX' }) {
+/**
+ * SHADOW MODE (review P1, 2026-08-03).
+ *
+ * Neither signal this module tiers has demonstrated an edge. EXP-018 measured
+ * harmonic patterns at ~0% mean return after costs and found its heaviest input
+ * inverted; EXP-005 found the AWO composite underperforms a baseline. Demoting
+ * harmonic from 1.0x to 0.25x was a half-measure: a signal with no measured
+ * edge should size nothing at all, and a fraction of nothing is still nothing.
+ *
+ * The concrete harm is contamination. The HI52W + broker-veto candidate is
+ * accumulating a forward track record right now, and it must not be mixed with
+ * models already known to fail.
+ *
+ * This zeroes SIZE, not VISIBILITY: tier, reason and every badge still render,
+ * so the signals remain fully readable — they simply do not allocate. Set
+ * CONVICTION_SIZING=enabled to restore the historical multipliers, which is a
+ * deliberate act rather than a default.
+ */
+const SIZING_ENABLED = process.env.CONVICTION_SIZING === 'enabled';
+
+function shadow(t) {
+  if (SIZING_ENABLED) return t;
+  return {
+    ...t,
+    sizeMultiplier: 0,
+    mode: 'SHADOW_ONLY',
+    sizedMultiplierIfEnabled: t.sizeMultiplier,
+    reason: `${t.reason} [SHADOW_ONLY: sizes nothing — no measured edge (EXP-018 harmonic, EXP-005 AWO composite). Set CONVICTION_SIZING=enabled to override.]`,
+  };
+}
+
+function computeConvictionTier(args) {
+  return shadow(classifyConvictionTier(args));
+}
+
+function classifyConvictionTier({ source, patternType, direction, trendAligned, smartMoneyConfirmed, signal, marketDirection, market = 'IDX' }) {
   const validated = market === 'IDX';
 
   // Counter-trend hard gate REMOVED 2026-07-28 — see file header. trendAligned
@@ -162,4 +197,4 @@ function computeConvictionTier({ source, patternType, direction, trendAligned, s
   return { tier: 'B', sizeMultiplier: 0.5, reason: 'Insufficient context to classify' };
 }
 
-module.exports = { computeConvictionTier, detectMarketDirection };
+module.exports = { computeConvictionTier, classifyConvictionTier, detectMarketDirection, SIZING_ENABLED };

@@ -200,13 +200,29 @@ async function main() {
     if (variant.veto === null) return null;
     return (rows) => {
       const banned = new Set();
+      // The control must differ from the real veto in ONE way: which names it
+      // picks. Same pool, same count (review P1).
+      //
+      // It used to draw Bernoulli -- `if (rng() < 0.20) ban` -- over ALL rows.
+      // That differed twice over: the count varied around 20% instead of being
+      // 20%, and it drew from names with no POSFRAC reading, which the real
+      // veto never touches. A control that removes a different number of
+      // different candidates is not measuring the same mechanism.
+      const pool = rows.filter(r => r.posfrac !== null);
+      const k = Math.floor(pool.length * variant.veto);
+
       if (variant.random) {
-        for (const r of rows) if (rng() < variant.veto) banned.add(r.ticker);
+        // Seeded partial Fisher-Yates: exactly k distinct names, uniformly.
+        const idx = pool.map((_, z) => z);
+        for (let z = 0; z < k; z++) {
+          const j = z + Math.floor(rng() * (idx.length - z));
+          [idx[z], idx[j]] = [idx[j], idx[z]];
+          banned.add(pool[idx[z]].ticker);
+        }
         return banned;
       }
-      const withPf = rows.filter(r => r.posfrac !== null)
+      const withPf = pool.slice()
         .sort((a, b) => variant.reverse ? a.posfrac - b.posfrac : b.posfrac - a.posfrac);
-      const k = Math.floor(withPf.length * variant.veto);
       for (let z = 0; z < k; z++) banned.add(withPf[z].ticker);
       return banned;
     };
