@@ -3,5 +3,5 @@
   "wyckoff": 15,
   "smc": 20,
   "volume_profile": 15,
-  "broker_flow": 30
+  "broker_flow": 0
 }
