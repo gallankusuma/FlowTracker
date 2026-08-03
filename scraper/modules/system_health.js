@@ -44,6 +44,14 @@ const CHECKS = [
     why: 'Derived from broker data; the POSFRAC veto degrades gracefully when it is missing.' },
   { key: 'ihsg',         table: 'idx_ihsg_history',    col: 'date',        maxLag: 1, critical: true,
     why: 'The 200-day regime filter is the one layer proven to transfer out of sample. Without a fresh IHSG it cannot be evaluated, and defaulting to "invested" is exactly the wrong failure direction.' },
+  // Added 2026-08-03 after finding ft_signals had been stale since 2026-05-30.
+  // signal_engine.py had a SyntaxError and, later, an unquoted MySQL reserved
+  // word. paper_trader.py kept running eight times a day and logging "Found 0
+  // BUY/STRONG_BUY signals", which is indistinguishable from a quiet market.
+  // Two months of silence. This check is the whole argument for deriving health
+  // from data rather than from whether a job reported an error.
+  { key: 'signals',      table: 'ft_signals',          col: 'signal_date', maxLag: 3, critical: false,
+    why: 'Feeds paper_trader.py. When it goes stale the paper trader still runs and still reports zero trades, which reads as a quiet market rather than a broken pipeline.' },
 ];
 
 /** Trading days between two dates, using the IHSG calendar as the authority. */

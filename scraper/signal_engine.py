@@ -695,7 +695,7 @@ class SignalEngine:
                     'strategy_code':      code,
                     'tech_score':         tech_score,
                     'macro_score':        macro_score,
-                    'sentiment_score':    round(get_sentiment_score(ticker, market) * 0.6 + get_macro_sentiment_score().get(" score, 0) * 0.4, 2) if HAS_MARKET_INTEL else 0,
+                    'sentiment_score':    round(get_sentiment_score(ticker, market) * 0.6 + get_macro_sentiment_score().get('score', 0) * 0.4, 2) if HAS_MARKET_INTEL else 0,
                     'seasonality_score':  season_score,
                     'bandarmology_score': bando_score,
                     'final_score':        result['final_score'],
@@ -778,7 +778,7 @@ class ResultTracker:
         cur.execute("""
             SELECT id, ticker, market, entry_price
             FROM ft_signals
-            WHERE signal_date=%s AND win IS NULL AND signal IN ('BUY','STRONG_BUY')
+            WHERE signal_date=%s AND win IS NULL AND `signal` IN ('BUY','STRONG_BUY')
         """, (yesterday,))
         pending = cur.fetchall()
         log.info(f"ResultTracker: {len(pending)} signals to evaluate for {yesterday}")
@@ -823,7 +823,7 @@ class ResultTracker:
                   SUM(CASE WHEN win=0 THEN 1 ELSE 0 END) as losses,
                   SUM(CASE WHEN win IS NULL THEN 1 ELSE 0 END) as pending,
                   AVG(CASE WHEN win IS NOT NULL THEN pnl_pct END) as avg_pnl
-                FROM ft_signals WHERE strategy_code=%s AND signal IN ('BUY','STRONG_BUY')
+                FROM ft_signals WHERE strategy_code=%s AND `signal` IN ('BUY','STRONG_BUY')
             """, (code,))
             st = cur.fetchone()
             if st and st['total']:
