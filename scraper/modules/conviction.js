@@ -116,16 +116,22 @@ function computeConvictionTier({ source, patternType, direction, trendAligned, s
   const isHarmonic = source === 'harmonic' || (patternType && patternType !== 'AWO_SIGNAL');
   if (isHarmonic) {
     if (smartMoneyConfirmed) {
-      return { tier: 'S', sizeMultiplier: 1.0, reason: validated
+      // Was tier S / 1.0x. EXP-018 measured harmonic patterns at ~0% mean
+      // return after costs, so the largest allocation in the system was going
+      // to its least-evidenced signal. Demoted to the shadow tier: still shown,
+      // no longer sized. Retiring a signal means changing what it DOES, not
+      // only what it says about itself.
+      return { tier: 'C', sizeMultiplier: 0.25, reason: validated
         ? 'Smart money confirmed — pattern geometry + broker alignment. NOT validated: EXP-018 measured harmonic patterns at ~0% mean return after costs'
         : 'Smart money confirmed — structural heuristic, not backtested on this market' };
     }
     if (patternType === 'ABCD') {
-      return { tier: 'A', sizeMultiplier: 0.8, reason: validated
+      // Same demotion, same reason (EXP-018).
+      return { tier: 'C', sizeMultiplier: 0.25, reason: validated
         ? 'ABCD pattern — largest sample, but EXP-018 found no predictive power in the conviction score'
         : 'ABCD pattern — structural heuristic (pattern geometry only), not backtested on this market' };
     }
-    return { tier: 'B', sizeMultiplier: 0.5, reason: validated
+    return { tier: 'C', sizeMultiplier: 0.25, reason: validated
       ? `${patternType || 'Exotic'} pattern — too few instances, and EXP-018 found no edge in the population`
       : `${patternType || 'Exotic'} pattern — structural heuristic, not backtested on this market` };
   }
