@@ -1,0 +1,1159 @@
+{
+ "decisions": [
+  {
+   "date": "2024-04-03",
+   "exposure": 1,
+   "eligible": 97,
+   "vetoed": 18,
+   "book": [
+    "AMMN",
+    "AMRT",
+    "BBTN",
+    "BNGA",
+    "DSNG",
+    "MEDC",
+    "NISP",
+    "TPIA"
+   ],
+   "opened": [
+    "AMMN",
+    "AMRT",
+    "BBTN",
+    "BNGA",
+    "DSNG",
+    "MEDC",
+    "NISP",
+    "TPIA"
+   ],
+   "closed": []
+  },
+  {
+   "date": "2024-04-25",
+   "exposure": 1,
+   "eligible": 98,
+   "vetoed": 19,
+   "book": [
+    "AKRA",
+    "AMMN",
+    "AMRT",
+    "BBCA",
+    "CMNT",
+    "CMRY",
+    "DSNG",
+    "ELSA"
+   ],
+   "opened": [
+    "AKRA",
+    "BBCA",
+    "CMNT",
+    "CMRY",
+    "ELSA"
+   ],
+   "closed": [
+    "BBTN",
+    "BNGA",
+    "MEDC",
+    "NISP",
+    "TPIA"
+   ]
+  },
+  {
+   "date": "2024-05-14",
+   "exposure": 1,
+   "eligible": 96,
+   "vetoed": 19,
+   "book": [
+    "AMMN",
+    "AMRT",
+    "BBCA",
+    "CMRY",
+    "DOID",
+    "DSNG",
+    "EXCL",
+    "MIKA"
+   ],
+   "opened": [
+    "DOID",
+    "EXCL",
+    "MIKA"
+   ],
+   "closed": [
+    "AKRA",
+    "CMNT",
+    "ELSA"
+   ]
+  },
+  {
+   "date": "2024-05-30",
+   "exposure": 0,
+   "eligible": 95,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": [
+    "AMMN",
+    "AMRT",
+    "BBCA",
+    "CMRY",
+    "DOID",
+    "DSNG",
+    "EXCL",
+    "MIKA"
+   ]
+  },
+  {
+   "date": "2024-06-13",
+   "exposure": 0,
+   "eligible": 92,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2024-07-01",
+   "exposure": 1,
+   "eligible": 90,
+   "vetoed": 17,
+   "book": [
+    "ADRO",
+    "BBCA",
+    "CMRY",
+    "DSNG",
+    "DSSA",
+    "MIKA",
+    "SILO",
+    "UNIQ"
+   ],
+   "opened": [
+    "ADRO",
+    "BBCA",
+    "CMRY",
+    "DSNG",
+    "DSSA",
+    "MIKA",
+    "SILO",
+    "UNIQ"
+   ],
+   "closed": []
+  },
+  {
+   "date": "2024-07-15",
+   "exposure": 1,
+   "eligible": 94,
+   "vetoed": 18,
+   "book": [
+    "ADRO",
+    "AMRT",
+    "BBCA",
+    "CMNT",
+    "CPIN",
+    "CTRA",
+    "DSSA",
+    "SILO"
+   ],
+   "opened": [
+    "AMRT",
+    "CMNT",
+    "CPIN",
+    "CTRA"
+   ],
+   "closed": [
+    "CMRY",
+    "DSNG",
+    "MIKA",
+    "UNIQ"
+   ]
+  },
+  {
+   "date": "2024-07-29",
+   "exposure": 1,
+   "eligible": 92,
+   "vetoed": 18,
+   "book": [
+    "ADRO",
+    "AMRT",
+    "BBCA",
+    "CMRY",
+    "CTRA",
+    "DSNG",
+    "DSSA",
+    "MIKA"
+   ],
+   "opened": [
+    "CMRY",
+    "DSNG",
+    "MIKA"
+   ],
+   "closed": [
+    "CMNT",
+    "CPIN",
+    "SILO"
+   ]
+  },
+  {
+   "date": "2024-08-12",
+   "exposure": 1,
+   "eligible": 95,
+   "vetoed": 18,
+   "book": [
+    "ADRO",
+    "BBCA",
+    "CMRY",
+    "DSSA",
+    "JSMR",
+    "MIKA",
+    "TAPG",
+    "WIFI"
+   ],
+   "opened": [
+    "JSMR",
+    "TAPG",
+    "WIFI"
+   ],
+   "closed": [
+    "AMRT",
+    "CTRA",
+    "DSNG"
+   ]
+  },
+  {
+   "date": "2024-08-26",
+   "exposure": 1,
+   "eligible": 97,
+   "vetoed": 19,
+   "book": [
+    "ADRO",
+    "CMRY",
+    "CTRA",
+    "DSSA",
+    "ICBP",
+    "MEJA",
+    "SILO",
+    "TAPG"
+   ],
+   "opened": [
+    "CTRA",
+    "ICBP",
+    "MEJA",
+    "SILO"
+   ],
+   "closed": [
+    "BBCA",
+    "JSMR",
+    "MIKA",
+    "WIFI"
+   ]
+  },
+  {
+   "date": "2024-09-09",
+   "exposure": 1,
+   "eligible": 99,
+   "vetoed": 19,
+   "book": [
+    "ADRO",
+    "BMRI",
+    "CTRA",
+    "ICBP",
+    "LSIP",
+    "MIKA",
+    "NISP",
+    "SRTG"
+   ],
+   "opened": [
+    "BMRI",
+    "LSIP",
+    "MIKA",
+    "NISP",
+    "SRTG"
+   ],
+   "closed": [
+    "CMRY",
+    "DSSA",
+    "MEJA",
+    "SILO",
+    "TAPG"
+   ]
+  },
+  {
+   "date": "2024-09-24",
+   "exposure": 1,
+   "eligible": 103,
+   "vetoed": 20,
+   "book": [
+    "LSIP",
+    "MIKA",
+    "MYOR",
+    "NISP",
+    "PTBA",
+    "SMRA",
+    "TAPG",
+    "TINS"
+   ],
+   "opened": [
+    "MYOR",
+    "PTBA",
+    "SMRA",
+    "TAPG",
+    "TINS"
+   ],
+   "closed": [
+    "ADRO",
+    "BMRI",
+    "CTRA",
+    "ICBP",
+    "SRTG"
+   ]
+  },
+  {
+   "date": "2024-10-08",
+   "exposure": 1,
+   "eligible": 107,
+   "vetoed": 20,
+   "book": [
+    "BRMS",
+    "HRTA",
+    "LSIP",
+    "MIKA",
+    "PTBA",
+    "SMRA",
+    "TINS",
+    "UNIQ"
+   ],
+   "opened": [
+    "BRMS",
+    "HRTA",
+    "UNIQ"
+   ],
+   "closed": [
+    "MYOR",
+    "NISP",
+    "TAPG"
+   ]
+  },
+  {
+   "date": "2024-10-22",
+   "exposure": 1,
+   "eligible": 103,
+   "vetoed": 20,
+   "book": [
+    "BBCA",
+    "BRMS",
+    "CMRY",
+    "CTRA",
+    "NEST",
+    "PNBN",
+    "PTBA",
+    "UNTR"
+   ],
+   "opened": [
+    "BBCA",
+    "CMRY",
+    "CTRA",
+    "NEST",
+    "PNBN",
+    "UNTR"
+   ],
+   "closed": [
+    "HRTA",
+    "LSIP",
+    "MIKA",
+    "SMRA",
+    "TINS",
+    "UNIQ"
+   ]
+  },
+  {
+   "date": "2024-11-05",
+   "exposure": 1,
+   "eligible": 102,
+   "vetoed": 20,
+   "book": [
+    "ADRO",
+    "BBCA",
+    "CMRY",
+    "DSNG",
+    "DSSA",
+    "JPFA",
+    "NISP",
+    "PNBN"
+   ],
+   "opened": [
+    "ADRO",
+    "DSNG",
+    "DSSA",
+    "JPFA",
+    "NISP"
+   ],
+   "closed": [
+    "BRMS",
+    "CTRA",
+    "NEST",
+    "PTBA",
+    "UNTR"
+   ]
+  },
+  {
+   "date": "2024-11-19",
+   "exposure": 0,
+   "eligible": 102,
+   "vetoed": 20,
+   "book": [],
+   "opened": [],
+   "closed": [
+    "ADRO",
+    "BBCA",
+    "CMRY",
+    "DSNG",
+    "DSSA",
+    "JPFA",
+    "NISP",
+    "PNBN"
+   ]
+  },
+  {
+   "date": "2024-12-04",
+   "exposure": 1,
+   "eligible": 95,
+   "vetoed": 18,
+   "book": [
+    "BBCA",
+    "DAAZ",
+    "ITMG",
+    "JPFA",
+    "NISP",
+    "PGAS",
+    "SRTG",
+    "UNTR"
+   ],
+   "opened": [
+    "BBCA",
+    "DAAZ",
+    "ITMG",
+    "JPFA",
+    "NISP",
+    "PGAS",
+    "SRTG",
+    "UNTR"
+   ],
+   "closed": []
+  },
+  {
+   "date": "2024-12-18",
+   "exposure": 0,
+   "eligible": 95,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": [
+    "BBCA",
+    "DAAZ",
+    "ITMG",
+    "JPFA",
+    "NISP",
+    "PGAS",
+    "SRTG",
+    "UNTR"
+   ]
+  },
+  {
+   "date": "2025-01-07",
+   "exposure": 0,
+   "eligible": 88,
+   "vetoed": 17,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-01-21",
+   "exposure": 0,
+   "eligible": 84,
+   "vetoed": 16,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-02-07",
+   "exposure": 0,
+   "eligible": 91,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-02-21",
+   "exposure": 0,
+   "eligible": 91,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-03-07",
+   "exposure": 0,
+   "eligible": 94,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-03-21",
+   "exposure": 0,
+   "eligible": 94,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-04-15",
+   "exposure": 0,
+   "eligible": 90,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-04-30",
+   "exposure": 0,
+   "eligible": 95,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-05-19",
+   "exposure": 0,
+   "eligible": 100,
+   "vetoed": 19,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-06-04",
+   "exposure": 0,
+   "eligible": 101,
+   "vetoed": 19,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-06-20",
+   "exposure": 0,
+   "eligible": 97,
+   "vetoed": 19,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-07-07",
+   "exposure": 0,
+   "eligible": 94,
+   "vetoed": 18,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2025-07-21",
+   "exposure": 1,
+   "eligible": 92,
+   "vetoed": 15,
+   "book": [
+    "BRPT",
+    "DEWA",
+    "DSSA",
+    "HEAL",
+    "PGEO",
+    "SIMP",
+    "TAPG",
+    "WIFI"
+   ],
+   "opened": [
+    "BRPT",
+    "DEWA",
+    "DSSA",
+    "HEAL",
+    "PGEO",
+    "SIMP",
+    "TAPG",
+    "WIFI"
+   ],
+   "closed": []
+  },
+  {
+   "date": "2025-08-04",
+   "exposure": 1,
+   "eligible": 98,
+   "vetoed": 16,
+   "book": [
+    "AALI",
+    "DEWA",
+    "DSNG",
+    "DSSA",
+    "EMTK",
+    "HEAL",
+    "NCKL",
+    "TAPG"
+   ],
+   "opened": [
+    "AALI",
+    "DSNG",
+    "EMTK",
+    "NCKL"
+   ],
+   "closed": [
+    "BRPT",
+    "PGEO",
+    "SIMP",
+    "WIFI"
+   ]
+  },
+  {
+   "date": "2025-08-19",
+   "exposure": 1,
+   "eligible": 102,
+   "vetoed": 17,
+   "book": [
+    "AALI",
+    "DSNG",
+    "DSSA",
+    "EMTK",
+    "HEAL",
+    "NCKL",
+    "PYFA",
+    "TAPG"
+   ],
+   "opened": [
+    "PYFA"
+   ],
+   "closed": [
+    "DEWA"
+   ]
+  },
+  {
+   "date": "2025-09-02",
+   "exposure": 1,
+   "eligible": 104,
+   "vetoed": 18,
+   "book": [
+    "AALI",
+    "BRMS",
+    "DSNG",
+    "DSSA",
+    "EMTK",
+    "NCKL",
+    "NISP",
+    "TKIM"
+   ],
+   "opened": [
+    "BRMS",
+    "NISP",
+    "TKIM"
+   ],
+   "closed": [
+    "HEAL",
+    "PYFA",
+    "TAPG"
+   ]
+  },
+  {
+   "date": "2025-09-17",
+   "exposure": 1,
+   "eligible": 102,
+   "vetoed": 17,
+   "book": [
+    "BBYB",
+    "BRMS",
+    "DSSA",
+    "HEAL",
+    "MIDI",
+    "NCKL",
+    "NISP",
+    "TKIM"
+   ],
+   "opened": [
+    "BBYB",
+    "HEAL",
+    "MIDI"
+   ],
+   "closed": [
+    "AALI",
+    "DSNG",
+    "EMTK"
+   ]
+  },
+  {
+   "date": "2025-10-01",
+   "exposure": 1,
+   "eligible": 102,
+   "vetoed": 17,
+   "book": [
+    "BBYB",
+    "BRMS",
+    "DEWA",
+    "EMTK",
+    "HRTA",
+    "NCKL",
+    "NISP",
+    "TINS"
+   ],
+   "opened": [
+    "DEWA",
+    "EMTK",
+    "HRTA",
+    "TINS"
+   ],
+   "closed": [
+    "DSSA",
+    "HEAL",
+    "MIDI",
+    "TKIM"
+   ]
+  },
+  {
+   "date": "2025-10-15",
+   "exposure": 1,
+   "eligible": 103,
+   "vetoed": 18,
+   "book": [
+    "BRMS",
+    "DSSA",
+    "ELSA",
+    "HRTA",
+    "JPFA",
+    "NCKL",
+    "NISP",
+    "TINS"
+   ],
+   "opened": [
+    "DSSA",
+    "ELSA",
+    "JPFA"
+   ],
+   "closed": [
+    "BBYB",
+    "DEWA",
+    "EMTK"
+   ]
+  },
+  {
+   "date": "2025-10-29",
+   "exposure": 1,
+   "eligible": 103,
+   "vetoed": 18,
+   "book": [
+    "ADMR",
+    "AUTO",
+    "CPIN",
+    "ELSA",
+    "JPFA",
+    "NCKL",
+    "NISP",
+    "TLKM"
+   ],
+   "opened": [
+    "ADMR",
+    "AUTO",
+    "CPIN",
+    "TLKM"
+   ],
+   "closed": [
+    "BRMS",
+    "DSSA",
+    "HRTA",
+    "TINS"
+   ]
+  },
+  {
+   "date": "2025-11-12",
+   "exposure": 1,
+   "eligible": 104,
+   "vetoed": 18,
+   "book": [
+    "ADMR",
+    "AUTO",
+    "CMRY",
+    "ELSA",
+    "LSIP",
+    "PGAS",
+    "SGRO",
+    "TLKM"
+   ],
+   "opened": [
+    "CMRY",
+    "LSIP",
+    "PGAS",
+    "SGRO"
+   ],
+   "closed": [
+    "CPIN",
+    "JPFA",
+    "NCKL",
+    "NISP"
+   ]
+  },
+  {
+   "date": "2025-11-26",
+   "exposure": 1,
+   "eligible": 101,
+   "vetoed": 17,
+   "book": [
+    "AUTO",
+    "BUMI",
+    "DSSA",
+    "INKP",
+    "LSIP",
+    "PGAS",
+    "SGRO",
+    "WIIM"
+   ],
+   "opened": [
+    "BUMI",
+    "DSSA",
+    "INKP",
+    "WIIM"
+   ],
+   "closed": [
+    "ADMR",
+    "CMRY",
+    "ELSA",
+    "TLKM"
+   ]
+  },
+  {
+   "date": "2025-12-10",
+   "exposure": 1,
+   "eligible": 99,
+   "vetoed": 17,
+   "book": [
+    "ADMR",
+    "BULL",
+    "BUMI",
+    "DEWA",
+    "DSSA",
+    "EXCL",
+    "PGAS",
+    "SGRO"
+   ],
+   "opened": [
+    "ADMR",
+    "BULL",
+    "DEWA",
+    "EXCL"
+   ],
+   "closed": [
+    "AUTO",
+    "INKP",
+    "LSIP",
+    "WIIM"
+   ]
+  },
+  {
+   "date": "2025-12-24",
+   "exposure": 1,
+   "eligible": 101,
+   "vetoed": 17,
+   "book": [
+    "ALII",
+    "EXCL",
+    "HRTA",
+    "INCO",
+    "INKP",
+    "MTEL",
+    "SGRO",
+    "TKIM"
+   ],
+   "opened": [
+    "ALII",
+    "HRTA",
+    "INCO",
+    "INKP",
+    "MTEL",
+    "TKIM"
+   ],
+   "closed": [
+    "ADMR",
+    "BULL",
+    "BUMI",
+    "DEWA",
+    "DSSA",
+    "PGAS"
+   ]
+  },
+  {
+   "date": "2026-01-13",
+   "exposure": 1,
+   "eligible": 103,
+   "vetoed": 18,
+   "book": [
+    "ANTM",
+    "INCO",
+    "INKP",
+    "MBMA",
+    "MDKA",
+    "SGRO",
+    "TINS",
+    "TKIM"
+   ],
+   "opened": [
+    "ANTM",
+    "MBMA",
+    "MDKA",
+    "TINS"
+   ],
+   "closed": [
+    "ALII",
+    "EXCL",
+    "HRTA",
+    "MTEL"
+   ]
+  },
+  {
+   "date": "2026-01-28",
+   "exposure": 1,
+   "eligible": 114,
+   "vetoed": 19,
+   "book": [
+    "ANTM",
+    "BJTM",
+    "BNGA",
+    "INCO",
+    "JPFA",
+    "MDKA",
+    "NISP",
+    "TKIM"
+   ],
+   "opened": [
+    "BJTM",
+    "BNGA",
+    "JPFA",
+    "NISP"
+   ],
+   "closed": [
+    "INKP",
+    "MBMA",
+    "SGRO",
+    "TINS"
+   ]
+  },
+  {
+   "date": "2026-02-11",
+   "exposure": 1,
+   "eligible": 112,
+   "vetoed": 19,
+   "book": [
+    "BBTN",
+    "BJTM",
+    "BNGA",
+    "INCO",
+    "NISP",
+    "TINS",
+    "ULTJ",
+    "WIIM"
+   ],
+   "opened": [
+    "BBTN",
+    "TINS",
+    "ULTJ",
+    "WIIM"
+   ],
+   "closed": [
+    "ANTM",
+    "JPFA",
+    "MDKA",
+    "TKIM"
+   ]
+  },
+  {
+   "date": "2026-02-27",
+   "exposure": 1,
+   "eligible": 106,
+   "vetoed": 17,
+   "book": [
+    "AUTO",
+    "BBTN",
+    "BNGA",
+    "HRTA",
+    "NISP",
+    "TINS",
+    "TKIM",
+    "ULTJ"
+   ],
+   "opened": [
+    "AUTO",
+    "HRTA",
+    "TKIM"
+   ],
+   "closed": [
+    "BJTM",
+    "INCO",
+    "WIIM"
+   ]
+  },
+  {
+   "date": "2026-03-13",
+   "exposure": 0,
+   "eligible": 101,
+   "vetoed": 16,
+   "book": [],
+   "opened": [],
+   "closed": [
+    "AUTO",
+    "BBTN",
+    "BNGA",
+    "HRTA",
+    "NISP",
+    "TINS",
+    "TKIM",
+    "ULTJ"
+   ]
+  },
+  {
+   "date": "2026-04-06",
+   "exposure": 0,
+   "eligible": 92,
+   "vetoed": 15,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2026-04-20",
+   "exposure": 0,
+   "eligible": 92,
+   "vetoed": 15,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2026-05-05",
+   "exposure": 0,
+   "eligible": 96,
+   "vetoed": 16,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2026-05-21",
+   "exposure": 0,
+   "eligible": 101,
+   "vetoed": 16,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2026-06-09",
+   "exposure": 0,
+   "eligible": 102,
+   "vetoed": 16,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2026-06-24",
+   "exposure": 0,
+   "eligible": 94,
+   "vetoed": 15,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2026-07-08",
+   "exposure": 0,
+   "eligible": 83,
+   "vetoed": 13,
+   "book": [],
+   "opened": [],
+   "closed": []
+  },
+  {
+   "date": "2026-07-22",
+   "exposure": 0,
+   "eligible": 78,
+   "vetoed": 14,
+   "book": [],
+   "opened": [],
+   "closed": []
+  }
+ ],
+ "equity": [
+  0.998,
+  0.978333,
+  0.980097,
+  0.996897,
+  0.996897,
+  0.994903,
+  0.996555,
+  1.002911,
+  1.060297,
+  1.114159,
+  1.0532,
+  1.096125,
+  1.118635,
+  1.209705,
+  1.187136,
+  1.131951,
+  1.129687,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.114456,
+  1.112227,
+  1.151099,
+  1.317158,
+  1.379646,
+  1.371586,
+  1.465839,
+  1.664806,
+  1.558405,
+  1.515489,
+  1.53151,
+  1.579166,
+  1.636557,
+  1.802386,
+  1.73261,
+  1.767345,
+  1.81508,
+  1.608266,
+  1.608266,
+  1.608266,
+  1.608266,
+  1.608266,
+  1.608266,
+  1.608266,
+  1.608266,
+  1.608266
+ ],
+ "trades": 266,
+ "noFill": 0,
+ "costPaid": 0.104863,
+ "finalEquity": 1.608266,
+ "maxDrawdown": 0.113942,
+ "cagr": 0.237646,
+ "hash": "9bd690bd827d353af1fd66ae67c732a1"
+}

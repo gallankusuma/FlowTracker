@@ -1,23 +1,44 @@
 /**
- * Proves that modules/strategy_book.js — the module the LIVE forward test will
- * use — reproduces EXP-017's backtested strategy.
+ * Exact verification of modules/strategy_book.js — the module the live forward
+ * test and every backtest now share.
  *
- * This is the check that makes the forward test meaningful. `awo_paper_trades`
- * broke precisely because the live path and the tested path were separate
- * implementations; nothing compared them, so the divergence was invisible for
- * weeks. Here, history is replayed through the live module's own targetBook()
- * and the resulting portfolio is compared against EXP-017's published numbers.
+ * WHAT THIS USED TO BE, AND WHY IT WAS WORTHLESS
+ * ----------------------------------------------
+ * The previous version asserted the replay landed in a "plausible
+ * neighbourhood": excess over baseline >= 2%, drawdown <= 25%. Those pass for a
+ * very wide range of broken modules. It also built a `reverse` variant by
+ * passing `reverseForTest: true` — a flag strategy_book.js never read — and then
+ * never asserted on the result or even printed it. A control that is computed
+ * and discarded is worse than no control: it produces the appearance of rigour
+ * with none of the substance. The 2026-08-03 review caught both.
  *
- * A mismatch means the live book would trade something other than what was
- * tested, and the forward test would be measuring the wrong strategy.
+ * WHAT IT IS NOW
+ * --------------
+ * 1. GOLDEN FIXTURE. The replay records the exact target book on every decision
+ *    date, every open and close, trade count, costs, final equity and max
+ *    drawdown, then hashes the whole thing. Any change to the module that moves
+ *    any of those numbers fails this test loudly. Regenerate deliberately with
+ *    --update-golden when a change is intended, and the diff in the fixture
+ *    file is then the record of what changed.
  *
- * Usage: node verify_strategy_book.js
+ * 2. A REVERSE CONTROL THAT ACTUALLY RUNS. Now possible because strategy_book
+ *    exposes `vetoSelector`. Banning the LEAST-accumulated names must HURT
+ *    relative to banning the most-accumulated; if it helps, the effect has
+ *    nothing to do with the signal's direction and EXP-017 is measuring an
+ *    artifact.
+ *
+ * 3. NO-LOOKAHEAD. Truncating every bar after the decision must leave the book
+ *    byte-identical.
+ *
+ * Usage: node verify_strategy_book.js [--update-golden]
  */
 'use strict';
 require('dotenv').config();
 
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 const mysql = require('mysql2/promise');
-const stats = require('./modules/statistics');
 const sb = require('./modules/strategy_book');
 
 const DB = {
@@ -27,24 +48,23 @@ const DB = {
   database: process.env.DB_NAME || 'erp_manufacturing',
 };
 
+const GOLDEN = path.join(__dirname, 'fixtures', 'strategy_book.golden.json');
 const BUY_COST = 0.20 / 100, SELL_COST = 0.30 / 100, TRADING_DAYS_YEAR = 245;
-const REBAL_BARS = 10;   // biweekly — the frozen configuration
+const REBAL_BARS = 10;
 const PARAMS = { positions: 8, bufferMult: 2, vetoFrac: 0.20, exitOnVeto: true };
-
-// EXP-017 reported, for the frozen cell family, a mean excess of +8.71% and a
-// mean maxDD of 13.83% across 9 cells. This replay runs ONE cell (biweekly,
-// buffer x2), so it must land in a plausible neighbourhood rather than match a
-// cross-cell mean exactly. The assertions below are deliberately loose about
-// level and strict about SIGN and ORDER — those are what a code-path divergence
-// would break.
-const EXPECT = { minExcessOverBase: 0.02, maxMDD: 0.25 };
 
 const toDateStr = d => d instanceof Date
   ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   : String(d).split('T')[0];
-const pct = v => (v === null || !Number.isFinite(v)) ? 'n/a' : (v * 100).toFixed(2) + '%';
+const r6 = v => (v === null || !Number.isFinite(v)) ? null : Math.round(v * 1e6) / 1e6;
 
-async function loadAll(pool) {
+let pass = 0, fail = 0;
+function check(name, cond, detail) {
+  if (cond) { pass++; console.log(`  PASS  ${name}`); }
+  else { fail++; console.log(`  FAIL  ${name}${detail ? '\n          ' + detail : ''}`); }
+}
+
+async function load(pool) {
   const [ihsgRows] = await pool.query('SELECT date, close_price FROM idx_ihsg_history ORDER BY date ASC');
   const tradingDates = ihsgRows.map(r => toDateStr(r.date));
   const ihsgClose = ihsgRows.map(r => Number(r.close_price));
@@ -69,8 +89,7 @@ async function loadAll(pool) {
     s.close[i] = c; s.value[i] = Number(r.value) || c * Number(r.volume || 0);
     s.placed++;
   }
-
-  const [concRows] = await pool.query('SELECT stock_code, data_date, dn0 FROM idx_concentration ORDER BY data_date ASC');
+  const [concRows] = await pool.query('SELECT stock_code, data_date, dn0 FROM idx_concentration');
   let concStart = Infinity;
   for (const r of concRows) {
     const i = dateIdx.get(toDateStr(r.data_date));
@@ -83,128 +102,170 @@ async function loadAll(pool) {
     if (i < concStart) concStart = i;
   }
   for (const [t, s] of series) if (s.placed < 400 || s.nConc < 200) series.delete(t);
-
-  return { tradingDates, ihsgClose, ihsgSma: sb.smaSeries(ihsgClose, sb.DEFAULTS.regimeSma), series, concStart, n };
+  return { tradingDates, ihsgClose, ihsgSma: sb.smaSeries(ihsgClose, sb.DEFAULTS.regimeSma), series, concStart };
 }
 
-/** Portfolio replay driven ENTIRELY by strategy_book.targetBook(). */
-function replay({ series, ihsgClose, ihsgSma, firstI, lastI, params }) {
+/**
+ * Replay driven entirely by strategy_book.targetBook(), recording everything the
+ * golden fixture pins — not just the headline return.
+ */
+function replay(ctx, firstI, lastI, params) {
+  const { series, ihsgClose, ihsgSma, tradingDates } = ctx;
   let cash = 1.0;
   const held = new Map();
-  const curve = [];
-  let flatPeriods = 0, periods = 0, tradeCount = 0;
+  const decisions = [], equity = [];
+  let trades = 0, costPaid = 0, noFill = 0;
 
   for (let i = firstI; i <= lastI; i += REBAL_BARS) {
     const execI = i + 1;
     if (execI > lastI + 1) break;
-    const decision = sb.targetBook({
-      series, i, ihsgClose, ihsgSma,
-      currentHoldings: [...held.keys()], opts: params,
-    });
-    periods++;
-    if (decision.exposure === 0) flatPeriods++;
+    const d = sb.targetBook({ series, i, ihsgClose, ihsgSma, currentHoldings: [...held.keys()], opts: params });
 
     let pv = cash;
     for (const [t, u] of held) { const px = series.get(t).open[execI]; if (px > 0) pv += u * px; }
 
-    const tset = new Set(decision.target);
+    const tset = new Set(d.target);
+    const closed = [], opened = [];
     for (const [t, u] of [...held]) {
       if (tset.has(t)) continue;
       const px = series.get(t).open[execI];
-      if (px > 0) cash += u * px * (1 - SELL_COST);
-      held.delete(t); tradeCount++;
+      if (!(px > 0)) { held.delete(t); continue; }
+      const fee = u * px * SELL_COST;
+      cash += u * px - fee; costPaid += fee; trades++;
+      closed.push(t); held.delete(t);
     }
-    const toBuy = decision.target.filter(t => !held.has(t));
-    if (toBuy.length) {
-      const per = (pv * decision.exposure) / Math.max(decision.target.length, 1);
-      for (const t of toBuy) {
-        const px = series.get(t).open[execI];
-        if (!(px > 0)) continue;
-        const spend = Math.min(per, cash);
-        if (spend <= 0) break;
-        cash -= spend; held.set(t, (held.get(t) || 0) + (spend * (1 - BUY_COST)) / px);
-        tradeCount++;
-      }
+    for (const t of d.target.filter(x => !held.has(x))) {
+      const px = series.get(t).open[execI];
+      if (!(px > 0)) { noFill++; continue; }
+      const spend = Math.min(pv / Math.max(d.target.length, 1) * d.exposure, cash);
+      if (spend <= 0) continue;
+      const fee = spend * BUY_COST;
+      cash -= spend; costPaid += fee; trades++;
+      held.set(t, (spend - fee) / px);
+      opened.push(t);
     }
+
     let mv = cash;
     for (const [t, u] of held) { const px = series.get(t).open[execI]; if (px > 0) mv += u * px; }
-    curve.push(mv);
+    equity.push(r6(mv));
+    decisions.push({
+      date: tradingDates[i], exposure: d.exposure, eligible: d.eligible,
+      vetoed: d.vetoedCount, book: d.target.slice().sort(),
+      opened: opened.sort(), closed: closed.sort(),
+    });
   }
+
   let final = cash;
   for (const [t, u] of held) {
     const s = series.get(t);
     for (let j = lastI; j >= 0; j--) if (s.close[j] > 0) { final += u * s.close[j] * (1 - SELL_COST); break; }
   }
-  curve.push(final);
-
   let peak = -Infinity, mdd = 0;
-  for (const v of curve) { if (v > peak) peak = v; if (peak > 0) mdd = Math.max(mdd, (peak - v) / peak); }
+  for (const v of equity.concat([final])) { if (v > peak) peak = v; if (peak > 0) mdd = Math.max(mdd, (peak - v) / peak); }
   const years = (lastI - firstI) / TRADING_DAYS_YEAR;
-  return { cagr: Math.pow(final, 1 / years) - 1, mdd, final, flatPct: periods ? flatPeriods / periods : 0, tradeCount, periods };
+
+  return {
+    decisions, equity,
+    trades, noFill,
+    costPaid: r6(costPaid),
+    finalEquity: r6(final),
+    maxDrawdown: r6(mdd),
+    cagr: r6(Math.pow(final, 1 / years) - 1),
+    hash: crypto.createHash('sha256')
+      .update(JSON.stringify({ decisions, equity, trades, costPaid: r6(costPaid), finalEquity: r6(final) }))
+      .digest('hex').slice(0, 32),
+  };
 }
 
 (async () => {
+  const update = process.argv.includes('--update-golden');
   const pool = mysql.createPool({ ...DB, waitForConnections: true, connectionLimit: 5 });
-  const { tradingDates, ihsgClose, ihsgSma, series, concStart } = await loadAll(pool);
+  const ctx = await load(pool);
 
-  const firstI = Math.max(concStart + sb.DEFAULTS.posfracWindow, sb.DEFAULTS.hiBars, sb.DEFAULTS.regimeSma);
-  const lastI = tradingDates.length - 2;
+  const firstI = Math.max(ctx.concStart + sb.DEFAULTS.posfracWindow, sb.DEFAULTS.hiBars, sb.DEFAULTS.regimeSma);
+  const lastI = ctx.tradingDates.length - 2;
 
-  console.log('='.repeat(96));
-  console.log('VERIFY — does the LIVE module reproduce the EXP-017 strategy?');
-  console.log('='.repeat(96));
-  console.log(`Window   : ${tradingDates[firstI]} .. ${tradingDates[lastI]}`);
-  console.log(`Universe : ${series.size} tickers`);
-  console.log(`Config   : biweekly, ${JSON.stringify(PARAMS)}\n`);
+  console.log('='.repeat(92));
+  console.log('VERIFY strategy_book.js — exact fixture comparison, not a plausibility range');
+  console.log('='.repeat(92));
+  console.log(`Window ${ctx.tradingDates[firstI]} .. ${ctx.tradingDates[lastI]}   universe ${ctx.series.size}\n`);
 
-  const withVeto = replay({ series, ihsgClose, ihsgSma, firstI, lastI, params: PARAMS });
-  const noVeto = replay({ series, ihsgClose, ihsgSma, firstI, lastI, params: { ...PARAMS, vetoFrac: 0, exitOnVeto: false } });
-  const reverse = replay({ series, ihsgClose, ihsgSma, firstI, lastI, params: { ...PARAMS, vetoFrac: 0.20, exitOnVeto: true, reverseForTest: true } });
+  const run = replay(ctx, firstI, lastI, PARAMS);
+  console.log(`  decisions ${run.decisions.length}  trades ${run.trades}  noFill ${run.noFill}`);
+  console.log(`  finalEquity ${run.finalEquity}  maxDD ${(run.maxDrawdown * 100).toFixed(2)}%  cagr ${(run.cagr * 100).toFixed(2)}%`);
+  console.log(`  hash ${run.hash}\n`);
 
-  console.log(`  BASE (veto off)   CAGR ${pct(noVeto.cagr)}   maxDD ${pct(noVeto.mdd)}   trades ${noVeto.tradeCount}`);
-  console.log(`  VETO 20% +exit    CAGR ${pct(withVeto.cagr)}   maxDD ${pct(withVeto.mdd)}   trades ${withVeto.tradeCount}`);
-  console.log(`  periods flat (regime): ${pct(withVeto.flatPct)} of ${withVeto.periods} rebalances\n`);
-
-  let pass = 0, fail = 0;
-  const check = (name, cond, detail) => {
-    if (cond) { pass++; console.log(`  PASS  ${name}`); }
-    else { fail++; console.log(`  FAIL  ${name}${detail ? ' — ' + detail : ''}`); }
-  };
-
-  check('veto version beats the no-veto version (EXP-017 sign)',
-    withVeto.cagr - noVeto.cagr >= EXPECT.minExcessOverBase,
-    `delta ${pct(withVeto.cagr - noVeto.cagr)}`);
-  check('drawdown is not worse than the no-veto version',
-    withVeto.mdd <= noVeto.mdd + 0.02, `${pct(withVeto.mdd)} vs ${pct(noVeto.mdd)}`);
-  check('drawdown within a sane bound', withVeto.mdd <= EXPECT.maxMDD, pct(withVeto.mdd));
-  check('regime filter actually stands aside sometimes', withVeto.flatPct > 0.05 && withVeto.flatPct < 0.7, pct(withVeto.flatPct));
-  check('book actually trades', withVeto.tradeCount > 50, String(withVeto.tradeCount));
-
-  // Determinism: the live module must produce the same book twice.
-  const a = sb.targetBook({ series, i: lastI, ihsgClose, ihsgSma, currentHoldings: [], opts: PARAMS });
-  const b = sb.targetBook({ series, i: lastI, ihsgClose, ihsgSma, currentHoldings: [], opts: PARAMS });
-  check('targetBook is deterministic', JSON.stringify(a.target) === JSON.stringify(b.target));
-
-  // No-lookahead: the book at i must not change when future bars are removed.
-  const truncated = new Map();
-  for (const [t, s] of series) {
-    truncated.set(t, {
-      open: s.open.slice(0, lastI + 1), high: s.high.slice(0, lastI + 1),
-      close: s.close.slice(0, lastI + 1), value: s.value.slice(0, lastI + 1),
-      dn0: s.dn0.slice(0, lastI + 1),
-    });
+  if (update) {
+    fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
+    fs.writeFileSync(GOLDEN, JSON.stringify(run, null, 1));
+    console.log(`  GOLDEN FIXTURE WRITTEN -> ${GOLDEN}`);
+    console.log('  Commit it. From now on any change to these numbers fails the test.');
+    await pool.end();
+    return;
   }
-  const c = sb.targetBook({
-    series: truncated, i: lastI, ihsgClose: ihsgClose.slice(0, lastI + 1),
-    ihsgSma: ihsgSma.slice(0, lastI + 1), currentHoldings: [], opts: PARAMS,
-  });
-  check('NO LOOKAHEAD: truncating all future bars leaves the book identical',
-    JSON.stringify(a.target) === JSON.stringify(c.target),
-    `${JSON.stringify(a.target)} vs ${JSON.stringify(c.target)}`);
 
-  console.log(`\n  TODAY'S BOOK (${tradingDates[lastI]}): ${a.reason}`);
-  console.log(`    eligible ${a.eligible}, vetoed ${a.vetoedCount}`);
-  console.log(`    target: ${a.target.length ? a.target.join(', ') : '(flat — standing aside)'}`);
+  console.log('GOLDEN FIXTURE COMPARISON');
+  if (!fs.existsSync(GOLDEN)) {
+    console.log('  FAIL  no fixture — run once with --update-golden and commit the result');
+    fail++;
+  } else {
+    const g = JSON.parse(fs.readFileSync(GOLDEN, 'utf8'));
+    check('decision count matches', g.decisions.length === run.decisions.length,
+      `${g.decisions.length} vs ${run.decisions.length}`);
+    check('trade count matches', g.trades === run.trades, `${g.trades} vs ${run.trades}`);
+    check('NO_FILL count matches', g.noFill === run.noFill, `${g.noFill} vs ${run.noFill}`);
+    check('costs paid match', g.costPaid === run.costPaid, `${g.costPaid} vs ${run.costPaid}`);
+    check('final equity matches', g.finalEquity === run.finalEquity, `${g.finalEquity} vs ${run.finalEquity}`);
+    check('max drawdown matches', g.maxDrawdown === run.maxDrawdown, `${g.maxDrawdown} vs ${run.maxDrawdown}`);
+    check('full equity curve matches', JSON.stringify(g.equity) === JSON.stringify(run.equity),
+      'the curve diverged — diff the fixture to see where');
+
+    // Per-date book comparison, reporting the FIRST divergence rather than only that one exists.
+    let firstDiff = null;
+    for (let k = 0; k < Math.min(g.decisions.length, run.decisions.length); k++) {
+      const a = g.decisions[k], b = run.decisions[k];
+      if (JSON.stringify(a) !== JSON.stringify(b)) { firstDiff = { k, a, b }; break; }
+    }
+    check('every per-date target book, open and close matches', firstDiff === null,
+      firstDiff ? `first divergence on ${firstDiff.b.date}:\n          golden ${JSON.stringify(firstDiff.a.book)}\n          now    ${JSON.stringify(firstDiff.b.book)}` : '');
+    check('overall hash matches', g.hash === run.hash, `${g.hash} vs ${run.hash}`);
+  }
+
+  // ── The reverse control, this time actually wired ────────────────────────
+  console.log('\nREVERSE CONTROL (now genuinely wired via vetoSelector)');
+  const leastAccumulatedSelector = (rows, p) => {
+    const withPf = rows.filter(r => r.posfrac !== null).sort((a, b) => a.posfrac - b.posfrac);
+    const k = Math.floor(withPf.length * p.vetoFrac);
+    const banned = new Set();
+    for (let z = 0; z < k; z++) banned.add(withPf[z].ticker);
+    return banned;
+  };
+  const reverse = replay(ctx, firstI, lastI, { ...PARAMS, vetoSelector: leastAccumulatedSelector });
+  const noVeto = replay(ctx, firstI, lastI, { ...PARAMS, vetoFrac: 0, exitOnVeto: false });
+
+  console.log(`  veto most-accumulated  CAGR ${(run.cagr * 100).toFixed(2)}%`);
+  console.log(`  veto least-accumulated CAGR ${(reverse.cagr * 100).toFixed(2)}%   <- must be WORSE`);
+  console.log(`  no veto                CAGR ${(noVeto.cagr * 100).toFixed(2)}%`);
+
+  check('reverse control produces a DIFFERENT book (proves the hook is wired)',
+    reverse.hash !== run.hash, 'identical hash means vetoSelector was ignored — the old bug');
+  check('vetoing the least-accumulated is WORSE than vetoing the most-accumulated',
+    reverse.cagr < run.cagr, `${(reverse.cagr * 100).toFixed(2)}% vs ${(run.cagr * 100).toFixed(2)}%`);
+
+  // ── No lookahead ─────────────────────────────────────────────────────────
+  console.log('\nNO-LOOKAHEAD');
+  const a = sb.targetBook({ series: ctx.series, i: lastI, ihsgClose: ctx.ihsgClose, ihsgSma: ctx.ihsgSma, currentHoldings: [], opts: PARAMS });
+  const truncated = new Map();
+  for (const [t, s] of ctx.series) truncated.set(t, {
+    open: s.open.slice(0, lastI + 1), high: s.high.slice(0, lastI + 1),
+    close: s.close.slice(0, lastI + 1), value: s.value.slice(0, lastI + 1), dn0: s.dn0.slice(0, lastI + 1),
+  });
+  const b = sb.targetBook({ series: truncated, i: lastI, ihsgClose: ctx.ihsgClose.slice(0, lastI + 1), ihsgSma: ctx.ihsgSma.slice(0, lastI + 1), currentHoldings: [], opts: PARAMS });
+  check('truncating every future bar leaves the book identical',
+    JSON.stringify(a.target) === JSON.stringify(b.target), `${JSON.stringify(a.target)} vs ${JSON.stringify(b.target)}`);
+
+  const c = sb.targetBook({ series: ctx.series, i: lastI, ihsgClose: ctx.ihsgClose, ihsgSma: ctx.ihsgSma, currentHoldings: [], opts: PARAMS });
+  check('targetBook is deterministic', JSON.stringify(a.target) === JSON.stringify(c.target));
 
   console.log(`\n${pass} passed, ${fail} failed`);
   await pool.end();
