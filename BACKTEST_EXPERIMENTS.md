@@ -779,6 +779,58 @@ Recommended configuration to freeze: **HI52W top-8 + 200d-SMA regime filter + PO
 
 ---
 
+## EXP-2026-08-02-018 — Harmonic conviction has no predictive power, and its heaviest input is inverted
+
+**Script**: `scraper/backtest_harmonic_conviction_ic.js`. Replays `detectHarmonicPatterns` + `calcUltraConviction` at historical as-of dates using the production 180-bar window, every 10 trading days, over 245 tickers and 10 years. 2,112 fresh pattern instances (D-point formed within 5 bars). Forward returns net of the 0.50% round trip, direction-adjusted so a BEARISH setup is scored against a fall.
+
+**Context**: this experiment was proposed on the reasoning that harmonic patterns are event-driven and rare (low turnover — the problem that killed HI52W), plausibly orthogonal to both momentum and broker flow, and carry natural structural invalidation levels. All three arguments were sound. The data does not support the conclusion.
+
+### Finding 1 — read the level before the ranking
+
+Mean forward return across all 2,112 patterns, after costs:
+
+| horizon | 20D | 40D | 60D |
+|---|---|---|---|
+| mean return | **−0.44%** | **+0.06%** | **−0.00%** |
+
+**Harmonic patterns produce essentially nothing after costs, at any horizon.** Not negative enough to fade, not positive enough to trade. Whatever the score says about *which* patterns are better, the population it ranks has no edge to distribute.
+
+This directly contradicts what the application currently tells users. `modules/conviction.js` displays *"Smart money confirmed — 73%→87% win rate, replicated across 2 market regimes"* and *"ABCD pattern — largest validated sample (695 events), ~73-75% win rate"*. Those figures came from `backtest_harmonic_winrate.js`, whose own header flags them provisional, computed under the F4/F6/F7/dn0 formulas fixed on 2026-07-28 and never regenerated. A population with a genuine 73-87% win rate does not produce a 0.06% mean return.
+
+### Finding 2 — the inversion hypothesis holds
+
+IC of the conviction score against forward return at 40D:
+
+| variant | IC 20D | IC 40D | IC 60D |
+|---|---|---|---|
+| **AS_IS** (production) | +0.0041 | **−0.0179** | −0.0185 |
+| **INVERTED** (broker data sign flipped) | −0.0089 | −0.0020 | −0.0066 |
+| **OFF** (broker_flow weight 0) | +0.0083 | **+0.0014** | −0.0037 |
+
+Per-year IC at 40D, restricted to the years where broker data actually exists:
+
+```
+              2024     2025     2026
+AS_IS        +0.032   -0.005   +0.040
+INVERTED     +0.055   +0.071   +0.234
+OFF          +0.074   +0.063   +0.050
+```
+
+2017-2023 are byte-identical across all three variants — `idx_concentration` begins 2024-01-02, so before that `broker_flow` contributes nothing and the variants collapse to the same score. That is a useful internal check that the harness is doing what it claims.
+
+In every year where the component is live, **removing or inverting broker_flow beats leaving it as-is.** That is consistent with EXP-016: `calcUltraConviction`'s E1 block awards +10 when the last three dn0 readings are all positive for a bullish setup, and persistent positive dn0 is precisely what EXP-016 measured as predicting underperformance. The heaviest category in the score — 30 of 100 points, more than harmonic, smc, wyckoff or volume_profile — is awarding its points backwards.
+
+**Caveat on the strength of that claim**: `idx_broker_flow_detail` only starts 2025-12, so `foreignNet`/`bigMoneyNet` are zero for almost the whole sample and this is effectively a test of the E1 concentration component alone. The 2026 INVERTED reading of +0.234 is a small-sample outlier and should not be quoted.
+
+**Status**: the harmonic layer is **not a promising direction**, and the argument that it was — made before testing it — was wrong. It is a production signal source: the nightly cron auto-saves its top 20 patterns into `ft_recommendations` every night, and the UI presents win-rate claims for it that this experiment does not support.
+
+**Decisions this drives**:
+1. Remove or heavily qualify the 73-87% win-rate text in `modules/conviction.js`. It is displayed to a user as an established finding and it is not one.
+2. Set `broker_flow` weight to 0 in the harmonic scan pending a redesign. Inverting it scores marginally better than leaving it, but building on a component whose only virtue is being backwards is not a design — removing it is the honest interim.
+3. Do not integrate harmonic into the HI52W book. There is nothing to integrate.
+
+---
+
 ## Open follow-ups (not yet done)
 
 - **Re-run EXP-001 through EXP-010 on 10-year data under both horizons** — this is now the highest-value open item. The headline finding ("AWO Full is worse than random entry") was established on a single ~2-year regime with a 15-bar exit; both of those constraints are gone. Report SWING and POSITION side by side rather than replacing one with the other, and label everything survivorship-biased.
