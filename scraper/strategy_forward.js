@@ -228,6 +228,14 @@ async function setup(pool) {
       vetoed INT NOT NULL,
       target_json TEXT NULL,
       reference_json TEXT NULL,
+      -- The execution contract this plan was decided under (review P0.2
+      -- residual). strategy_hash covers the STRATEGY; it does not move when a
+      -- code-only deploy changes fills, costs or sizing, so a plan could still
+      -- be executed by an implementation it was not decided against — now
+      -- inside one hash, which is harder to spot afterwards. Compared at fill.
+      buy_cost DECIMAL(10,6) NULL,
+      sell_cost DECIMAL(10,6) NULL,
+      execution_ledger_version INT NULL,
       status ENUM('PLANNED','PARTIALLY_FILLED','EXECUTED','EXPIRED') NOT NULL DEFAULT 'PLANNED',
       nofill_json TEXT NULL,
       executed_at DATETIME NULL,
@@ -364,6 +372,14 @@ async function migrateNavTable(pool) {
 }
 
 async function migratePlanTable(pool) {
+  const contract = [];
+  if (!(await hasColumn(pool, 'ft_strategy_plan', 'buy_cost'))) contract.push('ADD COLUMN buy_cost DECIMAL(10,6) NULL');
+  if (!(await hasColumn(pool, 'ft_strategy_plan', 'sell_cost'))) contract.push('ADD COLUMN sell_cost DECIMAL(10,6) NULL');
+  if (!(await hasColumn(pool, 'ft_strategy_plan', 'execution_ledger_version'))) contract.push('ADD COLUMN execution_ledger_version INT NULL');
+  if (contract.length) {
+    await pool.query(`ALTER TABLE ft_strategy_plan ${contract.join(', ')}`);
+    console.log('MIGRATION: ft_strategy_plan gained its execution contract (buy_cost / sell_cost / execution_ledger_version)');
+  }
   if (!(await hasColumn(pool, 'ft_strategy_plan', 'nofill_json'))) {
     await pool.query('ALTER TABLE ft_strategy_plan ADD COLUMN nofill_json TEXT NULL');
     console.log('MIGRATION: ft_strategy_plan.nofill_json added');
@@ -486,6 +502,31 @@ async function reclassifyBatchWrites(pool) {
   if (batched.affectedRows || orphans.affectedRows) {
     console.log(`PROVENANCE REPAIR: ${batched.affectedRows} log row(s) and ${orphans.affectedRows} position(s) predating source_command were inferred to be REPLAY.`);
     console.log('  Inference is used only for rows written before provenance was recorded, and only within one strategy_hash.');
+  }
+
+  // SEAL THE REMAINDER. The inference above is a ONE-TIME classification of rows
+  // that predate provenance; everything it did not flip keeps whatever run_mode
+  // it already had, and is now stamped so it can never be re-examined.
+  //
+  // Without this the previous commit's claim — "becomes a permanent no-op once
+  // the historical rows are labelled" — was simply not implemented. Nothing
+  // labelled them. Every pre-provenance row stayed source_command IS NULL and
+  // stayed eligible for the timestamp rule on EVERY startup, forever. A cron
+  // outage that legitimately produced two same-second LIVE log rows before this
+  // deploy would be relabelled REPLAY on the next restart, and its fills with
+  // it, and the promotion gate would lose them.
+  //
+  // Sealing runs AFTER the inference so the one-time classification still gets
+  // its chance on a database restored from before provenance existed.
+  let sealed = 0;
+  for (const t of ['ft_strategy_log', 'ft_strategy_positions']) {
+    const [r] = await pool.query(
+      `UPDATE ${t} SET source_command = CONCAT('LEGACY_', run_mode) WHERE source_command IS NULL`);
+    sealed += r.affectedRows;
+  }
+  if (sealed) {
+    console.log(`PROVENANCE SEALED: ${sealed} pre-provenance row(s) stamped LEGACY_<run_mode>.`);
+    console.log('  The timestamp heuristic can never re-examine them; it is a no-op from here.');
   }
 }
 
@@ -678,10 +719,12 @@ async function cmdPlan(pool, ctx, quiet, ids) {
   await pool.query(
     `INSERT INTO ft_strategy_plan
        (strategy_id, as_of_date, run_mode, generated_at, data_snapshot_hash, strategy_hash, code_commit,
-        exposure, reason, regime_label, eligible, vetoed, target_json, reference_json, status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PLANNED')`,
+        exposure, reason, regime_label, eligible, vetoed, target_json, reference_json,
+        buy_cost, sell_cost, execution_ledger_version, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PLANNED')`,
     [strategyId, asOf, 'LIVE', nowSql, snapshotHash(ctx), strategyHash, CODE_COMMIT,
-     d.exposure, d.reason, regimeLabel, d.eligible, d.vetoedCount, JSON.stringify(d.target), JSON.stringify(reference)]);
+     d.exposure, d.reason, regimeLabel, d.eligible, d.vetoedCount, JSON.stringify(d.target), JSON.stringify(reference),
+     BUY_COST, SELL_COST, EXECUTION_LEDGER_VERSION]);
 
   if (!quiet) {
     console.log(`PLAN  ${asOf}  ${d.reason}   [market ${regimeLabel || 'UNKNOWN'}]`);
@@ -730,11 +773,26 @@ async function cmdFill(pool, ctx, quiet, ids) {
   // would contain trades executed by implementation B, and A would no longer
   // describe what actually happened. Keeping old implementations around to
   // replay them faithfully is the alternative, and it is not worth it here.
-  const stale = plans.filter(p => p.strategy_hash && p.strategy_hash !== strategyHash);
+  // A plan is stale if its STRATEGY differs, or if the EXECUTION CONTRACT it was
+  // decided under differs from the one this process would apply. The hash alone
+  // misses the second case: a deploy that changes buyFill, sizing or the ledger
+  // version without touching EFFECTIVE_CONFIG leaves the hash identical, so the
+  // old plan would be filled by new machinery and recorded as if nothing had
+  // changed (review P0.2 residual).
+  const contractDiffers = p =>
+    (p.buy_cost !== null && Number(p.buy_cost) !== BUY_COST) ||
+    (p.sell_cost !== null && Number(p.sell_cost) !== SELL_COST) ||
+    (p.execution_ledger_version !== null && Number(p.execution_ledger_version) !== EXECUTION_LEDGER_VERSION);
+  const stale = plans.filter(p => (p.strategy_hash && p.strategy_hash !== strategyHash) || contractDiffers(p));
   for (const p of stale) {
     await pool.query(
       `UPDATE ft_strategy_plan SET status='EXPIRED', nofill_json=? WHERE id=?`,
-      [JSON.stringify({ expired: 'EXPIRED_CONFIG_CHANGE', planHash: p.strategy_hash, runningHash: strategyHash }), p.id]);
+      [JSON.stringify({
+        expired: p.strategy_hash && p.strategy_hash !== strategyHash ? 'EXPIRED_CONFIG_CHANGE' : 'EXPIRED_EXECUTION_CONTRACT',
+        planHash: p.strategy_hash, runningHash: strategyHash,
+        planContract: { buy: p.buy_cost, sell: p.sell_cost, ledger: p.execution_ledger_version },
+        runningContract: { buy: BUY_COST, sell: SELL_COST, ledger: EXECUTION_LEDGER_VERSION },
+      }), p.id]);
   }
   if (stale.length && !quiet) {
     console.log(`FILL  ${stale.length} plan(s) EXPIRED — decided by a different configuration, and this code cannot execute them faithfully`);
@@ -749,7 +807,7 @@ async function cmdFill(pool, ctx, quiet, ids) {
   let shortfallSum = 0, shortfallN = 0;
 
   for (const p of plans) {
-    if (p.strategy_hash && p.strategy_hash !== strategyHash) continue;   // expired above
+    if ((p.strategy_hash && p.strategy_hash !== strategyHash) || contractDiffers(p)) continue;   // expired above
     const asOf = toDateStr(p.as_of_date);
     const i = dateIdx.get(asOf);
     if (i === undefined) continue;
@@ -806,10 +864,11 @@ async function cmdFill(pool, ctx, quiet, ids) {
         const soldProceeds = soldUnits * px * (1 - SELL_COST);
         const [upd] = await conn.query(
           `UPDATE ft_strategy_positions SET status='CLOSED', exit_date=?, exit_price=?, exit_reason=?,
-                  gross_pct=?, net_pct=?, proceeds=?, execution_observed_at=?
+                  gross_pct=?, net_pct=?, proceeds=?, execution_observed_at=?,
+                  source_command=COALESCE(source_command,'LIVE_FILL'), run_id=COALESCE(run_id,?)
             WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=? AND strategy_hash=?`,
           [tradingDates[execI], px, exposure === 0 ? 'REGIME_FLAT' : 'REBALANCE',
-           gross.toFixed(4), (gross - (BUY_COST + SELL_COST) * 100).toFixed(4), soldProceeds.toFixed(8), nowSql,
+           gross.toFixed(4), (gross - (BUY_COST + SELL_COST) * 100).toFixed(4), soldProceeds.toFixed(8), nowSql, RUN_ID,
            strategyId, row.ticker, toDateStr(row.entry_date), 'LIVE', planHash]);
         // P0.4: a narrowed UPDATE, like INSERT IGNORE, can match nothing.
         // Counting regardless let the log claim a position was closed when the
@@ -1127,12 +1186,12 @@ function cashAt(rows, dateStr) {
  * additive figure, so two accounting methods could disagree about whether the
  * same record passed (review P0.6).
  */
-function navAt(rows, series, i, dateStr) {
+function navAt(rows, series, i, dateStr, priceFn = barPrice) {
   let nav = cashAt(rows, dateStr);
   for (const r of rows) {
     if (toDateStr(r.entry_date) > dateStr) continue;
     if (r.exit_date && toDateStr(r.exit_date) <= dateStr) continue;
-    const px = barPrice(series.get(r.ticker), i);
+    const px = priceFn(series.get(r.ticker), i);
     if (px === null) continue;
     nav += Number(r.units || 0) * px;
   }
@@ -1325,8 +1384,13 @@ async function reportFor(pool, ctx, runMode, ids) {
   // both dates are printed.
   const observedNav = navRow && navRow.total_nav !== null ? Number(navRow.total_nav) : null;
   const navDate = navRow ? toDateStr(navRow.mark_date) : null;
+  // Same date AND the same price function. cmdMark values holdings with
+  // exec.markPrice (close-preferring); navAt goes through barPrice, which
+  // prefers the OPEN. On a day the market gaps and fades, those differ by the
+  // whole intraday move, so the two NAVs disagreed for a reason that had nothing
+  // to do with the ledger (review P1.2 residual).
   const reconstructedNav = navDate && ctx.dateIdx.has(navDate)
-    ? navAt(ledger, ctx.series, ctx.dateIdx.get(navDate), navDate)
+    ? navAt(ledger, ctx.series, ctx.dateIdx.get(navDate), navDate, exec.markPrice)
     : (portRet === null ? null : 1 + portRet);
   const navGap = (observedNav !== null && reconstructedNav !== null) ? observedNav - reconstructedNav : null;
 
@@ -1500,7 +1564,7 @@ async function main() {
   await pool.end();
 }
 
-module.exports = { setup, loadSeries, reportFor, periodReturns, snapshotHash, cashAt, navAt, INITIAL_CAPITAL, cmdPlan, cmdFill, cmdMark, backfillRegimeLabels, STRATEGY_HASH, EFFECTIVE_CONFIG };
+module.exports = { setup, loadSeries, reportFor, reclassifyBatchWrites, periodReturns, snapshotHash, cashAt, navAt, INITIAL_CAPITAL, cmdPlan, cmdFill, cmdMark, backfillRegimeLabels, STRATEGY_HASH, EFFECTIVE_CONFIG };
 
 if (require.main === module) {
   main().catch(e => { console.error('FATAL', e); process.exit(1); });

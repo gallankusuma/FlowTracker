@@ -160,6 +160,46 @@ async function cleanup(pool) {
       assert.ok(Math.abs(Number(navs[1].v) - 0.80) < 1e-6, `B kept its NAV, got ${navs[1].v}`);
     });
 
+    console.log('\nforward schema — the provenance repair cannot eat genuine LIVE rows');
+    {
+      // The outage shape the repair used to misread: fill is down for two
+      // cadences, plan keeps running, then ONE cmdFill drains both plans and
+      // writes two LIVE log rows inside the same second. The old rule called
+      // that a replay batch and deleted two real decisions from the gate.
+      const sameSecond = '2026-02-02 09:00:00';
+      for (const d of ['2026-02-02', '2026-02-16']) {
+        await pool.query(
+          `INSERT IGNORE INTO ft_strategy_log
+             (strategy_id, as_of_date, exposure, reason, regime_label, eligible, vetoed, n_target,
+              run_mode, strategy_hash, source_command, run_id, created_at)
+           VALUES (?,?,1,'INVESTED','BULL',50,10,8,'LIVE',?,'LIVE_FILL','run-abc',?)`,
+          [TEST_ID, d, HASH_A, sameSecond]);
+      }
+      await sf.reclassifyBatchWrites(pool);
+      const [afterRepair] = await pool.query(
+        'SELECT run_mode FROM ft_strategy_log WHERE strategy_id=? AND strategy_hash=?', [TEST_ID, HASH_A]);
+      t('two LIVE decisions filled in the same second stay LIVE', () => {
+        assert.ok(afterRepair.length >= 2, `only ${afterRepair.length} rows`);
+        assert.ok(afterRepair.every(r => r.run_mode === 'LIVE'),
+          'recorded provenance must beat timestamp inference: ' + JSON.stringify(afterRepair.map(r => r.run_mode)));
+      });
+
+      // And a row with no recorded provenance is SEALED, so a later startup can
+      // never revisit it. Without this the heuristic stayed live forever.
+      await pool.query(
+        `INSERT IGNORE INTO ft_strategy_log
+           (strategy_id, as_of_date, exposure, reason, eligible, vetoed, n_target, run_mode, strategy_hash)
+         VALUES (?,'2026-03-02',1,'INVESTED',50,10,8,'LIVE',?)`, [TEST_ID, HASH_B]);
+      await sf.reclassifyBatchWrites(pool);
+      const [[legacy]] = await pool.query(
+        "SELECT source_command FROM ft_strategy_log WHERE strategy_id=? AND as_of_date='2026-03-02'", [TEST_ID]);
+      t('a pre-provenance row is sealed rather than left open to re-inference', () => {
+        assert.ok(legacy && legacy.source_command !== null,
+          'source_command is still NULL, so the heuristic can revisit it on every startup');
+        assert.ok(/^LEGACY_/.test(legacy.source_command), legacy.source_command);
+      });
+    }
+
     console.log('\nforward lifecycle — the log is scoped too');
 
     const log = async (hash, date) => {
