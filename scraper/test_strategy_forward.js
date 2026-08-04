@@ -73,6 +73,26 @@ function pos(ticker, entryDate, entryPx, spend, exitDate, exitPx) {
 
 console.log('\nperiodReturns — one authoritative NAV series');
 
+// port[0] is the DEPLOYMENT LEG added for review P1.1: INITIAL_CAPITAL to the
+// NAV after the first execution, so the cost of opening the book is inside the
+// reported return instead of sitting in its denominator. The first HOLDING
+// period is therefore port[1].
+const HOLD = 1;
+
+t('the deployment leg charges the cost of opening the book', () => {
+  const ctx = makeCtx({ AAA: flat(100) });
+  const rows = [pos('AAA', DATES[1], 100, 1.0)];
+  const { port } = periodReturns(ctx, LOG, rows);
+  assert.ok(Math.abs(port[0] - (-BUY_COST)) < 1e-9,
+    `expected the ${(BUY_COST * 100).toFixed(2)}% opening cost, got ${(port[0] * 100).toFixed(3)}%`);
+});
+
+t('with nothing bought, the deployment leg is flat rather than a loss', () => {
+  const ctx = makeCtx({ AAA: flat(100) });
+  const { port } = periodReturns(ctx, LOG, []);
+  assert.ok(Math.abs(port[0]) < 1e-12, `got ${port[0]}`);
+});
+
 t('the NAV path, not a weighted price move, is what is reported', () => {
   // Half the book in each of two names, one +10% and one -10%.
   const ctx = makeCtx({ AAA: move(100, 110), BBB: move(100, 90), CCC: move(100, 150) });
@@ -81,10 +101,10 @@ t('the NAV path, not a weighted price move, is what is reported', () => {
   const { port } = periodReturns(ctx, log, rows);
   const nav0 = navAt(rows, ctx.series, 1, DATES[1]);
   const nav1 = navAt(rows, ctx.series, 3, DATES[3]);
-  assert.ok(Math.abs(port[0] - (nav1 / nav0 - 1)) < 1e-12, 'port must BE the NAV ratio');
+  assert.ok(Math.abs(port[HOLD] - (nav1 / nav0 - 1)) < 1e-12, 'the holding period must BE the NAV ratio');
   // +10% and -10% cancel, so the book is flat. A plan-based reading would have
   // priced CCC, which was never bought, at (0.10 - 0.10 + 0.50) / 3 = +16.67%.
-  assert.ok(Math.abs(port[0]) < 1e-9, `expected flat, got ${(port[0] * 100).toFixed(3)}%`);
+  assert.ok(Math.abs(port[HOLD]) < 1e-9, `expected flat, got ${(port[HOLD] * 100).toFixed(3)}%`);
 });
 
 t('a PARTIAL fill leaves the rest in cash and earns nothing on it', () => {
@@ -94,7 +114,7 @@ t('a PARTIAL fill leaves the rest in cash and earns nothing on it', () => {
   const { port } = periodReturns(ctx, LOG, rows);
   // Deployed half at +20% is about +10% on the book. An unweighted mean over
   // the filled names would have said +20%, reinvesting the idle cash.
-  assert.ok(port[0] > 0.095 && port[0] < 0.105, `expected about +10%, got ${(port[0] * 100).toFixed(3)}%`);
+  assert.ok(port[HOLD] > 0.095 && port[HOLD] < 0.105, `expected about +10%, got ${(port[HOLD] * 100).toFixed(3)}%`);
 });
 
 t('a position that failed to SELL still counts — it used to vanish', () => {
@@ -103,7 +123,7 @@ t('a position that failed to SELL still counts — it used to vanish', () => {
   const ctx = makeCtx({ STUCK: move(100, 80) });
   const rows = [pos('STUCK', DATES[0], 100, 1.0)];
   const { port } = periodReturns(ctx, LOG, rows);
-  assert.ok(port[0] < -0.19 && port[0] > -0.21, `expected about -20%, got ${(port[0] * 100).toFixed(3)}%`);
+  assert.ok(port[HOLD] < -0.19 && port[HOLD] > -0.21, `expected about -20%, got ${(port[HOLD] * 100).toFixed(3)}%`);
 });
 
 t('a HALTED holding is marked at its last real close, not dropped', () => {
@@ -113,7 +133,7 @@ t('a HALTED holding is marked at its last real close, not dropped', () => {
   ] });
   const rows = [pos('HALT', DATES[0], 100, 1.0)];
   const { port } = periodReturns(ctx, LOG, rows);
-  assert.ok(port[0] < -0.29 && port[0] > -0.31, `expected about -30% from the last real close, got ${(port[0] * 100).toFixed(3)}%`);
+  assert.ok(port[HOLD] < -0.29 && port[HOLD] > -0.31, `expected about -30% from the last real close, got ${(port[HOLD] * 100).toFixed(3)}%`);
 });
 
 t('the ledger ignores a planned name that never filled', () => {
@@ -121,7 +141,7 @@ t('the ledger ignores a planned name that never filled', () => {
   const log = LOG.map(l => ({ ...l, target_json: '["AAA","GHOST"]' }));
   const rows = [pos('AAA', DATES[1], 100, 0.5)];
   const { port } = periodReturns(ctx, log, rows);
-  assert.ok(Math.abs(port[0]) < 1e-9, 'GHOST was planned, never filled, and must contribute nothing');
+  assert.ok(Math.abs(port[HOLD]) < 1e-9, 'GHOST was planned, never filled, and must contribute nothing');
 });
 
 console.log('\ncashAt / navAt — the book cannot spend what it does not have');
@@ -178,7 +198,8 @@ t('regimes come from the recorded label, never from the reason string', () => {
     { as_of_date: DATES[2], exposure: 1, reason: 'REGIME_FLAT — IHSG below its own 200d SMA', regime_label: 'BULL', target_json: '[]' },
   ];
   const { regimes } = periodReturns(ctx, log, []);
-  assert.deepStrictEqual(regimes, ['BULL'], JSON.stringify(regimes));
+  // One label for the deployment leg, one for the holding period.
+  assert.deepStrictEqual(regimes, ['BULL', 'BULL'], JSON.stringify(regimes));
 });
 
 t('a missing label is null, not a fabricated regime', () => {
@@ -188,7 +209,7 @@ t('a missing label is null, not a fabricated regime', () => {
     { as_of_date: DATES[2], exposure: 1, reason: 'INVESTED', regime_label: null, target_json: '[]' },
   ];
   const { regimes } = periodReturns(ctx, log, []);
-  assert.deepStrictEqual(regimes, [null]);
+  assert.deepStrictEqual(regimes, [null, null]);
 });
 
 console.log('\nsnapshotHash — content, not shape');
