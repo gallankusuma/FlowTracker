@@ -163,7 +163,8 @@ async function setup(pool) {
       vetoed INT NOT NULL,
       target_json TEXT NULL,
       reference_json TEXT NULL,
-      status ENUM('PLANNED','EXECUTED','EXPIRED') NOT NULL DEFAULT 'PLANNED',
+      status ENUM('PLANNED','PARTIALLY_FILLED','EXECUTED','EXPIRED') NOT NULL DEFAULT 'PLANNED',
+      nofill_json TEXT NULL,
       executed_at DATETIME NULL,
       execution_date DATE NULL,
       UNIQUE KEY uq_plan (strategy_id, as_of_date),
@@ -179,11 +180,48 @@ async function setup(pool) {
       open_positions INT NOT NULL,
       unrealised_pct DECIMAL(10,4) NULL,
       unmarkable VARCHAR(255) NULL,
+      cash_value DECIMAL(16,6) NULL,
+      market_value DECIMAL(16,6) NULL,
+      total_nav DECIMAL(16,6) NULL,
+      realized_pnl DECIMAL(16,6) NULL,
+      unrealized_pnl DECIMAL(16,6) NULL,
+      gross_exposure DECIMAL(16,6) NULL,
+      benchmark_nav DECIMAL(16,6) NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE KEY uq_mark (strategy_id, mark_date, run_mode)
     )`);
 
+  await migratePlanTable(pool);
+  await migrateNavTable(pool);
   await migrateProvenance(pool);
+}
+
+/**
+ * Bring an already-created ft_strategy_plan up to date: PARTIALLY_FILLED became
+ * a real state and per-ticker no-fills are recorded (review P1.2).
+ */
+async function migrateNavTable(pool) {
+  const cols = ['cash_value', 'market_value', 'total_nav', 'realized_pnl', 'unrealized_pnl', 'gross_exposure', 'benchmark_nav'];
+  const missing = [];
+  for (const c of cols) if (!(await hasColumn(pool, 'ft_strategy_nav', c))) missing.push(c);
+  if (!missing.length) return;
+  await pool.query(`ALTER TABLE ft_strategy_nav ${missing.map(c => `ADD COLUMN ${c} DECIMAL(16,6) NULL`).join(', ')}`);
+  console.log(`MIGRATION: ft_strategy_nav gained ${missing.join(', ')} — it now stores a NAV, not just an unrealised percentage`);
+}
+
+async function migratePlanTable(pool) {
+  if (!(await hasColumn(pool, 'ft_strategy_plan', 'nofill_json'))) {
+    await pool.query('ALTER TABLE ft_strategy_plan ADD COLUMN nofill_json TEXT NULL');
+    console.log('MIGRATION: ft_strategy_plan.nofill_json added');
+  }
+  const [[col]] = await pool.query(
+    `SELECT COLUMN_TYPE t FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ft_strategy_plan' AND COLUMN_NAME = 'status'`);
+  if (col && !/PARTIALLY_FILLED/.test(col.t)) {
+    await pool.query(
+      "ALTER TABLE ft_strategy_plan MODIFY COLUMN status ENUM('PLANNED','PARTIALLY_FILLED','EXECUTED','EXPIRED') NOT NULL DEFAULT 'PLANNED'");
+    console.log('MIGRATION: ft_strategy_plan.status gained PARTIALLY_FILLED');
+  }
 }
 
 /**
@@ -428,10 +466,15 @@ async function cmdFill(pool, ctx, quiet) {
   const { tradingDates, dateIdx, series } = ctx;
   const nowSql = new Date().toISOString().slice(0, 19).replace('T', ' ');
   const [plans] = await pool.query(
-    `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND status=? ORDER BY as_of_date`,
-    [STRATEGY_ID, 'LIVE', 'PLANNED']);
+    `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND status IN ('PLANNED','PARTIALLY_FILLED') ORDER BY as_of_date`,
+    [STRATEGY_ID, 'LIVE']);
 
-  let executed = 0, opened = 0, closed = 0, missed = 0, waiting = 0;
+  // Run-level totals for the console line only. The PER-PLAN counters live
+  // inside the loop: they used to be declared out here and written into every
+  // plan's ft_strategy_log row, so with two pending plans the second row got
+  // the first plan's activity added to its own (review P1.3).
+  let executed = 0, partial = 0, waiting = 0;
+  let totOpened = 0, totClosed = 0, totMissed = 0;
   let shortfallSum = 0, shortfallN = 0;
 
   for (const p of plans) {
@@ -446,94 +489,191 @@ async function cmdFill(pool, ctx, quiet) {
     const tset = new Set(target);
     const exposure = Number(p.exposure);
 
-    const [openRows] = await pool.query(
-      'SELECT ticker, entry_price, entry_date FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
-      [STRATEGY_ID, 'OPEN', 'LIVE']);
+    // One transaction per plan, so a crash cannot leave a plan half-executed
+    // with its status already advanced (review P1.3). The work was already
+    // idempotent enough to be re-runnable, but the sell-done/buy-not-done
+    // window could still corrupt a NAV mark taken in between.
+    const conn = await pool.getConnection();
+    let opened = 0, closed = 0;
+    const noFill = { buy: [], sell: [] };
+    try {
+      await conn.beginTransaction();
 
-    for (const row of openRows) {
-      if (tset.has(row.ticker)) continue;
-      const px = exec.sellFill(series.get(row.ticker), execI);
-      if (px === null) { missed++; continue; }        // keep holding, retry next plan (review P0.1)
-      const entry = Number(row.entry_price);
-      const gross = ((px - entry) / entry) * 100;
-      await pool.query(
-        `UPDATE ft_strategy_positions SET status='CLOSED', exit_date=?, exit_price=?, exit_reason=?,
-                gross_pct=?, net_pct=?, execution_observed_at=?
-          WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=?`,
-        [tradingDates[execI], px, exposure === 0 ? 'REGIME_FLAT' : 'REBALANCE',
-         gross.toFixed(4), (gross - (BUY_COST + SELL_COST) * 100).toFixed(4), nowSql,
-         STRATEGY_ID, row.ticker, toDateStr(row.entry_date), 'LIVE']);
-      closed++;
+      const [openRows] = await conn.query(
+        'SELECT ticker, entry_price, entry_date, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
+        [STRATEGY_ID, 'OPEN', 'LIVE']);
+
+      const stranded = [];      // wanted out, could not get out
+      for (const row of openRows) {
+        if (tset.has(row.ticker)) continue;
+        const px = exec.sellFill(series.get(row.ticker), execI);
+        if (px === null) { noFill.sell.push(row.ticker); stranded.push(row); continue; }
+        const entry = Number(row.entry_price);
+        const gross = ((px - entry) / entry) * 100;
+        await conn.query(
+          `UPDATE ft_strategy_positions SET status='CLOSED', exit_date=?, exit_price=?, exit_reason=?,
+                  gross_pct=?, net_pct=?, execution_observed_at=?
+            WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=?`,
+          [tradingDates[execI], px, exposure === 0 ? 'REGIME_FLAT' : 'REBALANCE',
+           gross.toFixed(4), (gross - (BUY_COST + SELL_COST) * 100).toFixed(4), nowSql,
+           STRATEGY_ID, row.ticker, toDateStr(row.entry_date), 'LIVE']);
+        closed++;
+      }
+
+      const retained = openRows.filter(r => tset.has(r.ticker));
+      const heldNow = new Set(retained.map(r => r.ticker));
+
+      // CAPACITY BEFORE SIZE (review P0.2). New positions used to be sized at
+      // 1/target.length regardless of what was already committed, so a failed
+      // sell left capital tied up AND the replacement was bought at full
+      // weight: 8 targets plus 2 stranded names is 10 positions at 1/8 each,
+      // 125% of the book. Nothing anywhere corrected it.
+      //
+      // The reviewer attributed this to `heldNow`, which is wrong -- a stranded
+      // name is by definition absent from `target`, so the buy loop could never
+      // have touched it and fixing `heldNow` would change nothing. The defect
+      // is the DENOMINATOR: it has to be the capacity that is actually free.
+      const committed = [...retained, ...stranded]
+        .reduce((s, r) => s + Number(r.weight || 0), 0);
+      const toBuy = target.filter(t => !heldNow.has(t));
+      const capacity = Math.max(0, 1 - committed);
+      const perName = toBuy.length ? capacity / toBuy.length : 0;
+
+      for (const t of toBuy) {
+        if (!(perName > 0)) { noFill.buy.push(t); continue; }   // no capacity left
+        const px = exec.buyFill(series.get(t), execI);
+        if (px === null) { noFill.buy.push(t); continue; }
+        // Implementation shortfall: what the decision saw vs what it paid.
+        if (reference[t] > 0) { shortfallSum += (px - reference[t]) / reference[t]; shortfallN++; }
+        await conn.query(
+          `INSERT IGNORE INTO ft_strategy_positions
+             (strategy_id, ticker, entry_date, entry_price, weight,
+              run_mode, decision_date, decision_created_at, data_available_at, execution_observed_at,
+              strategy_hash, code_commit)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+          [STRATEGY_ID, t, tradingDates[execI], px, perName.toFixed(5),
+           'LIVE', asOf, p.generated_at, p.generated_at, nowSql, STRATEGY_HASH, CODE_COMMIT]);
+        opened++;
+      }
+
+      await conn.query(
+        `INSERT IGNORE INTO ft_strategy_log
+           (strategy_id, as_of_date, exposure, reason, eligible, vetoed, n_target, opened, closed, target_json,
+            run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [STRATEGY_ID, asOf, exposure, p.reason, p.eligible, p.vetoed, target.length, opened, closed,
+         p.target_json, 'LIVE', p.generated_at, p.generated_at, STRATEGY_HASH, CODE_COMMIT]);
+
+      // PARTIALLY_FILLED is a real state (review P1.2). Marking a plan EXECUTED
+      // when part of it did not fill throws away the only record that intent and
+      // outcome diverged -- which is the single thing this whole lifecycle exists
+      // to capture.
+      const anyNoFill = noFill.buy.length + noFill.sell.length > 0;
+      await conn.query(
+        `UPDATE ft_strategy_plan SET status=?, executed_at=?, execution_date=?, nofill_json=? WHERE id=?`,
+        [anyNoFill ? 'PARTIALLY_FILLED' : 'EXECUTED', nowSql, tradingDates[execI],
+         anyNoFill ? JSON.stringify(noFill) : null, p.id]);
+
+      await conn.commit();
+      if (anyNoFill) partial++; else executed++;
+      totOpened += opened; totClosed += closed;
+      totMissed += noFill.buy.length + noFill.sell.length;
+    } catch (e) {
+      await conn.rollback();
+      console.error(`FILL  plan ${asOf} rolled back: ${e.message}`);
+    } finally {
+      conn.release();
     }
-
-    const heldNow = new Set(openRows.filter(r => tset.has(r.ticker)).map(r => r.ticker));
-    for (const t of target) {
-      if (heldNow.has(t)) continue;
-      const px = exec.buyFill(series.get(t), execI);
-      if (px === null) { missed++; continue; }
-      // Implementation shortfall: what the decision saw vs what it paid.
-      if (reference[t] > 0) { shortfallSum += (px - reference[t]) / reference[t]; shortfallN++; }
-      await pool.query(
-        `INSERT IGNORE INTO ft_strategy_positions
-           (strategy_id, ticker, entry_date, entry_price, weight,
-            run_mode, decision_date, decision_created_at, data_available_at, execution_observed_at,
-            strategy_hash, code_commit)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [STRATEGY_ID, t, tradingDates[execI], px, (1 / Math.max(target.length, 1)).toFixed(5),
-         'LIVE', asOf, p.generated_at, p.generated_at, nowSql, STRATEGY_HASH, CODE_COMMIT]);
-      opened++;
-    }
-
-    await pool.query(
-      `INSERT IGNORE INTO ft_strategy_log
-         (strategy_id, as_of_date, exposure, reason, eligible, vetoed, n_target, opened, closed, target_json,
-          run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [STRATEGY_ID, asOf, exposure, p.reason, p.eligible, p.vetoed, target.length, opened, closed,
-       p.target_json, 'LIVE', p.generated_at, p.generated_at, STRATEGY_HASH, CODE_COMMIT]);
-
-    await pool.query(
-      `UPDATE ft_strategy_plan SET status='EXECUTED', executed_at=?, execution_date=? WHERE id=?`,
-      [nowSql, tradingDates[execI], p.id]);
-    executed++;
   }
 
   if (!quiet) {
-    console.log(`FILL  executed ${executed} plan(s)   opened ${opened}, closed ${closed}, no-fill ${missed}`);
+    console.log(`FILL  ${executed} fully executed, ${partial} partially filled   opened ${totOpened}, closed ${totClosed}, no-fill ${totMissed}`);
     if (waiting) console.log(`      ${waiting} plan(s) still awaiting an execution bar — correct, not an error`);
     if (shortfallN) console.log(`      implementation shortfall ${(shortfallSum / shortfallN * 100).toFixed(3)}% mean (decision close -> execution open)`);
-    if (!executed && !waiting) console.log('      nothing to do.');
+    if (!executed && !partial && !waiting) console.log('      nothing to do.');
   }
-  return { executed, opened, closed, missed, waiting };
+  return { executed, partial, opened: totOpened, closed: totClosed, missed: totMissed, waiting };
 }
 
-/** MARK — record today's net asset value so the LIVE equity curve is observed, not reconstructed. */
+/**
+ * MARK — record a real net asset value, so the LIVE equity curve is OBSERVED
+ * rather than reconstructed from the plan at report time (review P0.3).
+ *
+ * This used to store only `unrealised_pct`, a weighted sum of open-position
+ * returns. That is not a NAV: it excluded realized P&L entirely, carried no
+ * cash, and no report ever read it — `reportFor` rebuilt everything from the
+ * target book instead.
+ *
+ * The accounting base is a notional book of 1.0, because the ledger records
+ * WEIGHTS, not share counts — this recorder deliberately holds no capital. Every
+ * field below is a fraction of that book and they reconcile:
+ *
+ *   gross_exposure  = Σ weight of open positions
+ *   market_value    = Σ weight × (mark / entry)        current value of that slice
+ *   unrealized_pnl  = market_value − gross_exposure
+ *   realized_pnl    = Σ over closed positions of weight × net_pct
+ *   cash_value      = 1 − gross_exposure + realized_pnl
+ *   total_nav       = cash_value + market_value = 1 + realized_pnl + unrealized_pnl
+ *
+ * What it is NOT: compounded. Weights are fractions of the ORIGINAL book, so
+ * gains are not reinvested. Stated here rather than papered over — a true
+ * compounding NAV needs a capital base and share counts, which is a different
+ * recorder from this one.
+ */
 async function cmdMark(pool, ctx, quiet) {
-  const { tradingDates, series } = ctx;
+  const { tradingDates, series, ihsgClose, dateIdx } = ctx;
   const i = tradingDates.length - 1;
+
   const [openRows] = await pool.query(
     'SELECT ticker, entry_price, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
     [STRATEGY_ID, 'OPEN', 'LIVE']);
+  const [[realizedRow]] = await pool.query(
+    `SELECT COALESCE(SUM(weight * net_pct / 100), 0) r FROM ft_strategy_positions
+      WHERE strategy_id=? AND status='CLOSED' AND run_mode='LIVE'`, [STRATEGY_ID]);
+  const [[firstRow]] = await pool.query(
+    `SELECT MIN(as_of_date) d FROM ft_strategy_log WHERE strategy_id=? AND run_mode='LIVE'`, [STRATEGY_ID]);
 
-  let mtm = 0;
+  let grossExposure = 0, marketValue = 0;
   const unmarkable = [];
   for (const p of openRows) {
+    const w = Number(p.weight);
+    grossExposure += w;
     const px = exec.markPrice(series.get(p.ticker), i);
-    if (px === null) { unmarkable.push(p.ticker); continue; }
-    mtm += ((px - Number(p.entry_price)) / Number(p.entry_price)) * Number(p.weight);
+    if (px === null) { unmarkable.push(p.ticker); marketValue += w; continue; }  // carried at cost, and named
+    marketValue += w * (px / Number(p.entry_price));
+  }
+  const realized = Number(realizedRow.r) || 0;
+  const unrealized = marketValue - grossExposure;
+  const cash = 1 - grossExposure + realized;
+  const nav = cash + marketValue;
+
+  // Benchmark on the same base, so the two curves are directly comparable.
+  let benchNav = null;
+  if (firstRow.d) {
+    const j = dateIdx.get(toDateStr(firstRow.d));
+    if (j !== undefined && ihsgClose[j] > 0) benchNav = ihsgClose[i] / ihsgClose[j];
   }
 
   await pool.query(
-    `INSERT INTO ft_strategy_nav (strategy_id, mark_date, run_mode, open_positions, unrealised_pct, unmarkable)
-     VALUES (?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE open_positions=VALUES(open_positions), unrealised_pct=VALUES(unrealised_pct), unmarkable=VALUES(unmarkable)`,
-    [STRATEGY_ID, tradingDates[i], 'LIVE', openRows.length, (mtm * 100).toFixed(4), unmarkable.join(',') || null]);
+    `INSERT INTO ft_strategy_nav
+       (strategy_id, mark_date, run_mode, open_positions, unrealised_pct, unmarkable,
+        cash_value, market_value, total_nav, realized_pnl, unrealized_pnl, gross_exposure, benchmark_nav)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE open_positions=VALUES(open_positions), unrealised_pct=VALUES(unrealised_pct),
+       unmarkable=VALUES(unmarkable), cash_value=VALUES(cash_value), market_value=VALUES(market_value),
+       total_nav=VALUES(total_nav), realized_pnl=VALUES(realized_pnl), unrealized_pnl=VALUES(unrealized_pnl),
+       gross_exposure=VALUES(gross_exposure), benchmark_nav=VALUES(benchmark_nav)`,
+    [STRATEGY_ID, tradingDates[i], 'LIVE', openRows.length, (unrealized * 100).toFixed(4),
+     unmarkable.join(',') || null, cash.toFixed(6), marketValue.toFixed(6), nav.toFixed(6),
+     realized.toFixed(6), unrealized.toFixed(6), grossExposure.toFixed(6), benchNav === null ? null : benchNav.toFixed(6)]);
 
   if (!quiet) {
-    console.log(`MARK  ${tradingDates[i]}   ${openRows.length} open   unrealised ${(mtm * 100).toFixed(2)}% (gross)`);
-    if (unmarkable.length) console.log(`      unmarkable (no price found at all): ${unmarkable.join(', ')}`);
+    console.log(`MARK  ${tradingDates[i]}   NAV ${nav.toFixed(4)}   (cash ${cash.toFixed(4)} + market ${marketValue.toFixed(4)})`);
+    console.log(`      ${openRows.length} open, exposure ${(grossExposure * 100).toFixed(1)}%   realized ${(realized * 100).toFixed(2)}%   unrealized ${(unrealized * 100).toFixed(2)}%`);
+    if (benchNav !== null) console.log(`      IHSG on the same base: ${benchNav.toFixed(4)}`);
+    if (unmarkable.length) console.log(`      carried at cost, no price found: ${unmarkable.join(', ')}`);
   }
-  return { openPositions: openRows.length, unrealisedPct: mtm * 100, unmarkable };
+  return { nav, cash, marketValue, realized, unrealized, grossExposure, benchNav, openPositions: openRows.length, unmarkable };
 }
 
 /**
@@ -624,7 +764,36 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
  * forward test is to measure what was recorded at the time, not what the
  * current code would decide today.
  */
-function periodReturns(ctx, logRows) {
+/** Price of `s` at bar j: the execution open where one exists, else the last real close. */
+function barPrice(s, j) {
+  if (!s) return null;
+  return (s.open && s.open[j] > 0) ? s.open[j] : exec.markPrice(s, j);
+}
+
+/**
+ * Period-by-period return of the portfolio that was ACTUALLY HELD.
+ *
+ * FIXED 2026-08-04 (review P0.1). This used to read `target_json` — the frozen
+ * PLAN — and take an unweighted mean over the names in it. Three things were
+ * wrong with that, all in the flattering direction:
+ *
+ *  - An unweighted mean renormalises the book to 100% invested however many
+ *    names actually filled. With 8 targets and 2 buy NO_FILLs, the cash sitting
+ *    idle was silently re-invested into the 6 that did fill.
+ *  - A position that failed to SELL stays open but is by construction absent
+ *    from the next target, so its return vanished from the report entirely.
+ *  - A holding that stopped printing failed the `p1 > 0` test and was dropped
+ *    from the average — so a name going untradeable, the worst case for a
+ *    holder, contributed 0.00% instead of a loss.
+ *
+ * It now reads ft_strategy_positions, the ledger `fill` actually writes, and
+ * weights each holding by the weight recorded at entry. Because `cmdFill` sizes
+ * from free capacity, those weights sum to at most 1 — so an unfilled slice
+ * correctly earns nothing rather than being redistributed.
+ *
+ * @param {Array} positionRows - every LIVE position row, any status
+ */
+function periodReturns(ctx, logRows, positionRows = []) {
   const { dateIdx, tradingDates, series, ihsgClose } = ctx;
   const port = [], bench = [], regimes = [];
   let turnoverTotal = 0;
@@ -635,31 +804,44 @@ function periodReturns(ctx, logRows) {
     if (ia === undefined || ib === undefined) continue;
     const execA = ia + 1, execB = ib + 1;
     if (execB >= tradingDates.length) continue;
+    const dA = tradingDates[execA], dB = tradingDates[execB];
 
-    let book = [];
-    try { book = JSON.parse(a.target_json || '[]'); } catch { book = []; }
-    const exposure = Number(a.exposure);
-
-    // Held names are priced open-to-open across the holding period, matching
-    // how entries and exits are actually recorded. Cash earns nothing.
-    const rets = [];
-    for (const t of book) {
-      const s = series.get(t);
-      if (!s) continue;
-      const p0 = s.open[execA], p1 = s.open[execB];
+    // Held across the window means: entered on or before it opened, and not yet
+    // exited when it opened. Nothing here consults the plan.
+    let gross = 0, held = 0;
+    for (const h of positionRows) {
+      const entry = toDateStr(h.entry_date);
+      const exit = h.exit_date ? toDateStr(h.exit_date) : null;
+      if (entry > dA) continue;
+      if (exit && exit <= dA) continue;
+      const s = series.get(h.ticker);
+      const p0 = barPrice(s, execA);
+      // A name that stops printing is marked at its last real close, not dropped.
+      const p1 = (exit && exit < dB) ? barPrice(s, dateIdx.get(exit) ?? execB) : barPrice(s, execB);
       if (!(p0 > 0) || !(p1 > 0)) continue;
-      rets.push(p1 / p0 - 1);
+      const w = Number(h.weight || 0);
+      gross += w * (p1 / p0 - 1);
+      held += w;
     }
-    const gross = rets.length ? rets.reduce((x, y) => x + y, 0) / rets.length : 0;
 
-    const nextBook = (() => { try { return JSON.parse(b.target_json || '[]'); } catch { return []; } })();
-    const churn = book.length ? nextBook.filter(t => !book.includes(t)).length / Math.max(book.length, 1) : 0;
-    turnoverTotal += churn;
-    const cost = churn * (BUY_COST + SELL_COST);
+    // Costs from the events that actually happened at this period's boundary,
+    // not from a diff of two planned books. The old churn term also went to
+    // zero at exactly the transitions this strategy makes most — re-entering
+    // from REGIME_FLAT was free, because the previous book was empty.
+    let cost = 0, turnover = 0;
+    for (const h of positionRows) {
+      const w = Number(h.weight || 0);
+      if (toDateStr(h.entry_date) === dB) { cost += w * BUY_COST; turnover += w; }
+      if (h.exit_date && toDateStr(h.exit_date) === dB) { cost += w * SELL_COST; turnover += w; }
+    }
+    turnoverTotal += turnover;
 
-    port.push(gross * exposure - cost);
+    // No `* exposure` factor: standing flat already produces 0 because no rows
+    // are open. Multiplying would have zeroed a retained no-fill position during
+    // a REGIME_FLAT period, hiding exactly the exposure we failed to shed.
+    port.push(gross - cost);
     bench.push(ihsgClose[execB] / ihsgClose[execA] - 1);
-    regimes.push(String(a.reason || '').split(' ')[0]);
+    regimes.push(String(a.regime_label || a.reason || '').split(' ')[0]);
   }
   return { port, bench, regimes, avgTurnover: port.length ? turnoverTotal / port.length : 0 };
 }
@@ -676,8 +858,12 @@ async function reportFor(pool, ctx, runMode) {
     [STRATEGY_ID, runMode, 'OPEN']);
   const [[fillsRow]] = await pool.query(
     'SELECT COUNT(*) n FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=?', [STRATEGY_ID, runMode]);
+  // The full ledger, every status: this is what was ACTUALLY held (review P0.1).
+  const [ledger] = await pool.query(
+    'SELECT ticker, entry_date, exit_date, weight, net_pct, status FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? ORDER BY entry_date',
+    [STRATEGY_ID, runMode]);
 
-  const { port, bench, regimes, avgTurnover } = periodReturns(ctx, logRows);
+  const { port, bench, regimes, avgTurnover } = periodReturns(ctx, logRows, ledger);
   const eq = fg.compound(port), beq = fg.compound(bench);
   const portRet = eq.length ? eq[eq.length - 1] - 1 : null;
   const benchRet = beq.length ? beq[beq.length - 1] - 1 : null;
