@@ -1,169 +1,371 @@
-P0.1 — Terminal performance masih memakai harga open, bukan actual NAV mark
+Virtual Broker & Portfolio Journal Engine
 
-terminalDate berasal dari latest ft_strategy_nav, yang dibuat oleh cmdMark() menggunakan close/mark price.
+Mulai dengan modal virtual Rp100 juta, order dari rekomendasi sistem, entry dan exit otomatis, seluruh transaksi dicatat seperti akun trading sungguhan.
 
-Namun terminal leg menghitung:
+Jangan menempel langsung ke modul lama
 
-const nav1 = navAt(
-  positionRows,
-  series,
-  iTerm,
-  terminalDate
-);
+FlowTracker sebenarnya sudah memiliki sebagian komponen yang dibutuhkan:
 
-Karena priceFn tidak diberikan, navAt() memakai barPrice(), yang memprioritaskan open price. Eligible-universe terminal return juga memakai barPrice() pada terminal date.
+rekomendasi hanya membuka posisi long untuk BUY dan STRONG BUY;
+entry disimulasikan pada open T+1;
+SL dan target dihitung setelah harga entry diketahui;
+jika SL dan target tersentuh pada candle yang sama, sistem memilih SL sebagai asumsi konservatif;
+fee round-trip sudah dimodelkan.
 
-Jadi secara efektif:
+Tetapi paper_trading.js sekarang adalah validator kandidat model, bukan portfolio sungguhan. Setiap rekomendasi berdiri sendiri dalam satuan R; belum ada shared cash account, jumlah lot, buying power, portfolio NAV, atau batas modal Rp100 juta.
 
-Observed NAV latest mark  = harga close/mark
-Gate terminal return      = harga open hari yang sama
+Jadi buat modul baru:
+
+modules/virtual_broker.js
+virtual_portfolio.js
+test_virtual_broker.js
+Catatan sangat penting soal closing market
+
+Current active policy FlowTracker adalah POSITION, dengan batas holding 40 trading bars, risiko 2,5 ATR, dan target sampai 4R. Itu dirancang untuk horizon sekitar 2–8 minggu. Memaksa semua saham ditutup pada hari entry adalah strategi yang benar-benar berbeda.
+
+Artinya, jangan mengganti strategy existing. Jalankan dua akun paralel:
+
+Akun virtual	Exit policy
+POSITION_100M	SL, PT, atau maksimum 40 bars
+INTRADAY_EOD_100M	SL, PT, atau close hari entry
+
+Dengan begini kita bisa menjawab pertanyaan penting:
+
+Edge sistem ini muncul secara intraday, atau memang membutuhkan holding beberapa minggu?
+
+Track record dua akun tidak boleh dicampur.
+
+Alur akun INTRADAY_EOD_100M
+Setelah market close hari T
+
+Sistem membekukan rekomendasi:
+
+BBCA BUY
+ASII BUY
+BMRI STRONG BUY
+
+Journal mencatat:
+
+status = SCHEDULED
+signal_date = T
+scheduled_entry_date = next trading day
+source_strategy_hash
+source_plan_id
+data_snapshot_hash
+code_commit
+
+Belum ada harga entry pada tahap ini.
+
+Hari T+1
+
+Karena data sekarang berbentuk daily OHLC, seluruh kejadian T+1 baru dapat diselesaikan setelah OHLC hari tersebut tersedia.
+
+Urutannya:
+
+Entry      = open T+1
+SL/PT      = dihitung dari actual entry
+SL hit     = low <= stop
+PT hit     = high >= target
+Tidak hit  = exit pada close T+1
+
+Prioritas resolusi:
+
+1. Entry tidak valid → NO_FILL
+2. SL dan PT sama-sama tersentuh → STOP
+3. SL tersentuh → STOP
+4. PT tersentuh → TARGET
+5. Tidak ada yang tersentuh → EOD_CLOSE
+
+Prioritas STOP ketika dua level tersentuh pada candle yang sama adalah asumsi konservatif yang sudah digunakan oleh paper-trading engine sekarang.
+
+Keterbatasan data
+
+Ini merupakan EOD paper simulation, bukan monitoring intraday real-time.
+
+Dengan daily OHLC, sistem mengetahui bahwa high atau low menyentuh level, tetapi tidak mengetahui urutan tick sebenarnya. Karena itu:
+
+SL dan PT bersamaan → STOP;
+exit close menggunakan official closing value setelah market selesai;
+sistem tidak berpura-pura pernah mengirim order sebelum market close.
+
+Untuk virtual order yang benar-benar berubah status selama jam perdagangan, kita membutuhkan intraday feed.
+
+Portfolio Rp100 juta
+
+Buat satu account:
+
+starting_cash = 100,000,000
+cash          = 100,000,000
+market_value  = 0
+total_nav     = 100,000,000
+currency      = IDR
+allow_margin  = false
+allow_short   = false
+Position sizing
+
+Untuk versi awal, gue sarankan memakai risk-based sizing dengan hard notional cap.
+
+Contoh konfigurasi paper-test:
+
+risk_per_trade       = 0.50% NAV
+max_position_notional = 12.50% NAV
+max_positions         = 8
+max_gross_exposure    = 90% NAV
+cash_buffer           = 10% NAV
+
+Pada NAV Rp100 juta:
+
+risk budget per trade = Rp500.000
+max nominal per saham = Rp12.500.000
+
+Formula:
+
+risk_per_share = entry_price - stop_price
+
+raw_quantity =
+    risk_budget / risk_per_share
+
+quantity =
+    floor_to_board_lot(raw_quantity)
+
+notional =
+    quantity × entry_price
+
+Kemudian:
+
+quantity = min(
+    risk-based quantity,
+    max-position quantity,
+    available-cash quantity
+)
+
+Jangan izinkan:
+
+cash < 0
+gross exposure > configured limit
+quantity bukan kelipatan lot
+
+Seluruh angka di atas harus berupa configuration version, bukan hardcoded di banyak file.
+
+Struktur database
+virtual_accounts
+id
+account_code
+strategy_id
+strategy_hash
+execution_policy_hash
+starting_cash
+cash_balance
+total_nav
+status
+created_at
 
 Contoh:
 
-Open hari ini  : 100
-Close hari ini : 90
+INTRADAY_EOD_100M
+POSITION_100M
+virtual_orders
+id
+account_id
+source_plan_id
+source_signal_id
+ticker
+side
+signal_date
+scheduled_entry_date
+intended_notional
+quantity
+status
+reject_reason
+strategy_hash
+execution_policy_hash
+created_at
 
-cmdMark() melihat penurunan ke 90, tetapi promotion performance dapat tetap berakhir di 100. Kerugian intraday pada latest mark belum masuk ke gate.
+Status:
 
-Perbaikan
+SCHEDULED
+FILLED
+NO_FILL
+REJECTED
+CANCELLED
+virtual_positions
+id
+account_id
+order_id
+ticker
+quantity
+entry_date
+entry_price
+stop_price
+target_price
+cost_basis
+entry_fee
+status
+exit_date
+exit_price
+exit_reason
+exit_fee
+gross_pnl
+net_pnl
+return_pct
+holding_bars
 
-Terminal portfolio NAV harus menggunakan:
+Exit reason:
 
-const nav1 = navAt(
-  positionRows,
-  series,
-  iTerm,
-  terminalDate,
-  exec.markPrice
-);
+STOP
+TARGET
+EOD_CLOSE
+TIME_EXIT
+REGIME_EXIT
+MANUAL
+virtual_trade_events
 
-Untuk eligible universe:
+Gunakan append-only event journal:
 
-const q0 = barPrice(s2, execLast);       // execution open
-const q1 = exec.markPrice(s2, iTerm);    // terminal close/mark
+RECOMMENDED
+ORDER_SCHEDULED
+ORDER_FILLED
+STOP_SET
+TARGET_SET
+STOP_TRIGGERED
+TARGET_TRIGGERED
+EOD_CLOSE
+NO_FILL
+REJECTED
 
-Pilihan paling kuat: gunakan navRow.total_nav langsung sebagai terminal strategy NAV karena itulah observed authoritative mark.
+Ini lebih aman daripada hanya menyimpan current status karena seluruh lifecycle dapat diaudit.
 
-P0.2 — Pending legacy plan dengan contract NULL masih dapat dieksekusi
+virtual_nav
+account_id
+mark_date
+cash_value
+market_value
+total_nav
+realized_pnl
+unrealized_pnl
+gross_exposure
+open_positions
+Jangan jadikan journal sumber accounting
 
-Migration menambahkan kolom execution contract sebagai nullable:
+Sumber kebenaran harus:
 
-buy_cost NULL
-sell_cost NULL
-execution_ledger_version NULL
+orders
++ fills
++ positions
++ cash ledger
 
-Tetapi contractDiffers() hanya menganggap berbeda jika nilainya tidak null dan tidak sama:
+Journal merupakan tampilan dari event-event tersebut.
 
-p.buy_cost !== null &&
-Number(p.buy_cost) !== BUY_COST
+Kalau journal bisa diedit langsung dan sekaligus menjadi sumber cash/NAV, cepat atau lambat akan terjadi kondisi:
 
-Skenario:
+journal bilang CLOSED
+position masih OPEN
+cash belum menerima proceeds
+NAV salah
 
-Plan dibuat sebelum execution-contract columns tersedia.
-Migration menambahkan ketiga kolom dengan nilai NULL.
-Plan masih PLANNED dan mempunyai current strategy hash.
-contractDiffers() menghasilkan false.
-Plan lama dieksekusi oleh implementation baru.
+Gunakan transaction per order resolution:
 
-Padahal contract plan tersebut tidak diketahui.
+BEGIN
 
-Perbaikan
+update order
+insert/update position
+update cash ledger
+insert trade event
+insert NAV mark
 
-Contract yang tidak lengkap harus dianggap stale:
+COMMIT
 
-const missingContract = p =>
-  p.buy_cost === null ||
-  p.sell_cost === null ||
-  p.execution_ledger_version === null;
+Kalau salah satu gagal, rollback semuanya.
 
-const stale = plans.filter(p =>
-  !p.strategy_hash ||
-  missingContract(p) ||
-  p.strategy_hash !== strategyHash ||
-  contractDiffers(p)
-);
+Cron yang disarankan
 
-Gunakan reason:
+Dengan data EOD sekarang:
 
-MISSING_EXECUTION_CONTRACT
+19:30  Import OHLC dan broker data selesai
+20:00  Resolve scheduled virtual orders hari ini
+20:05  Apply STOP / TARGET / EOD_CLOSE
+20:10  Update cash dan portfolio NAV
+20:15  Generate/freeze rekomendasi untuk hari berikutnya
+20:20  Create SCHEDULED virtual orders
+20:25  Run reconciliation dan integrity checks
 
-Jangan mengisi contract lama dengan current values melalui migration karena itu akan menciptakan provenance yang tidak pernah ada.
+Urutannya penting: selesaikan order hari ini sebelum membuat order baru.
 
-P1 yang disarankan
-1. Gate belum memeriksa freshness NAV
+Biaya yang harus dimasukkan
 
-Report menggunakan latest NAV row yang tersedia, tetapi gate tidak memeriksa apakah mark tersebut benar-benar terbaru. Gate criteria saat ini hanya mencakup decisions, months, regimes, fills, profit factor, excess return, dan ledger validity.
+Minimal:
 
-Jika cron mark berhenti selama beberapa hari, promotion gate tetap dapat mengevaluasi track record sampai mark lama dan tidak menyadari data performance-nya stale.
+buy fee
+sell fee
+slippage
+lot rounding
+cash limitation
+missing-open no-fill
+suspension/no-price handling
 
-Tambahkan:
+Untuk EOD_CLOSE, jangan selalu menganggap fill tepat di close tanpa friction. Gunakan:
 
-latestNavMarkDate
-latestCompleteTradingDate
-navFresh
+virtual sell fill =
+close × (1 - configured slippage)
 
-Gate harus NOT_ELIGIBLE ketika latest mark tertinggal lebih dari satu complete trading bar.
-
-2. Execution policy masih mengandalkan manual version bump
-
-Contract menangkap costs dan execution_ledger_version, tetapi perubahan murni pada:
-
-buyFill();
-sellFill();
-sizing algorithm;
-price fallback;
-transaction sequencing;
-
-tidak otomatis terdeteksi bila developer lupa menaikkan ledger version.
-
-Lebih kuat bila plan menyimpan:
+Biaya dan execution policy harus masuk ke:
 
 execution_policy_hash
 
-yang berasal dari execution configuration/version yang eksplisit. Alternatif konservatif: expire pending plan bila plan.code_commit !== CODE_COMMIT.
+Supaya perubahan fee, slippage, SL/PT, atau EOD-close rule memulai track record baru dan tidak mencampur hasil lama.
 
-3. Terminal leg belum punya regression test langsung
+Test wajib
 
-test_strategy_forward.js sudah menguji deployment cost dan NAV path, tetapi belum terlihat test yang memastikan harga setelah rebalance terakhir masuk melalui terminalDate.
+Sebelum dijalankan setiap hari, test minimal harus mencakup:
 
-Tambahkan fixture:
+Modal awal tepat Rp100 juta.
+Tidak bisa membelanjakan uang lebih dari cash.
+Duplicate recommendation tidak membuat dua order.
+Entry memakai T+1 open, bukan signal-day close.
+SL dan PT satu candle menghasilkan STOP.
+Hanya SL menghasilkan STOP.
+Hanya PT menghasilkan TARGET.
+Keduanya tidak tercapai menghasilkan EOD_CLOSE.
+Missing open menghasilkan NO_FILL.
+Fee dan slippage mengurangi cash/P&L.
+Quantity dibulatkan sesuai lot.
+NAV selalu sama dengan cash + market value.
+Closed trade mengembalikan proceeds ke cash.
+Strategy hash berbeda tidak boleh berbagi portfolio.
+Restart job tidak menggandakan fill atau exit.
+Rekomendasi implementasi
 
-last execution NAV = 1.00
-latest mark NAV    = 0.90
+Gue akan membangunnya dalam dua tahap:
 
-dan assert total return menyertakan terminal loss −10%.
+Tahap 1 — EOD Virtual Broker
 
-4. Label profit factor masih menyebut “net %”
+Menggunakan OHLC daily yang sudah tersedia:
 
-Output saat ini masih menulis:
+plan T
+→ entry T+1 open
+→ check T+1 high/low
+→ SL/PT/EOD close
+→ journal
+→ NAV Rp100 juta
 
-gross profit / gross loss, net %
+Ini bisa dibuat sekarang dan hasilnya tetap auditable.
 
-padahal input-nya sekarang nominal P&L.
+Tahap 2 — Intraday Virtual Broker
 
-Ganti menjadi:
+Setelah tersedia intraday feed:
 
-gross nominal profit / gross nominal loss
-Penilaian terbaru
-Area	Sebelumnya	Sekarang
-Nominal profit factor	6.0	9.5
-Latest-period coverage	6.0	8.5
-Provenance handling	9.0	9.5
-Stale-plan protection	9.5	9.0
-NAV reconciliation	8.2	9.3
-Schema/migration testing	8.8	9.2
-Forward infrastructure	9.0	9.2
-Predictive-edge evidence	4.5	4.5
-Kesimpulan akhir
+scheduled order
+→ live simulated fill
+→ real-time SL/PT monitoring
+→ close-auction/EOD liquidation
 
-Secara keseluruhan, revisi ini substantif dan benar. Dua masalah promotion yang paling besar—nominal profit factor dan latest open period—sudah ditangani.
+Jangan membuat simulasi daily-OHLC terlihat seperti eksekusi real-time.
 
-Posisi sistem sekarang:
+Kesimpulan
 
-Production-capable forward recorder, dengan promotion gate yang masih membutuhkan terminal close valuation dan missing-contract rejection.
+Gue setuju sistem virtual Rp100 juta dibuat sekarang. Namun jalankan sebagai dua eksperimen terpisah:
 
-Setelah dua P0 di atas ditutup, gue akan anggap forward validation infrastructure lulus secara engineering.
+POSITION_100M
+INTRADAY_EOD_100M
 
-Status signal tetap berbeda: infrastrukturnya hampir siap penuh untuk mengumpulkan bukti, tetapi edge HI52W + broker veto masih harus dibuktikan oleh LIVE time selama minimal periode yang ditentukan gate.
-
-Review ini berdasarkan static source terbaru. Gue belum menjalankan npm test dan npm run test:integration langsung terhadap MySQL/VPS production.
+Current recommendation engine dibangun untuk horizon position, sehingga akun EOD harus diperlakukan sebagai challenger baru, bukan menggantikan track record existing. Sumber rekomendasinya boleh sama, tetapi execution policy, strategy identity, journal, cash, dan performance record harus benar-benar terisolasi.

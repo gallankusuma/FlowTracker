@@ -145,10 +145,53 @@ strategy from the one EXP-017 tested, with different turnover and costs.
 
 Records intentions only. It places no orders and touches no broker.
 
+### Virtual portfolio — `virtual_accounts` / `virtual_orders` / `virtual_positions` / `virtual_trade_events` / `virtual_nav`
+```
+ 0 13 * * 1-5   node virtual_portfolio.js resolve               # 20:00 WIB
+30 13 * * 1-5   node virtual_portfolio.js schedule              # 20:30 WIB
+35 13 * * 1-5   node virtual_portfolio.js mark                  # 20:35 WIB
+40 13 * * 1-5   node virtual_portfolio.js reconcile             # 20:40 WIB
+```
+Added 2026-08-04. Two simulated Rp100 juta accounts, `POSITION_100M` and
+`INTRADAY_EOD_100M`, driven by the same recommendations under different exit
+policies. Logs to `/var/log/virtual-portfolio.log`.
+
+**The order is load-bearing, and it is not the order the design proposed.** The
+design asked for `resolve` at 20:00 and the orders created at 20:20. But
+`schedule` reads the latest row in `ft_strategy_plan`, which the existing
+`strategy_forward.js plan` entry does not write until 20:20 — scheduling at
+20:20 would race it, and scheduling earlier would freeze *yesterday's* plan a
+second time. So `schedule` sits at 20:30, after the plan it consumes exists.
+`resolve` stays at 20:00 because it depends only on the 19:30 price pull, and
+today's orders must be settled before tomorrow's are created.
+
+`reconcile` is not a printout. It checks that cash equals starting capital minus
+open cost plus realized P&L, that the last NAV mark equals cash + market value,
+that exposure and the position count are inside their caps, and that no FILLED
+order lacks a position or belongs to another account. It exits non-zero when any
+of that stops being true.
+
+**A changed execution contract retires the old account rather than running
+beside it.** `execution_policy_hash` covers the fees, slippage, exit rule and the
+whole risk layer, and the unique key is `(account_code, execution_policy_hash)`,
+so changing any of them inserts a NEW account row next to the old one. Both were
+ACTIVE on the first day this ran and every stage executed twice against four
+accounts. `setup()` now closes any account whose contract is no longer current —
+CLOSED, never deleted, because its orders and NAV history are the record of what
+that contract did.
+
+`INTRADAY_EOD_100M` is **expected to lose**: EXP-019 measured that rule at
+-0.951% per trade on this system's own BUY days (n=2,204, t=-18.5) against a
+-0.673% unconditional base rate. It runs to confirm that forward and must not be
+tuned until it stops losing.
+
+Simulated accounts. No orders are placed anywhere.
+
 ## Log files
 
 `/var/log/ft-pull.log`, `/var/log/signal_engine.log`, `/var/log/flowtracker-intel.log`,
-`/var/log/flowtracker-hk.log`, `/var/log/paper-trader.log`
+`/var/log/flowtracker-hk.log`, `/var/log/paper-trader.log,
+`/var/log/strategy-forward.log`, `/var/log/virtual-portfolio.log`
 
 ## Note on "paper trading"
 
