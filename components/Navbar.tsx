@@ -16,6 +16,7 @@ const NAV_ITEMS = [
   { label: "Watchlist",           href: "/watchlist",           icon: "⭐" },
   { label: "Position Sizer",      href: "/position-sizer",      icon: "📐" },
   { label: "Trade Journal",       href: "/trade-journal",       icon: "📓" },
+  { label: "Virtual Portfolio",   href: "/virtual-portfolio",   icon: "💼", badge: "SIM", badgeColor: "#58a6ff" },
   { label: "Stockbit",            href: "/stockbit-connector",  icon: "📡", badge: "RG", badgeColor: "#3fb950" },
   { label: "Strategy Lab",        href: "/strategy-lab",         icon: "🤖", badge: "AI", badgeColor: "#17C671" },
   { label: "Journey",              href: "/journey",              icon: "📈", badge: "NEW", badgeColor: "#f0a500" },

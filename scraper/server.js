@@ -2962,6 +2962,92 @@ app.get('/api/ihsg', async (req, res) => {
   }
 });
 
+/**
+ * Virtual portfolio — the two simulated Rp100 juta accounts.
+ *
+ * READ-ONLY on purpose. Nothing here creates an order, fills one, or moves
+ * cash: that is `virtual_portfolio.js` on cron, in one transaction per order.
+ * An HTTP handler that could also write would be a second, unsynchronised
+ * writer against the same ledger.
+ *
+ * Only ACTIVE accounts are listed by default. A retired execution contract is
+ * still in the table with its whole history intact — `?all=1` shows those too,
+ * clearly marked, because its record must not be pooled with the live one.
+ */
+app.get('/api/virtual-portfolio', async (req, res) => {
+  try {
+    const includeClosed = req.query.all === '1';
+    const [accounts] = await pool.query(
+      `SELECT id, account_code, strategy_id, exit_policy, execution_policy_hash,
+              starting_cash, cash_balance, total_nav, status, created_at
+         FROM virtual_accounts ${includeClosed ? '' : "WHERE status='ACTIVE'"}
+        ORDER BY status, account_code`);
+    if (!accounts.length) return res.json({ accounts: [], note: 'no virtual accounts yet — virtual_portfolio.js has not run' });
+
+    const out = [];
+    for (const a of accounts) {
+      const [nav] = await pool.query(
+        'SELECT mark_date, cash_value, market_value, total_nav, realized_pnl, unrealized_pnl, gross_exposure, open_positions, unmarkable FROM virtual_nav WHERE account_id=? ORDER BY mark_date', [a.id]);
+      const [open] = await pool.query(
+        `SELECT id, ticker, quantity, entry_date, entry_price, stop_price, target_price, cost_basis
+           FROM virtual_positions WHERE account_id=? AND status='OPEN' ORDER BY entry_date DESC, ticker`, [a.id]);
+      const [closed] = await pool.query(
+        `SELECT id, ticker, quantity, entry_date, entry_price, exit_date, exit_price, exit_reason,
+                net_pnl, return_pct, holding_bars, ambiguous_exit
+           FROM virtual_positions WHERE account_id=? AND status='CLOSED' ORDER BY exit_date DESC, ticker LIMIT 200`, [a.id]);
+      const [[stats]] = await pool.query(
+        `SELECT COUNT(*) n, COALESCE(SUM(net_pnl),0) pnl, SUM(net_pnl>0) wins,
+                COALESCE(SUM(CASE WHEN net_pnl>0 THEN net_pnl ELSE 0 END),0) grossProfit,
+                COALESCE(SUM(CASE WHEN net_pnl<0 THEN -net_pnl ELSE 0 END),0) grossLoss,
+                SUM(exit_reason='STOP') stops, SUM(exit_reason='TARGET') targets,
+                SUM(exit_reason='EOD_CLOSE') eodCloses, SUM(exit_reason='TIME_EXIT') timeExits,
+                SUM(ambiguous_exit) ambiguous
+           FROM virtual_positions WHERE account_id=? AND status='CLOSED'`, [a.id]);
+      const [pending] = await pool.query(
+        `SELECT ticker, signal_date, status, reject_reason FROM virtual_orders
+          WHERE account_id=? AND status IN ('SCHEDULED','REJECTED','NO_FILL')
+          ORDER BY signal_date DESC, ticker LIMIT 60`, [a.id]);
+
+      const n = Number(stats.n) || 0;
+      const gl = Number(stats.grossLoss);
+      out.push({
+        ...a,
+        startingCash: Number(a.starting_cash),
+        cash: Number(a.cash_balance),
+        nav: Number(a.total_nav),
+        returnPct: Math.round((Number(a.total_nav) / Number(a.starting_cash) - 1) * 10000) / 100,
+        navSeries: nav.map(r => ({
+          date: toDateStr(r.mark_date), cash: Number(r.cash_value), marketValue: Number(r.market_value),
+          nav: Number(r.total_nav), realized: Number(r.realized_pnl), unrealized: Number(r.unrealized_pnl),
+          exposure: Number(r.gross_exposure), openPositions: r.open_positions, unmarkable: r.unmarkable,
+        })),
+        openPositions: open, closedTrades: closed, pendingOrders: pending,
+        stats: {
+          closed: n, netPnl: Number(stats.pnl),
+          winRate: n ? Math.round((Number(stats.wins) / n) * 1000) / 10 : null,
+          // null, not Infinity and not 0: "no losers yet" is not a profit
+          // factor, and printing one would invent a number.
+          profitFactor: gl > 0 ? Math.round((Number(stats.grossProfit) / gl) * 100) / 100 : null,
+          exits: {
+            STOP: Number(stats.stops) || 0, TARGET: Number(stats.targets) || 0,
+            EOD_CLOSE: Number(stats.eodCloses) || 0, TIME_EXIT: Number(stats.timeExits) || 0,
+          },
+          ambiguousExits: Number(stats.ambiguous) || 0,
+        },
+        // Carried in the payload rather than hardcoded in the page: the reason
+        // this account exists is that it is expected to LOSE, and that has to
+        // travel with its numbers.
+        expectation: a.exit_policy === 'INTRADAY_EOD'
+          ? 'EXPECTED TO LOSE — EXP-019 measured this rule at -0.951%/trade on this system own BUY days (n=2,204, t=-18.5) vs a -0.673% base rate. It runs to confirm that forward and must not be tuned until it stops losing.'
+          : null,
+      });
+    }
+    res.json({ accounts: out, simulated: true, note: 'Simulated accounts. No orders are placed anywhere.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Intraday (5-min bars, today only) — feeds the "1D" range on the IHSG
 // history chart. Fetched live on-demand (60s cache in yahoo-candles.js),
 // NOT persisted — separate concern from the daily idx_ihsg_history table
@@ -4798,11 +4884,43 @@ async function getIHSGTrend() {
   const candles = rows.map(r => ({ date: toDateStr(r.date), close: Number(r.close_price) }));
   let weeklyTrend = null;
   try { weeklyTrend = computeWeeklyTrend(candles); } catch {}
+
+  // The 200-day SMA regime gate, from strategy_book.js — the SAME function and
+  // the SAME period the strategy actually decides on. Recomputing it here with
+  // a local loop would let the page and the strategy drift into disagreeing
+  // about the one line that decides whether the system trades at all.
+  const sb = require('./modules/strategy_book');
+  const closes = rows.map(r => Number(r.close_price));
+  const smaSeries = sb.smaSeries(closes, sb.DEFAULTS.regimeSma);
+  const i = closes.length - 1;
+  const sma200 = smaSeries[i];
+  let regime = null;
+  if (sma200 !== null && sma200 !== undefined) {
+    const below = closes[i] < sma200;
+    // How long it has been on this side. A gate that has been shut for months
+    // is a different fact from one that flipped this morning, and the page
+    // should not make the two look alike.
+    let sinceIdx = i;
+    while (sinceIdx > 0 && smaSeries[sinceIdx - 1] !== null &&
+           (closes[sinceIdx - 1] < smaSeries[sinceIdx - 1]) === below) sinceIdx--;
+    regime = {
+      sma200: Math.round(sma200 * 100) / 100,
+      gapPct: Math.round((closes[i] / sma200 - 1) * 10000) / 100,
+      below,
+      // What the strategy DOES about it, not just where the line is.
+      exposure: below ? 0 : 1,
+      label: below ? 'REGIME_FLAT' : 'INVESTED',
+      since: toDateStr(rows[sinceIdx].date),
+      sessions: i - sinceIdx + 1,
+    };
+  }
+
   return {
     price: Number(last.close_price),
     changePct: Number(last.change_pct),
     avgDailyChange10d: Math.round(avgDailyChange * 1000) / 1000,
     weeklyTrend: weeklyTrend?.trend ?? null,
+    regime,
     asOf: toDateStr(last.date),
   };
 }

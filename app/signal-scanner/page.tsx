@@ -3065,6 +3065,29 @@ export default function SignalScannerPage() {
                   style={{ fontSize: 10, color: "var(--text-muted)" }}>
                   10D avg: {ihsg.avgDailyChange10d >= 0 ? "+" : ""}{ihsg.avgDailyChange10d}%/hari
                 </span>
+                {/* The 200d SMA regime gate. Shown here because it is the one
+                    line that decides whether the strategy engine takes ANY
+                    position — a screener full of BUY signals means nothing on a
+                    day this gate is shut, and that was invisible until now. */}
+                {ihsg.regime && (
+                  <span
+                    title={`Gerbang regime 200d SMA (rata-rata sederhana, bukan EMA) — sumber: modules/strategy_book.js, fungsi yang sama dipakai mesin strateginya.\nIHSG ${ihsg.price?.toLocaleString("id-ID")} vs SMA200 ${ihsg.regime.sma200?.toLocaleString("id-ID")}.\n${ihsg.regime.below ? "Di BAWAH garis: exposure 0, sistem minggir." : "Di ATAS garis: sistem boleh ambil posisi."}\nSudah ${ihsg.regime.sessions} sesi di sisi ini, sejak ${ihsg.regime.since}.`}
+                    style={{
+                      display: "flex", alignItems: "center", gap: 6,
+                      fontSize: 10, fontWeight: 800, padding: "3px 9px", borderRadius: 5, cursor: "help",
+                      background: ihsg.regime.below ? "rgba(248,81,73,0.12)" : "rgba(63,185,80,0.12)",
+                      color: ihsg.regime.below ? "#f85149" : "#3fb950",
+                      border: `1px solid ${ihsg.regime.below ? "rgba(248,81,73,0.35)" : "rgba(63,185,80,0.35)"}`,
+                    }}>
+                    {ihsg.regime.below ? "⛔" : "✅"} SMA200 {ihsg.regime.sma200?.toLocaleString("id-ID")}
+                    <span style={{ opacity: 0.85, fontWeight: 700 }}>
+                      ({ihsg.regime.gapPct >= 0 ? "+" : ""}{ihsg.regime.gapPct}%)
+                    </span>
+                    <span style={{ opacity: 0.7, fontWeight: 700 }}>
+                      · {ihsg.regime.below ? "STAND ASIDE" : "INVESTED"}
+                    </span>
+                  </span>
+                )}
                 {ihsgFactors && (
                   <button onClick={() => setShowIhsgFactors(p => !p)} style={{
                     display: "flex", alignItems: "center", gap: 6, padding: "3px 10px", borderRadius: 5,
@@ -3085,6 +3108,16 @@ export default function SignalScannerPage() {
                   </span>
                 )}
                 <span style={{ fontSize: 9, color: "var(--text-muted)", marginLeft: "auto" }}>as of {ihsg.asOf}</span>
+                {ihsg.regime?.below && (
+                  <div style={{
+                    width: "100%", fontSize: 10, lineHeight: 1.5, color: "var(--text-muted)",
+                    borderTop: "1px solid var(--border)", paddingTop: 8, marginTop: 2,
+                  }}>
+                    IHSG sudah <b style={{ color: "#f85149" }}>{ihsg.regime.sessions} sesi</b> di bawah SMA200-nya, sejak {ihsg.regime.since}.
+                    Selama ini bertahan, mesin strategi memilih <b>tidak ambil posisi sama sekali</b> (exposure 0)
+                    — sinyal BUY di bawah tetap dihitung dan ditampilkan, tapi portfolio simulasinya diam.
+                  </div>
+                )}
               </div>
             )}
 
