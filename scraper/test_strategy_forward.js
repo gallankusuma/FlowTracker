@@ -33,7 +33,7 @@ function makeCtx(seriesSpec) {
     series.set(ticker, {
       open: bars.map(b => b.open), high: bars.map(b => b.high ?? b.open),
       close: bars.map(b => b.close), value: bars.map(() => 10e9),
-      dn0: bars.map(() => 0.5),
+      dn0: bars.map(() => 0.5), dn0Raw: bars.map(() => 0.5),
     });
   }
   return {
@@ -56,15 +56,29 @@ const move = (p0, p1) => [{ open: p0, close: p0 }, { open: p0, close: p0 }, { op
 console.log('\nperiodReturns — weights come from the ledger, not the plan');
 
 t('a fully invested book returns the weighted move', () => {
-  const ctx = makeCtx({ AAA: move(100, 110), BBB: move(100, 90) });
+  // The ledger and the plan must DISAGREE here, or the test proves nothing.
+  // The first version of this case used target_json '[]' and asserted 0, which
+  // the reverted plan-based implementation also returns — it passed either way.
+  // So the plan here names a THIRD ticker that was never filled: a plan-based
+  // reading would price CCC's +50%, the ledger correctly ignores it.
+  const ctx = makeCtx({ AAA: move(100, 110), BBB: move(100, 90), CCC: move(100, 150) });
+  const log = LOG.map(l => ({ ...l, target_json: '["AAA","BBB","CCC"]' }));
   const rows = [
     { ticker: 'AAA', entry_date: DATES[1], exit_date: null, weight: 0.5 },
     { ticker: 'BBB', entry_date: DATES[1], exit_date: null, weight: 0.5 },
   ];
-  const { port } = periodReturns(ctx, LOG, rows);
-  // +10% and -10% at half weight each, minus the buy cost charged at entry.
-  // Entries are on bar 1, the period boundary is bar 3, so no cost lands here.
-  assert.ok(Math.abs(port[0] - 0) < 1e-9, `got ${port[0]}`);
+  const { port } = periodReturns(ctx, log, rows);
+  // +10% and -10% at half weight each nets to zero. An unweighted mean over the
+  // planned book would have returned (0.10 - 0.10 + 0.50) / 3 = +16.67%.
+  assert.ok(Math.abs(port[0] - 0) < 1e-9, `got ${(port[0] * 100).toFixed(2)}% — a plan-based reading gives +16.67%`);
+});
+
+t('the ledger ignores a planned name that never filled', () => {
+  const ctx = makeCtx({ AAA: move(100, 100), GHOST: move(100, 300) });
+  const log = LOG.map(l => ({ ...l, target_json: '["AAA","GHOST"]' }));
+  const rows = [{ ticker: 'AAA', entry_date: DATES[1], exit_date: null, weight: 0.5 }];
+  const { port } = periodReturns(ctx, log, rows);
+  assert.strictEqual(port[0], 0, 'GHOST was planned but never filled and must contribute nothing');
 });
 
 t('a PARTIAL fill earns nothing on the unfilled slice — the old mean reinvested it', () => {
@@ -203,6 +217,18 @@ t('changing a dn0 changes the hash', () => {
   const a = makeCtx({ A: flat(100) });
   const b = makeCtx({ A: flat(100) });
   b.series.get('A').dn0[2] = -0.9;
+  b.series.get('A').dn0Raw[2] = -0.9;
+  assert.notStrictEqual(snapshotHash(a), snapshotHash(b));
+});
+
+t('a dn0 restated ABOVE the clip bound still changes the hash', () => {
+  // Both 120 and 950 clip to 100, so hashing the clipped value produced a
+  // bit-identical digest for two genuinely different datasets — the exact
+  // failure a content hash exists to prevent. The raw value is hashed.
+  const a = makeCtx({ A: flat(100) });
+  const b = makeCtx({ A: flat(100) });
+  a.series.get('A').dn0[2] = 100; a.series.get('A').dn0Raw[2] = 120;
+  b.series.get('A').dn0[2] = 100; b.series.get('A').dn0Raw[2] = 950;
   assert.notStrictEqual(snapshotHash(a), snapshotHash(b));
 });
 

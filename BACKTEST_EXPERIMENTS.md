@@ -924,6 +924,43 @@ Survivorship, which is baked in at **ingest**, not at screen time. `backfill_pri
 
 ---
 
+## EXP-2026-08-04-021 — Against the universe it selects from, the strategy adds nothing
+
+Review P0.5 warned that benchmarking the forward test against IHSG could let the strategy clear its gate on the strength of its SCREEN while the SELECTION added nothing, because the universe is already filtered for liquidity, price-history depth and broker coverage. Once the benchmark was implemented and the ledger accounting corrected, that stopped being a warning and became a measurement.
+
+Replay over 41 decisions, 20.5 months, 90 fills, on the point-in-time universe with the corrected ledger:
+
+| | |
+|---|---|
+| Portfolio return | **+3.28%** |
+| Eligible universe (primary benchmark) | **+3.57%** |
+| **Excess vs universe** | **−0.29%** |
+| IHSG (secondary) | −13.57% |
+| Excess vs IHSG | **+16.85%** |
+| Information ratio vs universe | **−0.05** |
+| Profit factor | 1.06 |
+| Max drawdown | 19.92% |
+| Turnover | 56.3% of the book per rebalance |
+
+**The +16.85% against the index is real and almost none of it is stock picking.** IHSG fell 13.57% while the set of names that merely *passed the screen* rose 3.57%. Being in liquid, established, broker-covered names — plus standing aside when the index was below its 200-day average — accounts for essentially the whole gap. The portfolio built by ranking and vetoing inside that set returned 3.28%, which is 0.29 points *behind* holding the set itself.
+
+This is consistent with EXP-020's decomposition, which found the 52-week-high ranking alone returns −0.88% and that the veto is what carries the backtest. It is not consistent with reading +16.85% as evidence of selection skill, and nothing in the earlier numbers separated the two, because the forward test benchmarked against the index while the backtest benchmarked against the universe. Those were never comparable figures.
+
+### Caveats, and they are large
+
+- **REPLAY, not live.** Decisions made from as-of data but recorded in one pass; it never faced a data outage or a real execution.
+- **Different window from EXP-020** (2024-11-13 → 2026-07-30 versus 2024-04-03 →2026-07-30), so the numbers are not a restatement of it.
+- **The universe leg is fully invested at all times** while the strategy stands aside 45% of the time, so this excess bundles the SELECTION with the TIMING. During a decline standing aside flatters the comparison; during a rise it penalises it. EXP-020 separates the components; this does not.
+- Survivorship bias at ingest is untouched and untouchable — see EXP-020.
+
+**Status**: this does not overturn EXP-017, whose mechanical controls still pass. It removes the number most likely to be misread. The honest one-line summary of the candidate is now: *it has kept pace with a well-chosen universe while avoiding a falling index, and there is no measured evidence that its stock selection adds value on top of the universe it draws from.*
+
+**Decisions this drives**:
+1. The promotion gate's excess criterion reads the universe benchmark, not the index. On this record it fails, correctly.
+2. Any future claim about this strategy quotes excess vs universe first. Excess vs IHSG is reported second and never alone.
+
+---
+
 ## Open follow-ups (not yet done)
 
 - **Re-run EXP-001 through EXP-010 on 10-year data under both horizons** — this is now the highest-value open item. The headline finding ("AWO Full is worse than random entry") was established on a single ~2-year regime with a 15-bar exit; both of those constraints are gone. Report SWING and POSITION side by side rather than replacing one with the other, and label everything survivorship-biased.

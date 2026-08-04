@@ -138,7 +138,7 @@ async function setup(pool) {
       net_pct DECIMAL(10,4) NULL,
       status ENUM('OPEN','CLOSED') NOT NULL DEFAULT 'OPEN',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_open (strategy_id, ticker, entry_date),
+      UNIQUE KEY uq_open (strategy_id, run_mode, ticker, entry_date),
       KEY idx_status (strategy_id, status)
     )`);
   await pool.query(`
@@ -156,7 +156,7 @@ async function setup(pool) {
       closed INT NOT NULL DEFAULT 0,
       target_json TEXT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_day (strategy_id, as_of_date)
+      UNIQUE KEY uq_day (strategy_id, run_mode, as_of_date)
     )`);
 
   // The frozen plan (review P0.3). Written after the close of bar T with no
@@ -210,6 +210,7 @@ async function setup(pool) {
   await migratePlanTable(pool);
   await migrateNavTable(pool);
   await migrateRegimeLabel(pool);
+  await migrateUniqueKeys(pool);
   await migrateProvenance(pool);
 }
 
@@ -217,6 +218,29 @@ async function setup(pool) {
  * Bring an already-created ft_strategy_plan up to date: PARTIALLY_FILLED became
  * a real state and per-ticker no-fills are recorded (review P1.2).
  */
+/**
+ * Put run_mode into the uniqueness constraints.
+ *
+ * Neither key included it, and both writers use INSERT IGNORE, so a LIVE row
+ * could collide with a REPLAY row for the same ticker and date and be silently
+ * discarded — while `opened++` still counted it and the plan was still marked
+ * EXECUTED. reclassifyBatchWrites would then flip the surviving row to REPLAY,
+ * erasing a genuine live fill from the track record on the next startup.
+ */
+async function migrateUniqueKeys(pool) {
+  const check = async (table, key, want) => {
+    const [rows] = await pool.query(
+      `SELECT COLUMN_NAME c FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? ORDER BY SEQ_IN_INDEX`, [table, key]);
+    if (!rows.length) return;                       // freshly created: already correct
+    if (rows.some(r => r.c === 'run_mode')) return; // already migrated
+    await pool.query(`ALTER TABLE ${table} DROP INDEX ${key}, ADD UNIQUE KEY ${key} (${want})`);
+    console.log(`MIGRATION: ${table}.${key} now includes run_mode — LIVE and REPLAY rows can no longer collide`);
+  };
+  await check('ft_strategy_positions', 'uq_open', 'strategy_id, run_mode, ticker, entry_date');
+  await check('ft_strategy_log', 'uq_day', 'strategy_id, run_mode, as_of_date');
+}
+
 async function migrateRegimeLabel(pool) {
   for (const t of ['ft_strategy_plan', 'ft_strategy_log']) {
     if (!(await hasColumn(pool, t, 'regime_label'))) {
@@ -361,7 +385,7 @@ async function loadSeries(pool) {
     if (!series.has(r.stock_code)) series.set(r.stock_code, {
       open: new Array(n).fill(null), high: new Array(n).fill(null),
       close: new Array(n).fill(null), value: new Array(n).fill(null),
-      dn0: new Array(n).fill(null), placed: 0, nConc: 0,
+      dn0: new Array(n).fill(null), dn0Raw: new Array(n).fill(null), placed: 0, nConc: 0,
     });
     const s = series.get(r.stock_code);
     const c = Number(r.close_price);
@@ -377,7 +401,12 @@ async function loadSeries(pool) {
     if (!s) continue;
     const v = sb.clipDn(r.dn0, sb.DEFAULTS.dnBound);
     if (v === null) continue;
-    s.dn0[i] = v; s.nConc++;
+    s.dn0[i] = v;
+    // The RAW value, kept only for the snapshot digest. Hashing the clipped
+    // value meant a restatement from 120 to 950 produced a bit-identical hash,
+    // because both clip to 100 — the digest could not see a change to the data
+    // it exists to fingerprint. 84 rows in idx_concentration breach the bound.
+    s.dn0Raw[i] = Number(r.dn0); s.nConc++;
   }
   // NO UNIVERSE FILTER HERE. Eligibility is decided per decision bar inside
   // strategy_book.crossSection(), from data through bar i only. This loader
@@ -418,8 +447,9 @@ function snapshotHash(ctx) {
     const t = crypto.createHash('sha256');
     t.update(ticker);
     for (let i = 0; i < s.close.length; i++) {
-      if (s.close[i] === null && s.high[i] === null && s.value[i] === null && s.dn0[i] === null) continue;
-      t.update(`${i}|${s.close[i]}|${s.high[i]}|${s.value[i]}|${s.dn0[i]};`);
+      const raw = s.dn0Raw ? s.dn0Raw[i] : s.dn0[i];
+      if (s.close[i] === null && s.high[i] === null && s.value[i] === null && raw === null) continue;
+      t.update(`${i}|${s.close[i]}|${s.high[i]}|${s.value[i]}|${s.dn0Raw ? s.dn0Raw[i] : s.dn0[i]};`);
     }
     const d = t.digest();
     for (let b = 0; b < 32; b++) fold[b] ^= d[b];
@@ -499,8 +529,8 @@ async function cmdPlan(pool, ctx, quiet) {
   // is not a holding, and treating it as one would let an unfilled intention
   // silently become part of the next decision's starting book.
   const [openRows] = await pool.query(
-    'SELECT ticker FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
-    [STRATEGY_ID, 'OPEN', 'LIVE']);
+    'SELECT ticker FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=? AND strategy_hash=?',
+    [STRATEGY_ID, 'OPEN', 'LIVE', STRATEGY_HASH]);
 
   const d = sb.targetBook({
     series, i, ihsgClose, ihsgSma, currentHoldings: openRows.map(r => r.ticker), opts: PARAMS,
@@ -545,7 +575,15 @@ async function cmdFill(pool, ctx, quiet) {
   const { tradingDates, dateIdx, series } = ctx;
   const nowSql = new Date().toISOString().slice(0, 19).replace('T', ' ');
   const [plans] = await pool.query(
-    `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND status IN ('PLANNED','PARTIALLY_FILLED') ORDER BY as_of_date`,
+    // ONLY 'PLANNED'. Re-selecting PARTIALLY_FILLED created a permanent work
+    // queue: a plan containing a name that is suspended for good would be
+    // re-processed every night forever, because its execution bar is fixed at
+    // as_of + 1 and that bar is closed history. The retry does not live in the
+    // plan — cmdPlan passes only FILLED positions as holdings and targetBook
+    // refills the empty slot from the ranked cross-section, so an unfilled name
+    // is re-targeted at the next decision if it still ranks. PARTIALLY_FILLED
+    // is a terminal record of what happened, not an instruction to try again.
+    `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND status='PLANNED' ORDER BY as_of_date`,
     [STRATEGY_ID, 'LIVE']);
 
   // Run-level totals for the console line only. The PER-PLAN counters live
@@ -578,9 +616,12 @@ async function cmdFill(pool, ctx, quiet) {
     try {
       await conn.beginTransaction();
 
+      // Hash-scoped like every report query. Without it, a configuration change
+      // left retained positions invisible to the report while they still
+      // consumed capacity here — the book and the record would disagree.
       const [openRows] = await conn.query(
-        'SELECT ticker, entry_price, entry_date, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
-        [STRATEGY_ID, 'OPEN', 'LIVE']);
+        'SELECT ticker, entry_price, entry_date, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=? AND strategy_hash=?',
+        [STRATEGY_ID, 'OPEN', 'LIVE', STRATEGY_HASH]);
 
       const stranded = [];      // wanted out, could not get out
       for (const row of openRows) {
@@ -704,8 +745,8 @@ async function cmdMark(pool, ctx, quiet) {
   const i = tradingDates.length - 1;
 
   const [openRows] = await pool.query(
-    'SELECT ticker, entry_price, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
-    [STRATEGY_ID, 'OPEN', 'LIVE']);
+    'SELECT ticker, entry_price, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=? AND strategy_hash=?',
+    [STRATEGY_ID, 'OPEN', 'LIVE', STRATEGY_HASH]);
   const [[realizedRow]] = await pool.query(
     `SELECT COALESCE(SUM(weight * net_pct / 100), 0) r FROM ft_strategy_positions
       WHERE strategy_id=? AND status='CLOSED' AND run_mode='LIVE'`, [STRATEGY_ID]);
@@ -777,7 +818,7 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
   if (dup.length) return { skipped: 'already recorded' };
 
   const [openRows] = await pool.query(
-    'SELECT ticker, entry_price, entry_date FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
+    'SELECT ticker, entry_price, entry_date, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
     [STRATEGY_ID, 'OPEN', runMode]);
   const holdings = openRows.map(r => r.ticker);
 
@@ -785,11 +826,15 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
   const tset = new Set(d.target);
 
   let closed = 0, opened = 0;
+  const stranded = [];
   for (const row of openRows) {
     if (tset.has(row.ticker)) continue;
-    const s = series.get(row.ticker);
-    const px = s ? s.open[execI] : null;
-    if (!(px > 0)) continue;
+    const px = exec.sellFill(series.get(row.ticker), execI);
+    // A seller who cannot sell still owns the shares. Recorded here as well as
+    // in cmdFill: this is the REPLAY writer, and it was left behind when the
+    // live path got the fix, so the replay ledger could hold more weight than
+    // the book has. periodReturns then reported that faithfully as leverage.
+    if (px === null) { stranded.push(row); continue; }
     const entry = Number(row.entry_price);
     const gross = ((px - entry) / entry) * 100;
     const net = gross - (BUY_COST + SELL_COST) * 100;
@@ -802,29 +847,34 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
     closed++;
   }
 
-  const heldNow = new Set(openRows.filter(r => tset.has(r.ticker)).map(r => r.ticker));
-  for (const t of d.target) {
-    if (heldNow.has(t)) continue;
-    const s = series.get(t);
-    const px = s ? s.open[execI] : null;
-    if (!(px > 0)) continue;
+  const retained = openRows.filter(r => tset.has(r.ticker));
+  const heldNow = new Set(retained.map(r => r.ticker));
+  // Same capacity rule as cmdFill: new names split what is actually free, so
+  // the ledger's open weights cannot exceed the book.
+  const committed = [...retained, ...stranded].reduce((sum, r) => sum + Number(r.weight || 0), 0);
+  const toBuy = d.target.filter(t => !heldNow.has(t));
+  const perName = toBuy.length ? Math.max(0, 1 - committed) / toBuy.length : 0;
+  for (const t of toBuy) {
+    if (!(perName > 0)) continue;
+    const px = exec.buyFill(series.get(t), execI);
+    if (px === null) continue;
     await pool.query(
       `INSERT IGNORE INTO ft_strategy_positions
          (strategy_id, ticker, entry_date, entry_price, weight,
           run_mode, decision_date, decision_created_at, data_available_at, strategy_hash, code_commit)
        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      [STRATEGY_ID, t, tradingDates[execI], px, (1 / d.target.length).toFixed(5),
+      [STRATEGY_ID, t, tradingDates[execI], px, perName.toFixed(5),
        runMode, asOf, nowSql, nowSql, STRATEGY_HASH, CODE_COMMIT]);
     opened++;
   }
 
   await pool.query(
     `INSERT IGNORE INTO ft_strategy_log
-       (strategy_id, as_of_date, exposure, reason, eligible, vetoed, n_target, opened, closed, target_json,
+       (strategy_id, as_of_date, exposure, reason, regime_label, eligible, vetoed, n_target, opened, closed, target_json,
         run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    [STRATEGY_ID, asOf, d.exposure, d.reason, d.eligible, d.vetoedCount, d.target.length, opened, closed,
-     JSON.stringify(d.target), runMode, nowSql, nowSql, STRATEGY_HASH, CODE_COMMIT]);
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [STRATEGY_ID, asOf, d.exposure, d.reason, sb.marketRegime(ihsgClose, ihsgSma, i), d.eligible, d.vetoedCount,
+     d.target.length, opened, closed, JSON.stringify(d.target), runMode, nowSql, nowSql, STRATEGY_HASH, CODE_COMMIT]);
 
   if (!quiet) {
     console.log(`${asOf}  [${runMode}]  ${d.reason}`);
@@ -962,6 +1012,15 @@ async function reportFor(pool, ctx, runMode) {
   // The full ledger, every status: this is what was ACTUALLY held (review P0.1).
   const [ledger] = await pool.query(
     'SELECT ticker, entry_date, exit_date, weight, net_pct, status FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=? ORDER BY entry_date', HASH);
+  // The OBSERVED NAV, read back (review P0.3 residual). Writing a NAV that
+  // nothing consumes is the same defect as printing a profit factor nobody
+  // computes — the thing this whole review series is about. It is read here and
+  // cross-checked against the reconstruction below; a divergence means the
+  // ledger and the marks disagree and is reported rather than hidden.
+  const [[navRow]] = await pool.query(
+    `SELECT mark_date, total_nav, cash_value, market_value, realized_pnl, unrealized_pnl, gross_exposure, benchmark_nav
+       FROM ft_strategy_nav WHERE strategy_id=? AND run_mode=? ORDER BY mark_date DESC LIMIT 1`,
+    [STRATEGY_ID, runMode]);
   const [otherHashes] = await pool.query(
     `SELECT COALESCE(strategy_hash, '(none)') h, COUNT(*) n, MIN(entry_date) d0, MAX(entry_date) d1
        FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND (strategy_hash IS NULL OR strategy_hash <> ?)
@@ -989,8 +1048,17 @@ async function reportFor(pool, ctx, runMode) {
     excessVsIndex: excess,                 // secondary, reported not gated
   };
 
+  // Both are fractions of the same notional book of 1.0, so they are directly
+  // comparable. They are NOT expected to match exactly — the report compounds
+  // period returns while the mark is additive over entry weights — but a large
+  // gap means something is wrong with one of them.
+  const observedNav = navRow && navRow.total_nav !== null ? Number(navRow.total_nav) : null;
+  const reconstructedNav = portRet === null ? null : 1 + portRet;
+  const navGap = (observedNav !== null && reconstructedNav !== null) ? observedNav - reconstructedNav : null;
+
   return {
     runMode, logRows, openRows, closedRows, m, otherHashes,
+    navRow, observedNav, reconstructedNav, navGap,
     liveStart: dates[0] || null, liveEnd: dates[dates.length - 1] || null,
     portRet, benchRet, univRet, excess, excessUniverse,
     infoRatio: fg.informationRatio(port, universe, REBAL_BARS),
@@ -1041,6 +1109,16 @@ function printReport(r, ctx) {
   console.log(`Maximum drawdown        ${r.maxDD === null ? 'n/a' : (r.maxDD * 100).toFixed(2) + '%'}`);
   console.log(`Average turnover        ${(r.avgTurnover * 100).toFixed(1)}% of the book per rebalance`);
   console.log(`Profit factor           ${num(r.m.profitFactor)}   (gross profit / gross loss, net %)`);
+  if (r.navRow) {
+    console.log('');
+    console.log(`Observed NAV            ${num(r.observedNav, 4)}   marked ${toDateStr(r.navRow.mark_date)} — cash ${num(r.navRow.cash_value, 4)} + market ${num(r.navRow.market_value, 4)}`);
+    console.log(`Reconstructed NAV       ${num(r.reconstructedNav, 4)}   from compounded period returns`);
+    if (r.navGap !== null && Math.abs(r.navGap) > 0.02) {
+      console.log(`  ** the two disagree by ${(r.navGap * 100).toFixed(2)} pp — the ledger and the marks are telling different stories`);
+    }
+  } else {
+    console.log('Observed NAV            none recorded yet — run `mark`');
+  }
 
   if (r.openRows.length) {
     console.log('\nOPEN positions');
