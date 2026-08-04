@@ -187,11 +187,52 @@ tuned until it stops losing.
 
 Simulated accounts. No orders are placed anywhere.
 
+### Watchdog — `ft_system_health`
+```
+50 13 * * 1-5   node watchdog.js                                # 20:50 WIB
+```
+Added 2026-08-04, and it runs LAST on purpose: it checks what the other stages
+actually produced, not whether they reported producing it. **A job that crashes
+cannot report that it crashed** — `strategy_forward.js fill` died at `setup()`
+that same evening while the two later stages ran clean, and nothing looked wrong
+the next morning. Logs to `/var/log/watchdog.log`.
+
+It repairs only what is idempotent, sourced from real upstream data, and
+verifiable afterwards — an IHSG refetch qualifies; interpolating a missing bar
+does not, because a fabricated close makes the regime filter confident about a
+session that never happened.
+
+**A fault that self-heals every night is a bug in hiding.** Repairs are recorded,
+and one that fires on 3 of the last 7 days is reported as `RECURRING` — a
+failure, even though the repair itself worked. A watchdog that quietly patches
+the same thing forever has converted a loud bug into a silent one, which is the
+disease it exists to treat.
+
+What it found on its first run:
+
+- **Holes behind the latest bar.** `idx_ihsg_history` was missing sessions in the
+  middle while `MAX(date)` was perfectly current, so every freshness check stayed
+  green. Worse, `refreshIHSG` skipped whenever `MAX(date)` reached the last closed
+  session, which made each hole **permanent**. The guard now asks about holes too.
+- **72 dates in `idx_stock_prices` that cannot be trading sessions** — 10 weekends
+  and the rest IDX public holidays carrying `open=high=low=close` with zero volume,
+  several of them verbatim copies of the previous date. Every rolling window here
+  counts BARS (ADV20, ATR14, the 252-day high, the 200-day SMA), so each phantom
+  shifts all of them and the return across one is 0% by construction. Reported,
+  never auto-deleted: dropping production price rows is irreversible and
+  re-ingesting the range may be the better fix. That is a decision, not a repair.
+
+**The index source is the trading calendar.** `^JKSE` is the exchange's own index,
+so a date it has no bar for was not a session. Without that rule the gap check
+demanded an index close for every public holiday, no refetch could ever supply
+one, and it would have failed every night forever — which is how a monitor
+teaches people to ignore it.
+
 ## Log files
 
 `/var/log/ft-pull.log`, `/var/log/signal_engine.log`, `/var/log/flowtracker-intel.log`,
 `/var/log/flowtracker-hk.log`, `/var/log/paper-trader.log,
-`/var/log/strategy-forward.log`, `/var/log/virtual-portfolio.log`
+`/var/log/strategy-forward.log`, `/var/log/virtual-portfolio.log`, `/var/log/watchdog.log`
 
 ## Note on "paper trading"
 

@@ -9,7 +9,7 @@
     "test": "node test_awo_factors.js && node test_regime_engine.js && node test_macd_fix.js && node test_optimizer_fixes.js && node test_score_parity.js && node test_paper_trading.js && node test_technical_availability.js && node test_trade_policy.js && node test_cross_sectional.js && node test_system_health.js && node test_ihsg.js && node test_execution.js && node test_forward_gate.js && node test_conviction.js && node test_strategy_forward.js && node test_virtual_broker.js && node --max-old-space-size=4096 verify_strategy_book.js",
     "test:unit": "node test_awo_factors.js && node test_regime_engine.js && node test_macd_fix.js && node test_optimizer_fixes.js && node test_score_parity.js && node test_paper_trading.js && node test_technical_availability.js && node test_trade_policy.js && node test_cross_sectional.js && node test_system_health.js && node test_ihsg.js && node test_execution.js && node test_forward_gate.js && node test_conviction.js && node test_strategy_forward.js && node test_virtual_broker.js",
     "test:verify": "node --max-old-space-size=4096 verify_strategy_book.js",
-    "test:integration": "node test_forward_schema.js --require-db && node --max-old-space-size=4096 test_forward_lifecycle.js --require-db && node test_virtual_portfolio.js --require-db"
+    "test:integration": "node test_forward_schema.js --require-db && node --max-old-space-size=4096 test_forward_lifecycle.js --require-db && node test_virtual_portfolio.js --require-db && node test_watchdog.js --require-db"
   },
   "dependencies": {
     "cors": "^2.8.5",

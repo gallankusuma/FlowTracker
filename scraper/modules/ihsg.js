@@ -103,7 +103,29 @@ async function refreshIHSG(pool, fetchCandles, opts = {}) {
   // a Saturday-latest one did not, for reasons unrelated to trading.
   const { date: today, minutes } = wibNow(now);
   const lastClosed = minutes >= IDX_CLOSE_WIB_MINUTES ? today : null;
-  if (!opts.force && latest && lastClosed && latest >= lastClosed) {
+
+  // A HOLE BEHIND THE LATEST BAR MUST DEFEAT THE SKIP.
+  //
+  // Found live 2026-08-04: the series held 2026-08-04 but not 2026-08-03. Every
+  // freshness check measures MAX(date) and stayed green, and this guard — which
+  // only asks whether MAX(date) has reached the last closed session — refused to
+  // refetch. The hole was therefore PERMANENT: no scheduled run would ever look
+  // at it again, and the 200-day SMA the regime filter reads was averaging a
+  // window with a session missing from it.
+  //
+  // So the guard now asks a second question. Missing sessions are proven against
+  // idx_stock_prices, not guessed, and one refetch of the full range fills them
+  // because the upsert is keyed on date.
+  let gaps = { missing: [] };
+  if (!opts.skipGapCheck) {
+    try {
+      gaps = await require('./system_health').missingSessions(pool, {
+        table: 'idx_ihsg_history', col: 'date', days: opts.gapWindowDays || 260,
+      });
+    } catch { /* a gap check that cannot run must not block the refresh */ }
+  }
+
+  if (!opts.force && !gaps.missing.length && latest && lastClosed && latest >= lastClosed) {
     return { skipped: true, reason: 'already current through the last closed session', latest };
   }
 
@@ -129,12 +151,34 @@ async function refreshIHSG(pool, fetchCandles, opts = {}) {
     [values]
   );
   const [[after]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+
+  // Re-check, so the caller learns whether the refetch actually closed the
+  // holes. A repair that reports success without verifying the thing it was
+  // repairing is the failure mode this whole module exists to end.
+  let gapsAfter = { missing: [] };
+  if (gaps.missing.length) {
+    try {
+      gapsAfter = await require('./system_health').missingSessions(pool, {
+        table: 'idx_ihsg_history', col: 'date', days: opts.gapWindowDays || 260,
+      });
+    } catch { /* ignore */ }
+  }
+
   return {
     saved: result.affectedRows,
     candles: usable.length,
     dropped,
     latest: toDateStr(after?.d) || latest,
     previousLatest: latest,
+    gapsBefore: gaps.missing,
+    gapsRemaining: gapsAfter.missing,
+    gapsFilled: gaps.missing.filter(d => !gapsAfter.missing.includes(d)),
+    // The dates the SOURCE actually has. ^JKSE is the exchange's own index, so
+    // this is the authoritative IDX trading calendar: no index bar, no session.
+    // A caller can therefore tell a real index gap ("the source has this day and
+    // we do not") from a date that was never a trading day at all — without
+    // which the check reports the same unfixable holiday every night forever.
+    sourceDates: usable.map(c => String(c.date).slice(0, 10)),
   };
 }
 
