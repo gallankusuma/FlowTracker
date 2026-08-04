@@ -138,7 +138,7 @@ async function setup(pool) {
       net_pct DECIMAL(10,4) NULL,
       status ENUM('OPEN','CLOSED') NOT NULL DEFAULT 'OPEN',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_open (strategy_id, run_mode, ticker, entry_date),
+      UNIQUE KEY uq_open (strategy_id, run_mode, strategy_hash, ticker, entry_date),
       KEY idx_status (strategy_id, status)
     )`);
   await pool.query(`
@@ -156,7 +156,7 @@ async function setup(pool) {
       closed INT NOT NULL DEFAULT 0,
       target_json TEXT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_day (strategy_id, run_mode, as_of_date)
+      UNIQUE KEY uq_day (strategy_id, run_mode, strategy_hash, as_of_date)
     )`);
 
   // The frozen plan (review P0.3). Written after the close of bar T with no
@@ -183,7 +183,7 @@ async function setup(pool) {
       nofill_json TEXT NULL,
       executed_at DATETIME NULL,
       execution_date DATE NULL,
-      UNIQUE KEY uq_plan (strategy_id, as_of_date),
+      UNIQUE KEY uq_plan (strategy_id, run_mode, strategy_hash, as_of_date),
       KEY idx_plan_status (strategy_id, run_mode, status)
     )`);
 
@@ -193,6 +193,7 @@ async function setup(pool) {
       strategy_id VARCHAR(64) NOT NULL,
       mark_date DATE NOT NULL,
       run_mode ENUM('LIVE','REPLAY','BACKFILL') NOT NULL DEFAULT 'LIVE',
+      strategy_hash VARCHAR(32) NULL,
       open_positions INT NOT NULL,
       unrealised_pct DECIMAL(10,4) NULL,
       unmarkable VARCHAR(255) NULL,
@@ -204,7 +205,7 @@ async function setup(pool) {
       gross_exposure DECIMAL(16,6) NULL,
       benchmark_nav DECIMAL(16,6) NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_mark (strategy_id, mark_date, run_mode)
+      UNIQUE KEY uq_mark (strategy_id, run_mode, strategy_hash, mark_date)
     )`);
 
   await migratePlanTable(pool);
@@ -233,12 +234,14 @@ async function migrateUniqueKeys(pool) {
       `SELECT COLUMN_NAME c FROM information_schema.STATISTICS
         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ? ORDER BY SEQ_IN_INDEX`, [table, key]);
     if (!rows.length) return;                       // freshly created: already correct
-    if (rows.some(r => r.c === 'run_mode')) return; // already migrated
+    if (rows.some(r => r.c === 'strategy_hash')) return; // already migrated
     await pool.query(`ALTER TABLE ${table} DROP INDEX ${key}, ADD UNIQUE KEY ${key} (${want})`);
-    console.log(`MIGRATION: ${table}.${key} now includes run_mode — LIVE and REPLAY rows can no longer collide`);
+    console.log(`MIGRATION: ${table}.${key} now includes run_mode + strategy_hash — different modes and configurations can no longer collide`);
   };
-  await check('ft_strategy_positions', 'uq_open', 'strategy_id, run_mode, ticker, entry_date');
-  await check('ft_strategy_log', 'uq_day', 'strategy_id, run_mode, as_of_date');
+  await check('ft_strategy_positions', 'uq_open', 'strategy_id, run_mode, strategy_hash, ticker, entry_date');
+  await check('ft_strategy_log', 'uq_day', 'strategy_id, run_mode, strategy_hash, as_of_date');
+  await check('ft_strategy_plan', 'uq_plan', 'strategy_id, run_mode, strategy_hash, as_of_date');
+  await check('ft_strategy_nav', 'uq_mark', 'strategy_id, run_mode, strategy_hash, mark_date');
 }
 
 async function migrateRegimeLabel(pool) {
@@ -251,6 +254,10 @@ async function migrateRegimeLabel(pool) {
 }
 
 async function migrateNavTable(pool) {
+  if (!(await hasColumn(pool, 'ft_strategy_nav', 'strategy_hash'))) {
+    await pool.query('ALTER TABLE ft_strategy_nav ADD COLUMN strategy_hash VARCHAR(32) NULL');
+    console.log('MIGRATION: ft_strategy_nav.strategy_hash added — one configuration could read and overwrite the NAV of another');
+  }
   const cols = ['cash_value', 'market_value', 'total_nav', 'realized_pnl', 'unrealized_pnl', 'gross_exposure', 'benchmark_nav'];
   const missing = [];
   for (const c of cols) if (!(await hasColumn(pool, 'ft_strategy_nav', c))) missing.push(c);
@@ -575,6 +582,14 @@ async function cmdFill(pool, ctx, quiet) {
   const { tradingDates, dateIdx, series } = ctx;
   const nowSql = new Date().toISOString().slice(0, 19).replace('T', ' ');
   const [plans] = await pool.query(
+    // Every PLANNED plan, whatever hash produced it — but each is executed
+    // against ITS OWN hash book and written under ITS OWN hash (review P0.1).
+    // Selecting without a hash filter while WRITING the running code hash was
+    // the worst of both: a plan decided by configuration A, filled after a
+    // change to B, landed in B track record. Each strategy_hash is an
+    // independent record with an independent book; `plan` only ever creates
+    // plans for the current one, so nothing is orphaned.
+    //
     // ONLY 'PLANNED'. Re-selecting PARTIALLY_FILLED created a permanent work
     // queue: a plan containing a name that is suspended for good would be
     // re-processed every night forever, because its execution bar is fixed at
@@ -605,6 +620,7 @@ async function cmdFill(pool, ctx, quiet) {
     const reference = JSON.parse(p.reference_json || '{}');
     const tset = new Set(target);
     const exposure = Number(p.exposure);
+    const planHash = p.strategy_hash || STRATEGY_HASH;   // the hash that DECIDED this
 
     // One transaction per plan, so a crash cannot leave a plan half-executed
     // with its status already advanced (review P1.3). The work was already
@@ -621,7 +637,7 @@ async function cmdFill(pool, ctx, quiet) {
       // consumed capacity here — the book and the record would disagree.
       const [openRows] = await conn.query(
         'SELECT ticker, entry_price, entry_date, weight FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=? AND strategy_hash=?',
-        [STRATEGY_ID, 'OPEN', 'LIVE', STRATEGY_HASH]);
+        [STRATEGY_ID, 'OPEN', 'LIVE', planHash]);
 
       const stranded = [];      // wanted out, could not get out
       for (const row of openRows) {
@@ -630,14 +646,17 @@ async function cmdFill(pool, ctx, quiet) {
         if (px === null) { noFill.sell.push(row.ticker); stranded.push(row); continue; }
         const entry = Number(row.entry_price);
         const gross = ((px - entry) / entry) * 100;
-        await conn.query(
+        const [upd] = await conn.query(
           `UPDATE ft_strategy_positions SET status='CLOSED', exit_date=?, exit_price=?, exit_reason=?,
                   gross_pct=?, net_pct=?, execution_observed_at=?
-            WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=?`,
+            WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=? AND strategy_hash=?`,
           [tradingDates[execI], px, exposure === 0 ? 'REGIME_FLAT' : 'REBALANCE',
            gross.toFixed(4), (gross - (BUY_COST + SELL_COST) * 100).toFixed(4), nowSql,
-           STRATEGY_ID, row.ticker, toDateStr(row.entry_date), 'LIVE']);
-        closed++;
+           STRATEGY_ID, row.ticker, toDateStr(row.entry_date), 'LIVE', planHash]);
+        // P0.4: a narrowed UPDATE, like INSERT IGNORE, can match nothing.
+        // Counting regardless let the log claim a position was closed when the
+        // statement touched no row at all.
+        if (upd.affectedRows === 1) closed++;
       }
 
       const retained = openRows.filter(r => tset.has(r.ticker));
@@ -665,15 +684,15 @@ async function cmdFill(pool, ctx, quiet) {
         if (px === null) { noFill.buy.push(t); continue; }
         // Implementation shortfall: what the decision saw vs what it paid.
         if (reference[t] > 0) { shortfallSum += (px - reference[t]) / reference[t]; shortfallN++; }
-        await conn.query(
+        const [ins] = await conn.query(
           `INSERT IGNORE INTO ft_strategy_positions
              (strategy_id, ticker, entry_date, entry_price, weight,
               run_mode, decision_date, decision_created_at, data_available_at, execution_observed_at,
               strategy_hash, code_commit)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
           [STRATEGY_ID, t, tradingDates[execI], px, perName.toFixed(5),
-           'LIVE', asOf, p.generated_at, p.generated_at, nowSql, STRATEGY_HASH, CODE_COMMIT]);
-        opened++;
+           'LIVE', asOf, p.generated_at, p.generated_at, nowSql, planHash, CODE_COMMIT]);
+        if (ins.affectedRows === 1) opened++; else noFill.buy.push(t);
       }
 
       await conn.query(
@@ -682,7 +701,7 @@ async function cmdFill(pool, ctx, quiet) {
             run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [STRATEGY_ID, asOf, exposure, p.reason, p.regime_label, p.eligible, p.vetoed, target.length, opened, closed,
-         p.target_json, 'LIVE', p.generated_at, p.generated_at, STRATEGY_HASH, CODE_COMMIT]);
+         p.target_json, 'LIVE', p.generated_at, p.generated_at, planHash, CODE_COMMIT]);
 
       // PARTIALLY_FILLED is a real state (review P1.2). Marking a plan EXECUTED
       // when part of it did not fill throws away the only record that intent and
@@ -749,9 +768,10 @@ async function cmdMark(pool, ctx, quiet) {
     [STRATEGY_ID, 'OPEN', 'LIVE', STRATEGY_HASH]);
   const [[realizedRow]] = await pool.query(
     `SELECT COALESCE(SUM(weight * net_pct / 100), 0) r FROM ft_strategy_positions
-      WHERE strategy_id=? AND status='CLOSED' AND run_mode='LIVE'`, [STRATEGY_ID]);
+      WHERE strategy_id=? AND status='CLOSED' AND run_mode='LIVE' AND strategy_hash=?`, [STRATEGY_ID, STRATEGY_HASH]);
   const [[firstRow]] = await pool.query(
-    `SELECT MIN(as_of_date) d FROM ft_strategy_log WHERE strategy_id=? AND run_mode='LIVE'`, [STRATEGY_ID]);
+    `SELECT MIN(as_of_date) d FROM ft_strategy_log WHERE strategy_id=? AND run_mode='LIVE' AND strategy_hash=?`,
+    [STRATEGY_ID, STRATEGY_HASH]);
 
   let grossExposure = 0, marketValue = 0;
   const unmarkable = [];
@@ -776,14 +796,14 @@ async function cmdMark(pool, ctx, quiet) {
 
   await pool.query(
     `INSERT INTO ft_strategy_nav
-       (strategy_id, mark_date, run_mode, open_positions, unrealised_pct, unmarkable,
+       (strategy_id, mark_date, run_mode, strategy_hash, open_positions, unrealised_pct, unmarkable,
         cash_value, market_value, total_nav, realized_pnl, unrealized_pnl, gross_exposure, benchmark_nav)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
      ON DUPLICATE KEY UPDATE open_positions=VALUES(open_positions), unrealised_pct=VALUES(unrealised_pct),
        unmarkable=VALUES(unmarkable), cash_value=VALUES(cash_value), market_value=VALUES(market_value),
        total_nav=VALUES(total_nav), realized_pnl=VALUES(realized_pnl), unrealized_pnl=VALUES(unrealized_pnl),
        gross_exposure=VALUES(gross_exposure), benchmark_nav=VALUES(benchmark_nav)`,
-    [STRATEGY_ID, tradingDates[i], 'LIVE', openRows.length, (unrealized * 100).toFixed(4),
+    [STRATEGY_ID, tradingDates[i], 'LIVE', STRATEGY_HASH, openRows.length, (unrealized * 100).toFixed(4),
      unmarkable.join(',') || null, cash.toFixed(6), marketValue.toFixed(6), nav.toFixed(6),
      realized.toFixed(6), unrealized.toFixed(6), grossExposure.toFixed(6), benchNav === null ? null : benchNav.toFixed(6)]);
 
@@ -858,14 +878,14 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
     if (!(perName > 0)) continue;
     const px = exec.buyFill(series.get(t), execI);
     if (px === null) continue;
-    await pool.query(
+    const [ins] = await pool.query(
       `INSERT IGNORE INTO ft_strategy_positions
          (strategy_id, ticker, entry_date, entry_price, weight,
           run_mode, decision_date, decision_created_at, data_available_at, strategy_hash, code_commit)
        VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
       [STRATEGY_ID, t, tradingDates[execI], px, perName.toFixed(5),
        runMode, asOf, nowSql, nowSql, STRATEGY_HASH, CODE_COMMIT]);
-    opened++;
+    if (ins.affectedRows === 1) opened++;
   }
 
   await pool.query(
@@ -1019,8 +1039,8 @@ async function reportFor(pool, ctx, runMode) {
   // ledger and the marks disagree and is reported rather than hidden.
   const [[navRow]] = await pool.query(
     `SELECT mark_date, total_nav, cash_value, market_value, realized_pnl, unrealized_pnl, gross_exposure, benchmark_nav
-       FROM ft_strategy_nav WHERE strategy_id=? AND run_mode=? ORDER BY mark_date DESC LIMIT 1`,
-    [STRATEGY_ID, runMode]);
+       FROM ft_strategy_nav WHERE strategy_id=? AND run_mode=? AND strategy_hash=? ORDER BY mark_date DESC LIMIT 1`,
+    HASH);
   const [otherHashes] = await pool.query(
     `SELECT COALESCE(strategy_hash, '(none)') h, COUNT(*) n, MIN(entry_date) d0, MAX(entry_date) d1
        FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND (strategy_hash IS NULL OR strategy_hash <> ?)
