@@ -1,22 +1,29 @@
 /**
- * Database lifecycle integration test (review P1.1, 2026-08-04 12:33).
+ * End-to-end lifecycle test against real MySQL.
  *
- * test_strategy_forward.js covers the pure functions, and the reviewer was right
- * that this is not enough: the defects that kept surviving lived in the GLUE —
- * hash scoping on plan and NAV, unique-key collisions, INSERT IGNORE silently
- * discarding a row while a counter incremented anyway, transaction behaviour.
- * None of those are reachable without a real database.
+ * The previous file with this name claimed to run cmdPlan -> cmdFill -> cmdMark
+ * -> reportFor -> gate and did none of it: it inserted rows by hand and tested
+ * the primitives. The 2026-08-04 13:07 review caught the gap between the
+ * docstring and the code, which is a fair hit — the defects that keep surviving
+ * live in the glue, and hand-written INSERTs are not the glue. That file is now
+ * test_forward_schema.js, named for what it does.
  *
- * So this drives the actual cycle against real MySQL:
+ * This one drives the actual functions:
  *
- *   cmdPlan -> row -> cmdFill -> partial fill -> cmdMark -> reportFor -> gate
+ *   cmdPlan (on a truncated view, so the execution bar does not exist yet)
+ *     -> a PLANNED row with no execution price
+ *   cmdFill (on the full view, with one target deliberately unbuyable)
+ *     -> PARTIALLY_FILLED, real units, cash reduced by exactly the cost basis
+ *   cmdMark   -> a NAV that reconciles
+ *   reportFor -> metrics from that ledger
+ *   gate      -> NOT_ELIGIBLE on a one-decision record
  *
- * ISOLATION. Everything is written under a distinct STRATEGY_ID, so the live
- * ledger is never touched, and the rows are deleted at the end whether the test
- * passes or fails. The tables are the real ones, because using copies would
- * defeat the point — unique keys and INSERT IGNORE are exactly what is on trial.
+ * Isolation is by an injected strategyId/strategyHash, so the live ledger is
+ * untouched; rows are removed in a finally block and the cleanup is asserted.
  *
- * SKIPS CLEANLY without a database, so `npm test` still runs on a laptop.
+ * SKIPPING IS NOT SUCCESS. Without a database this exits 0 only when run
+ * WITHOUT --require-db. `npm run test:integration` passes it, so an environment
+ * that is supposed to have MySQL cannot go green by quietly skipping.
  */
 'use strict';
 require('dotenv').config();
@@ -24,9 +31,11 @@ require('dotenv').config();
 const assert = require('assert');
 const mysql = require('mysql2/promise');
 const sf = require('./strategy_forward');
+const fg = require('./modules/forward_gate');
+const sb = require('./modules/strategy_book');
 
-const TEST_ID = 'TEST_LIFECYCLE_DO_NOT_TRADE';
-const HASH_A = 'aaaaaaaaaaaaaaaa', HASH_B = 'bbbbbbbbbbbbbbbb';
+const IDS = { strategyId: 'TEST_LIFECYCLE_DO_NOT_TRADE', strategyHash: 'testhash00000001' };
+const REQUIRE_DB = process.argv.includes('--require-db') || process.env.FT_REQUIRE_DB === '1';
 
 let pass = 0, fail = 0;
 function t(name, fn) {
@@ -36,145 +45,160 @@ function t(name, fn) {
 
 async function cleanup(pool) {
   for (const tbl of ['ft_strategy_positions', 'ft_strategy_log', 'ft_strategy_plan', 'ft_strategy_nav']) {
-    await pool.query(`DELETE FROM ${tbl} WHERE strategy_id=?`, [TEST_ID]);
+    await pool.query(`DELETE FROM ${tbl} WHERE strategy_id=?`, [IDS.strategyId]);
   }
+}
+
+/** A view of ctx that ends at bar `n`, so cmdPlan cannot see the execution bar. */
+function truncated(ctx, n) {
+  return {
+    tradingDates: ctx.tradingDates.slice(0, n + 1),
+    dateIdx: new Map(ctx.tradingDates.slice(0, n + 1).map((d, i) => [d, i])),
+    ihsgClose: ctx.ihsgClose.slice(0, n + 1),
+    ihsgSma: ctx.ihsgSma.slice(0, n + 1),
+    series: ctx.series,
+  };
 }
 
 (async () => {
   let pool;
   try {
     pool = mysql.createPool({
-      host: process.env.DB_HOST || 'localhost',
-      user: process.env.DB_USER || 'erp_user',
-      password: process.env.DB_PASSWORD,
-      database: process.env.DB_NAME || 'erp_manufacturing',
-      waitForConnections: true, connectionLimit: 3,
+      host: process.env.DB_HOST || 'localhost', user: process.env.DB_USER || 'erp_user',
+      password: process.env.DB_PASSWORD, database: process.env.DB_NAME || 'erp_manufacturing',
+      waitForConnections: true, connectionLimit: 4,
     });
     await pool.query('SELECT 1');
   } catch (e) {
-    console.log('\nforward lifecycle — SKIPPED (no database reachable)');
-    console.log(`  ${e.message}`);
+    if (REQUIRE_DB) {
+      console.log('\nforward lifecycle — FAILED: FT_REQUIRE_DB=1 but no database is reachable');
+      console.log(`  ${e.message}`);
+      process.exit(1);
+    }
+    console.log('\nforward lifecycle — skipped (no database; pass --require-db to make this a failure)');
     process.exit(0);
   }
 
-  // The tables must already exist; setup() owns their DDL and migrations.
-  const [[tbl]] = await pool.query(
-    `SELECT COUNT(*) n FROM information_schema.TABLES
-      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ft_strategy_positions'`);
-  if (!tbl.n) {
-    console.log('\nforward lifecycle — SKIPPED (run strategy_forward.js once to create the tables)');
-    process.exit(0);
-  }
-
+  await sf.setup(pool);
+  const ctx = await sf.loadSeries(pool);
   await cleanup(pool);
+
   try {
-    console.log('\nforward lifecycle — strategy_hash isolation');
+    // Plan on a bar the strategy would actually have INVESTED on, so the
+    // partial-fill path is exercised regardless of what the market is doing the
+    // day this test runs. Neutralising the regime instead would have been
+    // simpler and wrong: marketRegime reads the same SMA, so the plan would
+    // carry no regime label and the test would be asserting on a fixture that
+    // cannot occur. Any bar with an execution bar after it will do.
+    let planI = null;
+    for (let i = ctx.tradingDates.length - 6; i > sb.DEFAULTS.regimeSma; i--) {
+      if (ctx.ihsgSma[i] !== null && ctx.ihsgClose[i] > ctx.ihsgSma[i]) { planI = i; break; }
+    }
+    assert.ok(planI !== null, 'no INVESTED bar anywhere in the sample');
+    const planDate = ctx.tradingDates[planI];
+    const execDate = ctx.tradingDates[planI + 1];
 
-    // Two configurations, same ticker, same date. Before strategy_hash entered
-    // the unique keys, INSERT IGNORE discarded the second silently.
-    const ins = async (hash, ticker, date, cost) => {
-      const [r] = await pool.query(
-        `INSERT IGNORE INTO ft_strategy_positions
-           (strategy_id, ticker, entry_date, entry_price, weight, units, cost_basis, run_mode, strategy_hash)
-         VALUES (?,?,?,?,?,?,?,'LIVE',?)`,
-        [TEST_ID, ticker, date, 100, cost, cost / 100, cost, hash]);
-      return r.affectedRows;
-    };
-    const a1 = await ins(HASH_A, 'AAA', '2026-01-05', 0.5);
-    const b1 = await ins(HASH_B, 'AAA', '2026-01-05', 0.5);
-    t('two configurations can hold the same ticker on the same date', () => {
-      assert.strictEqual(a1, 1, 'first insert must land');
-      assert.strictEqual(b1, 1, 'second must land too — it is a different strategy');
+    console.log('\nforward lifecycle — cmdPlan');
+    const planned = await sf.cmdPlan(pool, truncated(ctx, planI), true, IDS);
+    const [[planRow]] = await pool.query(
+      'SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND strategy_hash=?', [IDS.strategyId, IDS.strategyHash]);
+
+    t('cmdPlan wrote exactly one PLANNED row', () => {
+      assert.ok(planRow, 'no plan row was written');
+      assert.strictEqual(planRow.status, 'PLANNED');
+    });
+    t('the plan is stamped with the injected hash, a snapshot and a regime label', () => {
+      assert.strictEqual(planRow.strategy_hash, IDS.strategyHash);
+      assert.ok(planRow.data_snapshot_hash, 'no data_snapshot_hash');
+      assert.ok(planRow.regime_label, 'no regime_label');
+    });
+    t('cmdPlan opened no positions — it reads no execution price', () => {
+      assert.ok(!planned.skipped, planned.skipped || '');
     });
 
-    const dup = await ins(HASH_A, 'AAA', '2026-01-05', 0.5);
-    t('the same configuration cannot duplicate a position, and says so', () => {
-      assert.strictEqual(dup, 0, 'INSERT IGNORE must discard the duplicate');
-      // This is the value of guarding on affectedRows: the caller can tell.
-    });
+    console.log('\nforward lifecycle — cmdFill with one deliberately unbuyable name');
+    const target = JSON.parse(planRow.target_json || '[]');
+    const fillCtx = { ...ctx, series: new Map(ctx.series) };
+    let blocked = null;
+    if (target.length) {
+      blocked = target[0];
+      const s0 = ctx.series.get(blocked);
+      fillCtx.series.set(blocked, { ...s0, open: s0.open.slice() });
+      fillCtx.series.get(blocked).open[planI + 1] = 0;      // suspended that morning
+    }
+    const filled = await sf.cmdFill(pool, fillCtx, true, IDS);
+    const [[after]] = await pool.query(
+      'SELECT status, nofill_json FROM ft_strategy_plan WHERE id=?', [planRow.id]);
+    const [positions] = await pool.query(
+      'SELECT ticker, units, cost_basis, entry_date, status FROM ft_strategy_positions WHERE strategy_id=? AND strategy_hash=?',
+      [IDS.strategyId, IDS.strategyHash]);
 
-    const [rows] = await pool.query(
-      'SELECT strategy_hash h, COUNT(*) n FROM ft_strategy_positions WHERE strategy_id=? GROUP BY h ORDER BY h',
-      [TEST_ID]);
-    t('each configuration keeps its own row', () => {
-      assert.strictEqual(rows.length, 2, JSON.stringify(rows));
-      assert.ok(rows.every(r => r.n === 1));
-    });
-
-    console.log('\nforward lifecycle — NAV is scoped per configuration');
-
-    const mark = async (hash, nav) => pool.query(
-      `INSERT INTO ft_strategy_nav (strategy_id, mark_date, run_mode, strategy_hash, open_positions, total_nav)
-       VALUES (?, '2026-01-06', 'LIVE', ?, 1, ?)
-       ON DUPLICATE KEY UPDATE total_nav=VALUES(total_nav)`, [TEST_ID, hash, nav]);
-    await mark(HASH_A, 1.25);
-    await mark(HASH_B, 0.80);
-    const [navs] = await pool.query(
-      'SELECT strategy_hash h, total_nav v FROM ft_strategy_nav WHERE strategy_id=? ORDER BY h', [TEST_ID]);
-    t('one configuration cannot overwrite the NAV of another on the same date', () => {
-      assert.strictEqual(navs.length, 2, JSON.stringify(navs));
-      assert.ok(Math.abs(Number(navs[0].v) - 1.25) < 1e-6, `A kept its NAV, got ${navs[0].v}`);
-      assert.ok(Math.abs(Number(navs[1].v) - 0.80) < 1e-6, `B kept its NAV, got ${navs[1].v}`);
-    });
-
-    console.log('\nforward lifecycle — the log is scoped too');
-
-    const log = async (hash, date) => {
-      const [r] = await pool.query(
-        `INSERT IGNORE INTO ft_strategy_log
-           (strategy_id, as_of_date, exposure, reason, regime_label, eligible, vetoed, n_target, run_mode, strategy_hash)
-         VALUES (?,?,1,'INVESTED','BULL',50,10,8,'LIVE',?)`, [TEST_ID, date, hash]);
-      return r.affectedRows;
-    };
-    const la = await log(HASH_A, '2026-01-05');
-    const lb = await log(HASH_B, '2026-01-05');
-    const ldup = await log(HASH_A, '2026-01-05');
-    t('two configurations can log the same decision date; one cannot log it twice', () => {
-      assert.strictEqual(la, 1);
-      assert.strictEqual(lb, 1, 'a second configuration must not be silently dropped');
-      assert.strictEqual(ldup, 0);
-    });
-
-    console.log('\nforward lifecycle — cash and NAV read back from the real ledger');
-
-    const [ledger] = await pool.query(
-      `SELECT ticker, entry_date, exit_date, units, cost_basis, proceeds
-         FROM ft_strategy_positions WHERE strategy_id=? AND strategy_hash=?`, [TEST_ID, HASH_A]);
-    t('cash reflects what the ledger actually spent', () => {
-      const cash = sf.cashAt(ledger, '2026-01-05');
-      assert.ok(Math.abs(cash - (sf.INITIAL_CAPITAL - 0.5)) < 1e-9, `got ${cash}`);
-    });
-
-    t('a sale returns its proceeds to cash', () => {
-      const withExit = ledger.map(r => ({ ...r, exit_date: '2026-01-07', proceeds: 0.6 }));
-      const cash = sf.cashAt(withExit, '2026-01-07');
-      assert.ok(Math.abs(cash - (sf.INITIAL_CAPITAL - 0.5 + 0.6)) < 1e-9, `got ${cash}`);
-    });
-
-    t('NAV marks the held units at the given bar', () => {
-      const series = new Map([['AAA', {
-        open: [100, 100, 200], high: [100, 100, 200], close: [100, 100, 200], value: [1, 1, 1], dn0: [0, 0, 0],
-      }]]);
-      const nav = sf.navAt(ledger, series, 2, '2026-01-07');
-      // 0.5 of the book left in cash, 0.005 units now worth 200 each.
-      assert.ok(Math.abs(nav - (0.5 + 0.005 * 200)) < 1e-9, `got ${nav}`);
-    });
-
-    console.log('\nforward lifecycle — the promotion gate reads the isolated record');
-
-    const fg = require('./modules/forward_gate');
-    t('an empty LIVE record for a configuration is NOT_ELIGIBLE, not an error', () => {
-      const g = fg.evaluateForwardGate({
-        rebalanceDecisions: 1, calendarMonths: 0, distinctRegimes: 1, fills: 1,
-        profitFactor: null, excessReturn: null,
+    if (target.length) {
+      t('a plan that did not fully fill is PARTIALLY_FILLED, not EXECUTED', () => {
+        assert.strictEqual(after.status, 'PARTIALLY_FILLED', `status ${after.status}`);
       });
+      t('the unbuyable name is named in nofill_json', () => {
+        assert.ok(after.nofill_json, 'nofill_json is empty');
+        assert.ok(JSON.parse(after.nofill_json).buy.includes(blocked), after.nofill_json);
+      });
+      t('it opened every OTHER target and none of the blocked one', () => {
+        assert.strictEqual(positions.length, target.length - 1, `opened ${positions.length} of ${target.length - 1}`);
+        assert.ok(!positions.some(p => p.ticker === blocked));
+      });
+      t('every filled position carries real units and a cost basis', () => {
+        for (const p of positions) {
+          assert.ok(Number(p.units) > 0, `${p.ticker} has no units`);
+          assert.ok(Number(p.cost_basis) > 0, `${p.ticker} has no cost basis`);
+        }
+      });
+      t('cash fell by exactly the sum of the cost bases', () => {
+        const spent = positions.reduce((a, p) => a + Number(p.cost_basis), 0);
+        const cash = sf.cashAt(positions.map(p => ({ ...p, exit_date: null, proceeds: null })), execDate);
+        assert.ok(Math.abs(cash - (sf.INITIAL_CAPITAL - spent)) < 1e-9, `cash ${cash}, spent ${spent}`);
+      });
+      t('the book never borrowed', () => {
+        const spent = positions.reduce((a, p) => a + Number(p.cost_basis), 0);
+        assert.ok(spent <= sf.INITIAL_CAPITAL + 1e-9, `deployed ${spent} of ${sf.INITIAL_CAPITAL}`);
+      });
+    } else {
+      t('a flat plan fills nothing and is EXECUTED', () => {
+        assert.strictEqual(after.status, 'EXECUTED');
+        assert.strictEqual(positions.length, 0);
+        assert.strictEqual(filled.opened, 0);
+      });
+    }
+
+    console.log('\nforward lifecycle — cmdMark');
+    const marked = await sf.cmdMark(pool, ctx, true, IDS);
+    const [[navRow]] = await pool.query(
+      'SELECT * FROM ft_strategy_nav WHERE strategy_id=? AND strategy_hash=?', [IDS.strategyId, IDS.strategyHash]);
+    t('cmdMark wrote a NAV row under the injected hash', () => {
+      assert.ok(navRow, 'no NAV row');
+      assert.strictEqual(navRow.strategy_hash, IDS.strategyHash);
+    });
+    t('the NAV identity holds: total = cash + market', () => {
+      const gap = Number(navRow.total_nav) - (Number(navRow.cash_value) + Number(navRow.market_value));
+      assert.ok(Math.abs(gap) < 1e-5, `off by ${gap}`);
+    });
+    t('cash is not negative — the book is self-financing', () => {
+      assert.ok(marked.cash >= -1e-9, `cash ${marked.cash}`);
+    });
+
+    console.log('\nforward lifecycle — reportFor and the gate');
+    const rep = await sf.reportFor(pool, ctx, 'LIVE', IDS);
+    t('the report sees this hash and no other', () => {
+      assert.strictEqual(rep.m.fills, positions.length, `fills ${rep.m.fills}`);
+      assert.ok(!rep.unconverted.length, 'a v2 record must have no weight-era rows');
+    });
+    t('one decision cannot clear the gate', () => {
+      const g = fg.evaluateForwardGate({ ...rep.m, replayDecisions: 0 });
       assert.strictEqual(g.status, 'NOT_ELIGIBLE');
-      assert.ok(g.failed.length >= 4);
+      assert.ok(g.failed.includes('independent rebalance decisions (LIVE)'));
     });
   } finally {
     await cleanup(pool);
     const [[left]] = await pool.query(
-      'SELECT COUNT(*) n FROM ft_strategy_positions WHERE strategy_id=?', [TEST_ID]);
+      'SELECT COUNT(*) n FROM ft_strategy_positions WHERE strategy_id=?', [IDS.strategyId]);
     t('the test cleans up after itself', () => assert.strictEqual(Number(left.n), 0));
     await pool.end();
   }

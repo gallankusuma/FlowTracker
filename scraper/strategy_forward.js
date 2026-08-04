@@ -63,6 +63,22 @@ const BUY_COST = 0.20 / 100, SELL_COST = 0.30 / 100;
 const MODEL_VERSION = process.env.AWO_MODEL_VERSION || '1.0.0-forward';
 
 /**
+ * The EXECUTION ledger version, separate from the strategy configuration.
+ *
+ * v1 recorded a weight fixed at entry. v2 records units, cost basis and
+ * proceeds, and derives cash and NAV from them. Those are not two versions of
+ * one track record — they are two different accounting systems, and pooling
+ * them would mix a return that ignores realized P&L with one that does not.
+ *
+ * Bumping this changes STRATEGY_HASH, which starts a clean record and leaves
+ * the old rows readable under their own hash. Raise it for ANY change to fills,
+ * costs, sizing, cash, NAV or no-fill handling — not only configuration
+ * (review P0.4). The alternative, backfilling units onto weight-era rows, would
+ * mean guessing at a historical NAV that was never recorded.
+ */
+const EXECUTION_LEDGER_VERSION = 2;
+
+/**
  * Identity of the exact strategy configuration a row was produced by. If any of
  * it changes, rows written before and after are not the same track record and
  * must not be pooled.
@@ -79,7 +95,7 @@ const MODEL_VERSION = process.env.AWO_MODEL_VERSION || '1.0.0-forward';
  * passed to targetBook, so a default that changes upstream in strategy_book.js
  * changes the hash here without anyone remembering to update a list.
  */
-const EFFECTIVE_CONFIG = { ...sb.DEFAULTS, ...PARAMS, rebalanceBars: REBAL_BARS, buyCost: BUY_COST, sellCost: SELL_COST, modelVersion: MODEL_VERSION };
+const EFFECTIVE_CONFIG = { ...sb.DEFAULTS, ...PARAMS, rebalanceBars: REBAL_BARS, buyCost: BUY_COST, sellCost: SELL_COST, modelVersion: MODEL_VERSION, executionLedgerVersion: EXECUTION_LEDGER_VERSION };
 const STRATEGY_HASH = crypto.createHash('sha256')
   .update(JSON.stringify({ id: STRATEGY_ID, cfg: Object.keys(EFFECTIVE_CONFIG).sort().map(k => [k, EFFECTIVE_CONFIG[k]]) }))
   .digest('hex').slice(0, 16);
@@ -141,6 +157,17 @@ async function setup(pool) {
       net_pct DECIMAL(10,4) NULL,
       status ENUM('OPEN','CLOSED') NOT NULL DEFAULT 'OPEN',
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      -- Declared HERE, not only added by a migration (review P0.1). The unique
+      -- key below names these columns, so a CREATE TABLE that leaves them to an
+      -- ALTER later is rejected outright on an empty database. The migrations
+      -- exist for schemas that predate them; a fresh schema must stand alone.
+      run_mode ENUM('LIVE','REPLAY','BACKFILL') NOT NULL DEFAULT 'LIVE',
+      strategy_hash VARCHAR(32) NULL,
+      decision_date DATE NULL,
+      decision_created_at DATETIME NULL,
+      data_available_at DATETIME NULL,
+      execution_observed_at DATETIME NULL,
+      code_commit VARCHAR(40) NULL,
       UNIQUE KEY uq_open (strategy_id, run_mode, strategy_hash, ticker, entry_date),
       KEY idx_status (strategy_id, status)
     )`);
@@ -159,6 +186,12 @@ async function setup(pool) {
       closed INT NOT NULL DEFAULT 0,
       target_json TEXT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      -- Same reason as ft_strategy_positions above (review P0.1).
+      run_mode ENUM('LIVE','REPLAY','BACKFILL') NOT NULL DEFAULT 'LIVE',
+      strategy_hash VARCHAR(32) NULL,
+      decision_created_at DATETIME NULL,
+      data_available_at DATETIME NULL,
+      code_commit VARCHAR(40) NULL,
       UNIQUE KEY uq_day (strategy_id, run_mode, strategy_hash, as_of_date)
     )`);
 
@@ -211,12 +244,16 @@ async function setup(pool) {
       UNIQUE KEY uq_mark (strategy_id, run_mode, strategy_hash, mark_date)
     )`);
 
-  await migratePlanTable(pool);
-  await migrateNavTable(pool);
+  // ORDER MATTERS (review P0.2). migrateUniqueKeys builds indexes over
+  // run_mode and strategy_hash, which migrateProvenance is what ADDS on an old
+  // schema. Running the index migration first made an upgrade from the oldest
+  // schema fail on a column that did not exist yet. Columns first, indexes last.
+  await migrateProvenance(pool);
   await migrateLedgerUnits(pool);
+  await migrateNavTable(pool);
+  await migratePlanTable(pool);
   await migrateRegimeLabel(pool);
   await migrateUniqueKeys(pool);
-  await migrateProvenance(pool);
 }
 
 /**
@@ -542,18 +579,25 @@ async function backfillRegimeLabels(pool, ctx) {
   }
 }
 
-async function cmdPlan(pool, ctx, quiet) {
+async function cmdPlan(pool, ctx, quiet, ids) {
+  const strategyId = (ids && ids.strategyId) || STRATEGY_ID;
+  const strategyHash = (ids && ids.strategyHash) || STRATEGY_HASH;
   const { tradingDates, series, ihsgClose, ihsgSma } = ctx;
   const i = tradingDates.length - 1;              // the latest COMPLETE bar
   const asOf = tradingDates[i];
   const nowSql = new Date().toISOString().slice(0, 19).replace('T', ' ');
 
   const [dup] = await pool.query(
-    'SELECT id, status FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?', [STRATEGY_ID, asOf]);
+    'SELECT id, status FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND strategy_hash=? AND as_of_date=?',
+    [strategyId, 'LIVE', strategyHash, asOf]);
   if (dup.length) return { skipped: `plan for ${asOf} already exists (${dup[0].status}) — never recomputed` };
 
   const [last] = await pool.query(
-    'SELECT MAX(as_of_date) d FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=?', [STRATEGY_ID, 'LIVE']);
+    // Hash-scoped: an unrelated configuration must not block this one from
+    // planning today, nor delay the start of its record by a whole cadence
+    // (review P0.5).
+    'SELECT MAX(as_of_date) d FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND strategy_hash=?',
+    [strategyId, 'LIVE', strategyHash]);
   if (last[0].d) {
     const lastIdx = ctx.dateIdx.get(toDateStr(last[0].d));
     if (lastIdx !== undefined && i - lastIdx < REBAL_BARS) {
@@ -566,7 +610,7 @@ async function cmdPlan(pool, ctx, quiet) {
   // silently become part of the next decision's starting book.
   const [openRows] = await pool.query(
     'SELECT ticker FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=? AND strategy_hash=?',
-    [STRATEGY_ID, 'OPEN', 'LIVE', STRATEGY_HASH]);
+    [strategyId, 'OPEN', 'LIVE', strategyHash]);
 
   const d = sb.targetBook({
     series, i, ihsgClose, ihsgSma, currentHoldings: openRows.map(r => r.ticker), opts: PARAMS,
@@ -588,7 +632,7 @@ async function cmdPlan(pool, ctx, quiet) {
        (strategy_id, as_of_date, run_mode, generated_at, data_snapshot_hash, strategy_hash, code_commit,
         exposure, reason, regime_label, eligible, vetoed, target_json, reference_json, status)
      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PLANNED')`,
-    [STRATEGY_ID, asOf, 'LIVE', nowSql, snapshotHash(ctx), STRATEGY_HASH, CODE_COMMIT,
+    [strategyId, asOf, 'LIVE', nowSql, snapshotHash(ctx), strategyHash, CODE_COMMIT,
      d.exposure, d.reason, regimeLabel, d.eligible, d.vetoedCount, JSON.stringify(d.target), JSON.stringify(reference)]);
 
   if (!quiet) {
@@ -607,7 +651,9 @@ async function cmdPlan(pool, ctx, quiet) {
  * which is robust to holidays in a way a stored calendar date would not be. The
  * plan itself is never recomputed here; only its execution is recorded.
  */
-async function cmdFill(pool, ctx, quiet) {
+async function cmdFill(pool, ctx, quiet, ids) {
+  const strategyId = (ids && ids.strategyId) || STRATEGY_ID;
+  const strategyHash = (ids && ids.strategyHash) || STRATEGY_HASH;
   const { tradingDates, dateIdx, series } = ctx;
   const nowSql = new Date().toISOString().slice(0, 19).replace('T', ' ');
   const [plans] = await pool.query(
@@ -628,13 +674,13 @@ async function cmdFill(pool, ctx, quiet) {
     // is re-targeted at the next decision if it still ranks. PARTIALLY_FILLED
     // is a terminal record of what happened, not an instruction to try again.
     `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND status='PLANNED' ORDER BY as_of_date`,
-    [STRATEGY_ID, 'LIVE']);
+    [strategyId, 'LIVE']);
 
   // Run-level totals for the console line only. The PER-PLAN counters live
   // inside the loop: they used to be declared out here and written into every
   // plan's ft_strategy_log row, so with two pending plans the second row got
   // the first plan's activity added to its own (review P1.3).
-  let executed = 0, partial = 0, waiting = 0;
+  let executed = 0, partial = 0, waiting = 0, expiredNoHash = 0;
   let totOpened = 0, totClosed = 0, totMissed = 0;
   let shortfallSum = 0, shortfallN = 0;
 
@@ -649,7 +695,18 @@ async function cmdFill(pool, ctx, quiet) {
     const reference = JSON.parse(p.reference_json || '{}');
     const tset = new Set(target);
     const exposure = Number(p.exposure);
-    const planHash = p.strategy_hash || STRATEGY_HASH;   // the hash that DECIDED this
+    // NO FALLBACK to the running hash (review P0.6). A plan with no recorded
+    // hash carries no evidence that the current configuration produced it;
+    // adopting it would import an unknown strategy's decision into this track
+    // record. Expire it instead and say why.
+    if (!p.strategy_hash) {
+      await pool.query(
+        `UPDATE ft_strategy_plan SET status='EXPIRED', nofill_json=? WHERE id=?`,
+        [JSON.stringify({ expired: 'MISSING_strategyHash' }), p.id]);
+      expiredNoHash++;
+      continue;
+    }
+    const planHash = p.strategy_hash;                    // the hash that DECIDED this
 
     // One transaction per plan, so a crash cannot leave a plan half-executed
     // with its status already advanced (review P1.3). The work was already
@@ -668,10 +725,10 @@ async function cmdFill(pool, ctx, quiet) {
       // from it, so a closed position matters as much as an open one.
       const [ledgerRows] = await conn.query(
         'SELECT ticker, entry_date, exit_date, cost_basis, proceeds, units FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=?',
-        [STRATEGY_ID, 'LIVE', planHash]);
+        [strategyId, 'LIVE', planHash]);
       const [openRows] = await conn.query(
         'SELECT ticker, entry_price, entry_date, weight, units FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=? AND strategy_hash=?',
-        [STRATEGY_ID, 'OPEN', 'LIVE', planHash]);
+        [strategyId, 'OPEN', 'LIVE', planHash]);
 
       const stranded = [];      // wanted out, could not get out
       for (const row of openRows) {
@@ -688,7 +745,7 @@ async function cmdFill(pool, ctx, quiet) {
             WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=? AND strategy_hash=?`,
           [tradingDates[execI], px, exposure === 0 ? 'REGIME_FLAT' : 'REBALANCE',
            gross.toFixed(4), (gross - (BUY_COST + SELL_COST) * 100).toFixed(4), soldProceeds.toFixed(8), nowSql,
-           STRATEGY_ID, row.ticker, toDateStr(row.entry_date), 'LIVE', planHash]);
+           strategyId, row.ticker, toDateStr(row.entry_date), 'LIVE', planHash]);
         // P0.4: a narrowed UPDATE, like INSERT IGNORE, can match nothing.
         // Counting regardless let the log claim a position was closed when the
         // statement touched no row at all.
@@ -726,7 +783,7 @@ async function cmdFill(pool, ctx, quiet) {
               run_mode, decision_date, decision_created_at, data_available_at, execution_observed_at,
               strategy_hash, code_commit)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-          [STRATEGY_ID, t, tradingDates[execI], px, (nav > 0 ? spend / nav : 0).toFixed(5),
+          [strategyId, t, tradingDates[execI], px, (nav > 0 ? spend / nav : 0).toFixed(5),
            units.toFixed(10), spend.toFixed(8),
            'LIVE', asOf, p.generated_at, p.generated_at, nowSql, planHash, CODE_COMMIT]);
         if (ins.affectedRows === 1) {
@@ -741,7 +798,7 @@ async function cmdFill(pool, ctx, quiet) {
            (strategy_id, as_of_date, exposure, reason, regime_label, eligible, vetoed, n_target, opened, closed, target_json,
             run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [STRATEGY_ID, asOf, exposure, p.reason, p.regime_label, p.eligible, p.vetoed, target.length, opened, closed,
+        [strategyId, asOf, exposure, p.reason, p.regime_label, p.eligible, p.vetoed, target.length, opened, closed,
          p.target_json, 'LIVE', p.generated_at, p.generated_at, planHash, CODE_COMMIT]);
 
       // PARTIALLY_FILLED is a real state (review P1.2). Marking a plan EXECUTED
@@ -769,6 +826,7 @@ async function cmdFill(pool, ctx, quiet) {
   if (!quiet) {
     console.log(`FILL  ${executed} fully executed, ${partial} partially filled   opened ${totOpened}, closed ${totClosed}, no-fill ${totMissed}`);
     if (waiting) console.log(`      ${waiting} plan(s) still awaiting an execution bar — correct, not an error`);
+    if (expiredNoHash) console.log(`      ${expiredNoHash} plan(s) EXPIRED with no strategy_hash — provenance unknown, not adopted`);
     if (shortfallN) console.log(`      implementation shortfall ${(shortfallSum / shortfallN * 100).toFixed(3)}% mean (decision close -> execution open)`);
     if (!executed && !partial && !waiting) console.log('      nothing to do.');
   }
@@ -800,7 +858,9 @@ async function cmdFill(pool, ctx, quiet) {
  * compounding NAV needs a capital base and share counts, which is a different
  * recorder from this one.
  */
-async function cmdMark(pool, ctx, quiet) {
+async function cmdMark(pool, ctx, quiet, ids) {
+  const strategyId = (ids && ids.strategyId) || STRATEGY_ID;
+  const strategyHash = (ids && ids.strategyHash) || STRATEGY_HASH;
   const { tradingDates, series, ihsgClose, dateIdx } = ctx;
   const i = tradingDates.length - 1;
   const today = tradingDates[i];
@@ -808,10 +868,10 @@ async function cmdMark(pool, ctx, quiet) {
   const [ledger] = await pool.query(
     `SELECT ticker, entry_date, exit_date, units, cost_basis, proceeds, status
        FROM ft_strategy_positions WHERE strategy_id=? AND run_mode='LIVE' AND strategy_hash=?`,
-    [STRATEGY_ID, STRATEGY_HASH]);
+    [strategyId, strategyHash]);
   const [[firstRow]] = await pool.query(
     `SELECT MIN(as_of_date) d FROM ft_strategy_log WHERE strategy_id=? AND run_mode='LIVE' AND strategy_hash=?`,
-    [STRATEGY_ID, STRATEGY_HASH]);
+    [strategyId, strategyHash]);
 
   const open = ledger.filter(r => r.status === 'OPEN');
   const closed = ledger.filter(r => r.status === 'CLOSED');
@@ -845,7 +905,7 @@ async function cmdMark(pool, ctx, quiet) {
        unmarkable=VALUES(unmarkable), cash_value=VALUES(cash_value), market_value=VALUES(market_value),
        total_nav=VALUES(total_nav), realized_pnl=VALUES(realized_pnl), unrealized_pnl=VALUES(unrealized_pnl),
        gross_exposure=VALUES(gross_exposure), benchmark_nav=VALUES(benchmark_nav)`,
-    [STRATEGY_ID, today, 'LIVE', STRATEGY_HASH, open.length, (unrealized * 100).toFixed(4),
+    [strategyId, today, 'LIVE', strategyHash, open.length, (unrealized * 100).toFixed(4),
      unmarkable.join(',') || null, cash.toFixed(6), marketValue.toFixed(6), nav.toFixed(6),
      realized.toFixed(6), unrealized.toFixed(6), grossExposure.toFixed(6),
      benchNav === null ? null : benchNav.toFixed(6)]);
@@ -1098,18 +1158,20 @@ function periodReturns(ctx, logRows, positionRows = []) {
   return { port, bench, universe, regimes, navs, avgTurnover: port.length ? turnoverTotal / port.length : 0 };
 }
 
-async function reportFor(pool, ctx, runMode) {
+async function reportFor(pool, ctx, runMode, ids) {
+  const strategyId = (ids && ids.strategyId) || STRATEGY_ID;
+  const strategyHash = (ids && ids.strategyHash) || STRATEGY_HASH;
   // EVERY QUERY IS SCOPED TO THE CURRENT strategy_hash (review P0.4). The code
   // comments have always insisted records from different configurations must
   // not be pooled; nothing enforced it, because reportFor filtered on
   // strategy_id and run_mode only. Rows written under an older configuration
   // are not silently dropped — `otherHashes` below reports them, so an empty
   // record reads as "the configuration changed" rather than "nothing happened".
-  const HASH = [STRATEGY_ID, runMode, STRATEGY_HASH];
+  const HASH = [strategyId, runMode, strategyHash];
   const [logRows] = await pool.query(
     'SELECT as_of_date, exposure, reason, regime_label, target_json, opened, closed FROM ft_strategy_log WHERE strategy_id=? AND run_mode=? AND strategy_hash=? ORDER BY as_of_date', HASH);
   const [closedRows] = await pool.query(
-    "SELECT net_pct, exit_date FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=? AND status='CLOSED'", HASH);
+    "SELECT net_pct, cost_basis, proceeds, exit_date FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=? AND status='CLOSED'", HASH);
   const [openRows] = await pool.query(
     "SELECT ticker, entry_date, entry_price, weight FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=? AND status='OPEN' ORDER BY entry_date", HASH);
   const [[fillsRow]] = await pool.query(
@@ -1131,6 +1193,11 @@ async function reportFor(pool, ctx, runMode) {
        FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND (strategy_hash IS NULL OR strategy_hash <> ?)
       GROUP BY h ORDER BY n DESC`, HASH);
 
+  // A v2 record must not contain weight-era rows. If the ledger version were
+  // ever raised without the hash changing, units would read as 0 and every
+  // position would look free — cash intact, market value nil (review P0.3).
+  const unconverted = ledger.filter(r => r.units === null || r.cost_basis === null);
+
   const { port, bench, universe, regimes, avgTurnover } = periodReturns(ctx, logRows, ledger);
   const eq = fg.compound(port), beq = fg.compound(bench), ueq = fg.compound(universe);
   const portRet = eq.length ? eq[eq.length - 1] - 1 : null;
@@ -1148,7 +1215,15 @@ async function reportFor(pool, ctx, runMode) {
     calendarMonths: Math.round(months * 10) / 10,
     distinctRegimes: fg.distinctRegimes(regimes),
     fills: fillsRow.n,
-    profitFactor: fg.profitFactor(closedRows.map(r => r.net_pct)),
+    // From ACTUAL cash (review P1): (proceeds - cost_basis) / cost_basis. The
+    // stored net_pct is grossPct minus the two fee percentages, which is only an
+    // approximation — the buy fee reduces UNITS, so it does not subtract
+    // linearly from the return. Falls back to net_pct only for rows with no
+    // cost basis, which are pre-v2 and already flagged above.
+    profitFactor: fg.profitFactor(closedRows.map(r => (
+      Number(r.cost_basis) > 0
+        ? ((Number(r.proceeds || 0) - Number(r.cost_basis)) / Number(r.cost_basis)) * 100
+        : r.net_pct))),
     excessReturn: excessUniverse,          // PRIMARY: vs the set names were chosen from
     excessVsIndex: excess,                 // secondary, reported not gated
   };
@@ -1162,7 +1237,7 @@ async function reportFor(pool, ctx, runMode) {
   const navGap = (observedNav !== null && reconstructedNav !== null) ? observedNav - reconstructedNav : null;
 
   return {
-    runMode, logRows, openRows, closedRows, m, otherHashes,
+    runMode, logRows, openRows, closedRows, m, otherHashes, unconverted,
     navRow, observedNav, reconstructedNav, navGap,
     liveStart: dates[0] || null, liveEnd: dates[dates.length - 1] || null,
     portRet, benchRet, univRet, excess, excessUniverse,
@@ -1181,6 +1256,12 @@ function printReport(r, ctx) {
   console.log(`\n${line}`);
   console.log(`${STRATEGY_ID}   run_mode=${r.runMode}   strategy_hash=${STRATEGY_HASH}   commit=${CODE_COMMIT || 'unknown'}`);
   console.log(line);
+
+  if (r.unconverted && r.unconverted.length) {
+    console.log(`** ${r.unconverted.length} position(s) under this hash have no units/cost_basis.`);
+    console.log('   They predate the self-financing ledger and would read as costing nothing.');
+    console.log('   Every figure below is unreliable until they are removed or re-recorded.\n');
+  }
 
   if (r.otherHashes && r.otherHashes.length) {
     console.log('Records under a DIFFERENT configuration exist and are excluded (review P0.4):');
@@ -1324,7 +1405,7 @@ async function main() {
   await pool.end();
 }
 
-module.exports = { periodReturns, snapshotHash, cashAt, navAt, INITIAL_CAPITAL, cmdPlan, cmdFill, cmdMark, backfillRegimeLabels, STRATEGY_HASH, EFFECTIVE_CONFIG };
+module.exports = { setup, loadSeries, reportFor, periodReturns, snapshotHash, cashAt, navAt, INITIAL_CAPITAL, cmdPlan, cmdFill, cmdMark, backfillRegimeLabels, STRATEGY_HASH, EFFECTIVE_CONFIG };
 
 if (require.main === module) {
   main().catch(e => { console.error('FATAL', e); process.exit(1); });
