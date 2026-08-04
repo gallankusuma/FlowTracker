@@ -15,16 +15,34 @@ type FlowRow = {
 type SortKey = "ticker" | "lastVal" | "day4" | "day3" | "day2" | "day1" | "day0" | "dailyChange" | "price";
 type SortDir = "asc" | "desc";
 
-// Parse lastVal strings like "1.7T", "807.9B", "23.4M" -> number (in billions)
+/**
+ * Parse a formatted turnover string into billions of rupiah.
+ *
+ * The server's formatVal() emits T, B, M, K, or a bare number for anything
+ * under a thousand. This handled T, B and M, so "929.2K" fell through to
+ * `return n` and was read as 929.2 BILLION — a million times too large — which
+ * put the smallest rows at the top of a descending sort. A bare number had the
+ * same shape of bug, off by a factor of a billion.
+ *
+ * The multipliers are now keyed off the suffix explicitly, and a value with no
+ * recognised suffix is treated as raw rupiah rather than silently inheriting
+ * the units of whatever the last branch happened to return.
+ */
+const VAL_UNITS: Record<string, number> = {
+  T: 1e3,     // trillions -> billions
+  B: 1,
+  M: 1e-3,
+  K: 1e-6,
+};
+
 function parseLastVal(s: string): number {
   if (!s) return 0;
   const n = parseFloat(s);
   if (isNaN(n)) return 0;
-  const u = s.slice(-1).toUpperCase();
-  if (u === "T") return n * 1000;
-  if (u === "B") return n;
-  if (u === "M") return n / 1000;
-  return n;
+  const suffix = s.trim().slice(-1).toUpperCase();
+  const mult = VAL_UNITS[suffix];
+  // No suffix means formatVal printed the raw figure, which is in rupiah.
+  return mult === undefined ? n / 1e9 : n * mult;
 }
 
 function pctColor(val: number) {
