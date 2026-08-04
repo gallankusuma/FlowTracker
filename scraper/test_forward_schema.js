@@ -85,6 +85,32 @@ async function cleanup(pool) {
 
   await cleanup(pool);
   try {
+    // FRESH DDL, ACTUALLY EXERCISED (review, test notes). Checking the existing
+    // tables cannot catch a CREATE TABLE that an empty database would reject —
+    // which is exactly the defect that shipped: a unique key naming columns the
+    // DDL never declared. The user account cannot CREATE DATABASE, so each
+    // CREATE TABLE from setup() is replayed here under a scratch name, which
+    // puts the same statement through the same parser.
+    console.log('\nforward schema — the CREATE TABLE statements on an empty namespace');
+    const src = require('fs').readFileSync(require('path').join(__dirname, 'strategy_forward.js'), 'utf8');
+    const blocks = [...src.matchAll(/CREATE TABLE IF NOT EXISTS (ft_strategy_\w+) \(([\s\S]*?)\n {4}\)/g)];
+    t('every forward table has a CREATE statement to check', () => {
+      assert.strictEqual(blocks.length, 4, `found ${blocks.length}`);
+    });
+    const scratch = [];
+    for (const [, name, body] of blocks) {
+      const tmp = `${name}_freshcheck`;
+      let err = null;
+      try {
+        await pool.query(`DROP TABLE IF EXISTS ${tmp}`);
+        await pool.query(`CREATE TABLE ${tmp} (${body}
+    )`);
+        scratch.push(tmp);
+      } catch (e) { err = e; }
+      t(`${name} builds from nothing`, () => assert.ok(!err, err && err.message));
+    }
+    for (const tmp of scratch) await pool.query(`DROP TABLE ${tmp}`);
+
     console.log('\nforward lifecycle — strategy_hash isolation');
 
     // Two configurations, same ticker, same date. Before strategy_hash entered

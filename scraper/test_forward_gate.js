@@ -152,6 +152,19 @@ t('surfaces excluded replay decisions instead of hiding them', () => {
   assert.strictEqual(r.replayDecisionsExcluded, 19);
 });
 
+t('an invalid ledger blocks the gate outright, it does not merely warn', () => {
+  // Rows without units/cost_basis read as costing nothing, so cash and NAV are
+  // wrong and every metric built on them is meaningless (review P1.3).
+  const r = fg.evaluateForwardGate({ ...PASSING, ledgerValid: false });
+  assert.strictEqual(r.status, 'NOT_ELIGIBLE');
+  assert.ok(r.failed.some(f => /units and a cost basis/.test(f)), JSON.stringify(r.failed));
+});
+
+t('a valid ledger does not add a criterion', () => {
+  assert.strictEqual(fg.evaluateForwardGate({ ...PASSING, ledgerValid: true }).status, 'ELIGIBLE_FOR_REVIEW');
+  assert.strictEqual(fg.evaluateForwardGate(PASSING).status, 'ELIGIBLE_FOR_REVIEW');
+});
+
 t('eligibility is explicitly not an instruction to deploy capital', () => {
   assert.ok(/not an instruction to deploy capital/i.test(fg.evaluateForwardGate(PASSING).note));
 });

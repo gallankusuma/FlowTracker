@@ -161,10 +161,11 @@ function truncated(ctx, n) {
         assert.ok(spent <= sf.INITIAL_CAPITAL + 1e-9, `deployed ${spent} of ${sf.INITIAL_CAPITAL}`);
       });
     } else {
-      t('a flat plan fills nothing and is EXECUTED', () => {
-        assert.strictEqual(after.status, 'EXECUTED');
-        assert.strictEqual(positions.length, 0);
-        assert.strictEqual(filled.opened, 0);
+      // A flat plan means the fixture failed to produce a book, so the partial
+      // fill path — the whole point of this test — never ran. Passing here would
+      // be a green run that tested nothing (review, test notes).
+      t('THE FIXTURE FAILED: the chosen bar produced an empty target', () => {
+        assert.fail(`planned ${planDate} with an empty book; the partial-fill path was not exercised`);
       });
     }
 

@@ -121,6 +121,9 @@ function distinctRegimes(regimes) {
  * @param {number} m.fills
  * @param {number|null} m.profitFactor
  * @param {number|null} m.excessReturn - portfolio minus benchmark, fractional
+ * @param {boolean} [m.ledgerValid] - false blocks the gate outright: a ledger
+ *   with rows lacking units/cost_basis produces a cash and NAV that are simply
+ *   wrong, so there is nothing worth evaluating.
  * @param {number} [m.replayDecisions] - reported for transparency; never counted
  * @param {Object} [gate]
  */
@@ -148,6 +151,16 @@ function evaluateForwardGate(m, gate = GATE) {
     { name: 'excess over the eligible universe, net of costs', actual: m.excessReturn, required: gate.minExcessReturn,
       pass: m.excessReturn !== null && m.excessReturn !== undefined && m.excessReturn > gate.minExcessReturn },
   ];
+  // An invalid ledger is not a warning (review P1.3). Rows without units or a
+  // cost basis read as costing nothing, so cash and NAV — and therefore every
+  // number above — are wrong. Reporting them and then evaluating the gate anyway
+  // is the same mistake as printing a requirement nobody computes.
+  if (m.ledgerValid === false) {
+    criteria.unshift({
+      name: 'ledger rows all carry units and a cost basis', actual: 'no', required: 'yes', pass: false,
+    });
+  }
+
   const failed = criteria.filter(c => !c.pass);
   return {
     status: failed.length === 0 ? 'ELIGIBLE_FOR_REVIEW' : 'NOT_ELIGIBLE',

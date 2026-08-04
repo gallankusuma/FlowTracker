@@ -108,6 +108,12 @@ function codeCommit() {
 }
 const CODE_COMMIT = codeCommit();
 
+/**
+ * One id per invocation, stamped on everything this process writes. Provenance
+ * you can look up beats provenance you have to guess at from a clock.
+ */
+const RUN_ID = crypto.randomUUID();
+
 const toDateStr = d => d instanceof Date
   ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
   : String(d).split('T')[0];
@@ -163,6 +169,11 @@ async function setup(pool) {
       -- exist for schemas that predate them; a fresh schema must stand alone.
       run_mode ENUM('LIVE','REPLAY','BACKFILL') NOT NULL DEFAULT 'LIVE',
       strategy_hash VARCHAR(32) NULL,
+      -- Explicit provenance, so nothing has to be INFERRED from timestamps
+      -- (review P0.1). Every row records the command that wrote it and the id
+      -- of that invocation.
+      source_command VARCHAR(16) NULL,
+      run_id VARCHAR(36) NULL,
       decision_date DATE NULL,
       decision_created_at DATETIME NULL,
       data_available_at DATETIME NULL,
@@ -189,6 +200,8 @@ async function setup(pool) {
       -- Same reason as ft_strategy_positions above (review P0.1).
       run_mode ENUM('LIVE','REPLAY','BACKFILL') NOT NULL DEFAULT 'LIVE',
       strategy_hash VARCHAR(32) NULL,
+      source_command VARCHAR(16) NULL,
+      run_id VARCHAR(36) NULL,
       decision_created_at DATETIME NULL,
       data_available_at DATETIME NULL,
       code_commit VARCHAR(40) NULL,
@@ -248,6 +261,12 @@ async function setup(pool) {
   // run_mode and strategy_hash, which migrateProvenance is what ADDS on an old
   // schema. Running the index migration first made an upgrade from the oldest
   // schema fail on a column that did not exist yet. Columns first, indexes last.
+  // migrateProvenanceColumns FIRST: migrateProvenance ends by calling
+  // reclassifyBatchWrites, which now filters on source_command, so that column
+  // has to exist before it runs. Same class of mistake as the previous review's
+  // P0.2 — a migration querying a column a later migration adds. Columns first,
+  // then anything that reads them, then indexes.
+  await migrateProvenanceColumns(pool);
   await migrateProvenance(pool);
   await migrateLedgerUnits(pool);
   await migrateNavTable(pool);
@@ -283,6 +302,18 @@ async function migrateUniqueKeys(pool) {
   await check('ft_strategy_log', 'uq_day', 'strategy_id, run_mode, strategy_hash, as_of_date');
   await check('ft_strategy_plan', 'uq_plan', 'strategy_id, run_mode, strategy_hash, as_of_date');
   await check('ft_strategy_nav', 'uq_mark', 'strategy_id, run_mode, strategy_hash, mark_date');
+}
+
+async function migrateProvenanceColumns(pool) {
+  for (const t of ['ft_strategy_positions', 'ft_strategy_log']) {
+    const add = [];
+    if (!(await hasColumn(pool, t, 'source_command'))) add.push('ADD COLUMN source_command VARCHAR(16) NULL');
+    if (!(await hasColumn(pool, t, 'run_id'))) add.push('ADD COLUMN run_id VARCHAR(36) NULL');
+    if (add.length) {
+      await pool.query(`ALTER TABLE ${t} ${add.join(', ')}`);
+      console.log(`MIGRATION: ${t} gained source_command / run_id — provenance is recorded, not inferred (review P0.1)`);
+    }
+  }
 }
 
 async function migrateRegimeLabel(pool) {
@@ -418,26 +449,43 @@ async function migrateProvenance(pool) {
  * rows.
  */
 async function reclassifyBatchWrites(pool) {
+  // ONLY rows that predate source_command, and only within one strategy_hash.
+  //
+  // This used to treat "two log rows share a created_at second" as proof of a
+  // replay batch, on the reasoning that a live invocation writes exactly one log
+  // row. That stopped being true when cmdFill was changed to drain every pending
+  // plan in one run (review P0.1): a cron outage leaves two plans, one fill
+  // executes both, both log rows land in the same second, and the next startup
+  // would relabel genuine LIVE decisions as REPLAY and delete them from the
+  // promotion gate. I introduced that interaction while fixing something else.
+  //
+  // The position half was worse: it matched on strategy_id and decision date
+  // only, so a REPLAY log under hash A could flip a LIVE position under hash B.
+  //
+  // Rows written from now on carry source_command, so they are never touched
+  // here. Once the historical rows are labelled this whole function is a no-op,
+  // which is the intended end state — a timestamp is not evidence.
   const [batched] = await pool.query(
-    `UPDATE ft_strategy_log SET run_mode='REPLAY'
-      WHERE run_mode='LIVE' AND created_at IN (
-        SELECT c FROM (
-          SELECT created_at c FROM ft_strategy_log
-           GROUP BY strategy_id, created_at HAVING COUNT(*) > 1
+    `UPDATE ft_strategy_log SET run_mode='REPLAY', source_command='REPLAY_INFERRED'
+      WHERE run_mode='LIVE' AND source_command IS NULL AND (strategy_id, strategy_hash, created_at) IN (
+        SELECT * FROM (
+          SELECT strategy_id, strategy_hash, created_at FROM ft_strategy_log
+           WHERE source_command IS NULL
+           GROUP BY strategy_id, strategy_hash, created_at HAVING COUNT(*) > 1
         ) batch)`);
 
-  // A position belongs to the decision whose execution bar it was filled on.
-  // If that decision is REPLAY, so is the position.
   const [orphans] = await pool.query(
-    `UPDATE ft_strategy_positions p SET p.run_mode='REPLAY'
-      WHERE p.run_mode='LIVE' AND EXISTS (
+    `UPDATE ft_strategy_positions p SET p.run_mode='REPLAY', p.source_command='REPLAY_INFERRED'
+      WHERE p.run_mode='LIVE' AND p.source_command IS NULL AND EXISTS (
         SELECT 1 FROM ft_strategy_log l
          WHERE l.strategy_id = p.strategy_id AND l.run_mode='REPLAY'
+           AND (l.strategy_hash <=> p.strategy_hash)
            AND (l.as_of_date = p.decision_date
                 OR (p.decision_date IS NULL AND p.entry_date BETWEEN l.as_of_date AND l.as_of_date + INTERVAL 5 DAY)))`);
 
   if (batched.affectedRows || orphans.affectedRows) {
-    console.log(`PROVENANCE REPAIR: ${batched.affectedRows} log row(s) and ${orphans.affectedRows} position(s) were batch-written by a replay loop and are now marked REPLAY.`);
+    console.log(`PROVENANCE REPAIR: ${batched.affectedRows} log row(s) and ${orphans.affectedRows} position(s) predating source_command were inferred to be REPLAY.`);
+    console.log('  Inference is used only for rows written before provenance was recorded, and only within one strategy_hash.');
   }
 }
 
@@ -676,6 +724,22 @@ async function cmdFill(pool, ctx, quiet, ids) {
     `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode=? AND status='PLANNED' ORDER BY as_of_date`,
     [strategyId, 'LIVE']);
 
+  // EXPIRE ANY PLAN FROM ANOTHER CONFIGURATION (review P0.2). Recording a stale
+  // plan's fills under its own hash was half the fix: the EXECUTION still used
+  // the running code's costs, sizing and ledger version. So hash A's record
+  // would contain trades executed by implementation B, and A would no longer
+  // describe what actually happened. Keeping old implementations around to
+  // replay them faithfully is the alternative, and it is not worth it here.
+  const stale = plans.filter(p => p.strategy_hash && p.strategy_hash !== strategyHash);
+  for (const p of stale) {
+    await pool.query(
+      `UPDATE ft_strategy_plan SET status='EXPIRED', nofill_json=? WHERE id=?`,
+      [JSON.stringify({ expired: 'EXPIRED_CONFIG_CHANGE', planHash: p.strategy_hash, runningHash: strategyHash }), p.id]);
+  }
+  if (stale.length && !quiet) {
+    console.log(`FILL  ${stale.length} plan(s) EXPIRED — decided by a different configuration, and this code cannot execute them faithfully`);
+  }
+
   // Run-level totals for the console line only. The PER-PLAN counters live
   // inside the loop: they used to be declared out here and written into every
   // plan's ft_strategy_log row, so with two pending plans the second row got
@@ -685,6 +749,7 @@ async function cmdFill(pool, ctx, quiet, ids) {
   let shortfallSum = 0, shortfallN = 0;
 
   for (const p of plans) {
+    if (p.strategy_hash && p.strategy_hash !== strategyHash) continue;   // expired above
     const asOf = toDateStr(p.as_of_date);
     const i = dateIdx.get(asOf);
     if (i === undefined) continue;
@@ -781,11 +846,11 @@ async function cmdFill(pool, ctx, quiet, ids) {
           `INSERT IGNORE INTO ft_strategy_positions
              (strategy_id, ticker, entry_date, entry_price, weight, units, cost_basis,
               run_mode, decision_date, decision_created_at, data_available_at, execution_observed_at,
-              strategy_hash, code_commit)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+              strategy_hash, code_commit, source_command, run_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'LIVE_FILL',?)`,
           [strategyId, t, tradingDates[execI], px, (nav > 0 ? spend / nav : 0).toFixed(5),
            units.toFixed(10), spend.toFixed(8),
-           'LIVE', asOf, p.generated_at, p.generated_at, nowSql, planHash, CODE_COMMIT]);
+           'LIVE', asOf, p.generated_at, p.generated_at, nowSql, planHash, CODE_COMMIT, RUN_ID]);
         if (ins.affectedRows === 1) {
           opened++;
           cash -= spend;
@@ -796,10 +861,10 @@ async function cmdFill(pool, ctx, quiet, ids) {
       await conn.query(
         `INSERT IGNORE INTO ft_strategy_log
            (strategy_id, as_of_date, exposure, reason, regime_label, eligible, vetoed, n_target, opened, closed, target_json,
-            run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            run_mode, decision_created_at, data_available_at, strategy_hash, code_commit, source_command, run_id)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'LIVE_FILL',?)`,
         [strategyId, asOf, exposure, p.reason, p.regime_label, p.eligible, p.vetoed, target.length, opened, closed,
-         p.target_json, 'LIVE', p.generated_at, p.generated_at, planHash, CODE_COMMIT]);
+         p.target_json, 'LIVE', p.generated_at, p.generated_at, planHash, CODE_COMMIT, RUN_ID]);
 
       // PARTIALLY_FILLED is a real state (review P1.2). Marking a plan EXECUTED
       // when part of it did not fill throws away the only record that intent and
@@ -994,11 +1059,11 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
     const [ins] = await pool.query(
       `INSERT IGNORE INTO ft_strategy_positions
          (strategy_id, ticker, entry_date, entry_price, weight, units, cost_basis,
-          run_mode, decision_date, decision_created_at, data_available_at, strategy_hash, code_commit)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          run_mode, decision_date, decision_created_at, data_available_at, strategy_hash, code_commit, source_command, run_id)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'REPLAY',?)`,
       [STRATEGY_ID, t, tradingDates[execI], px, (nav > 0 ? spend / nav : 0).toFixed(5),
        units.toFixed(10), spend.toFixed(8),
-       runMode, asOf, nowSql, nowSql, STRATEGY_HASH, CODE_COMMIT]);
+       runMode, asOf, nowSql, nowSql, STRATEGY_HASH, CODE_COMMIT, RUN_ID]);
     if (ins.affectedRows === 1) {
       opened++;
       cash -= spend;
@@ -1009,10 +1074,10 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
   await pool.query(
     `INSERT IGNORE INTO ft_strategy_log
        (strategy_id, as_of_date, exposure, reason, regime_label, eligible, vetoed, n_target, opened, closed, target_json,
-        run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        run_mode, decision_created_at, data_available_at, strategy_hash, code_commit, source_command, run_id)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'REPLAY',?)`,
     [STRATEGY_ID, asOf, d.exposure, d.reason, sb.marketRegime(ihsgClose, ihsgSma, i), d.eligible, d.vetoedCount,
-     d.target.length, opened, closed, JSON.stringify(d.target), runMode, nowSql, nowSql, STRATEGY_HASH, CODE_COMMIT]);
+     d.target.length, opened, closed, JSON.stringify(d.target), runMode, nowSql, nowSql, STRATEGY_HASH, CODE_COMMIT, RUN_ID]);
 
   if (!quiet) {
     console.log(`${asOf}  [${runMode}]  ${d.reason}`);
@@ -1107,6 +1172,25 @@ function periodReturns(ctx, logRows, positionRows = []) {
   const { dateIdx, tradingDates, series, ihsgClose } = ctx;
   const port = [], bench = [], universe = [], regimes = [], navs = [];
   let turnoverTotal = 0;
+
+  // THE DEPLOYMENT LEG (review P1.1). The first period ran from the NAV AFTER
+  // the opening trades to the next execution, so the cost of putting the book on
+  // sat in the denominator and never appeared in the reported return: a book
+  // opened at 0.998 with no price movement read as 0.00% instead of -0.20%.
+  // Charged here as its own period, with the benchmark flat over it, so the
+  // strategy pays for entering and the comparison stays fair.
+  if (logRows.length) {
+    const i0 = dateIdx.get(toDateStr(logRows[0].as_of_date));
+    if (i0 !== undefined && i0 + 1 < tradingDates.length) {
+      const exec0 = i0 + 1;
+      const nav0 = navAt(positionRows, series, exec0, tradingDates[exec0]);
+      port.push(nav0 / INITIAL_CAPITAL - 1);
+      bench.push(0);
+      universe.push(0);
+      regimes.push(logRows[0].regime_label || null);
+      navs.push(nav0);
+    }
+  }
 
   for (let k = 0; k < logRows.length - 1; k++) {
     const a = logRows[k], b = logRows[k + 1];
@@ -1220,6 +1304,7 @@ async function reportFor(pool, ctx, runMode, ids) {
     // approximation — the buy fee reduces UNITS, so it does not subtract
     // linearly from the return. Falls back to net_pct only for rows with no
     // cost basis, which are pre-v2 and already flagged above.
+    ledgerValid: unconverted.length === 0,
     profitFactor: fg.profitFactor(closedRows.map(r => (
       Number(r.cost_basis) > 0
         ? ((Number(r.proceeds || 0) - Number(r.cost_basis)) / Number(r.cost_basis)) * 100
@@ -1232,8 +1317,17 @@ async function reportFor(pool, ctx, runMode, ids) {
   // comparable. They are NOT expected to match exactly — the report compounds
   // period returns while the mark is additive over entry weights — but a large
   // gap means something is wrong with one of them.
+  // Compared at the SAME bar (review P1.2). The observed mark is whatever date
+  // `mark` last ran on, while the reconstruction ends at the last execution bar
+  // that had a following period. If the market moved between the two, the gap
+  // reported a disagreement that was only a difference of dates. The
+  // reconstruction is now extended to the mark's own date before comparing, and
+  // both dates are printed.
   const observedNav = navRow && navRow.total_nav !== null ? Number(navRow.total_nav) : null;
-  const reconstructedNav = portRet === null ? null : 1 + portRet;
+  const navDate = navRow ? toDateStr(navRow.mark_date) : null;
+  const reconstructedNav = navDate && ctx.dateIdx.has(navDate)
+    ? navAt(ledger, ctx.series, ctx.dateIdx.get(navDate), navDate)
+    : (portRet === null ? null : 1 + portRet);
   const navGap = (observedNav !== null && reconstructedNav !== null) ? observedNav - reconstructedNav : null;
 
   return {
@@ -1297,8 +1391,9 @@ function printReport(r, ctx) {
   console.log(`Profit factor           ${num(r.m.profitFactor)}   (gross profit / gross loss, net %)`);
   if (r.navRow) {
     console.log('');
-    console.log(`Observed NAV            ${num(r.observedNav, 4)}   marked ${toDateStr(r.navRow.mark_date)} — cash ${num(r.navRow.cash_value, 4)} + market ${num(r.navRow.market_value, 4)}`);
-    console.log(`Reconstructed NAV       ${num(r.reconstructedNav, 4)}   from compounded period returns`);
+    const on = toDateStr(r.navRow.mark_date);
+    console.log(`Observed NAV            ${num(r.observedNav, 4)}   marked ${on} — cash ${num(r.navRow.cash_value, 4)} + market ${num(r.navRow.market_value, 4)}`);
+    console.log(`Reconstructed NAV       ${num(r.reconstructedNav, 4)}   rebuilt from the ledger on the SAME date, ${on}`);
     if (r.navGap !== null && Math.abs(r.navGap) > 0.02) {
       console.log(`  ** the two disagree by ${(r.navGap * 100).toFixed(2)} pp — the ledger and the marks are telling different stories`);
     }
