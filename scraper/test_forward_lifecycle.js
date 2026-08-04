@@ -169,6 +169,37 @@ function truncated(ctx, n) {
       });
     }
 
+    console.log('\nforward lifecycle — a plan from another configuration is refused');
+    {
+      // Both halves of P0.2: a different strategy_hash, and a same-hash plan
+      // whose EXECUTION CONTRACT differs. Neither may be executed by this code.
+      const mkPlan = async (hash, date, buy) => {
+        await pool.query(
+          `INSERT IGNORE INTO ft_strategy_plan
+             (strategy_id, as_of_date, run_mode, generated_at, strategy_hash, exposure, reason,
+              eligible, vetoed, target_json, reference_json, buy_cost, sell_cost, execution_ledger_version, status)
+           VALUES (?,?,'LIVE',NOW(),?,1,'INVESTED',50,10,'[]','{}',?,0.003,2,'PLANNED')`,
+          [IDS.strategyId, date, hash, buy]);
+        const [[row]] = await pool.query(
+          'SELECT id FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=? AND strategy_hash=?',
+          [IDS.strategyId, date, hash]);
+        return row && row.id;
+      };
+      const otherHashId = await mkPlan('someotherhash000', ctx.tradingDates[planI - 20], 0.002);
+      const otherContractId = await mkPlan(IDS.strategyHash, ctx.tradingDates[planI - 30], 0.009);
+      await sf.cmdFill(pool, ctx, true, IDS);
+      const [[a]] = await pool.query('SELECT status, nofill_json FROM ft_strategy_plan WHERE id=?', [otherHashId]);
+      const [[b]] = await pool.query('SELECT status, nofill_json FROM ft_strategy_plan WHERE id=?', [otherContractId]);
+      t('a plan from a different strategy_hash is EXPIRED, not executed', () => {
+        assert.strictEqual(a.status, 'EXPIRED', `status ${a.status}`);
+        assert.ok(/EXPIRED_CONFIG_CHANGE/.test(a.nofill_json || ''), a.nofill_json);
+      });
+      t('a same-hash plan with a different execution contract is EXPIRED too', () => {
+        assert.strictEqual(b.status, 'EXPIRED', `status ${b.status}`);
+        assert.ok(/EXPIRED_EXECUTION_CONTRACT/.test(b.nofill_json || ''), b.nofill_json);
+      });
+    }
+
     console.log('\nforward lifecycle — cmdMark');
     const marked = await sf.cmdMark(pool, ctx, true, IDS);
     const [[navRow]] = await pool.query(

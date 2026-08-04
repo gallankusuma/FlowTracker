@@ -481,23 +481,31 @@ async function reclassifyBatchWrites(pool) {
   // Rows written from now on carry source_command, so they are never touched
   // here. Once the historical rows are labelled this whole function is a no-op,
   // which is the intended end state — a timestamp is not evidence.
-  const [batched] = await pool.query(
+  // INFERENCE RETIRED (review P1.2). Deciding LIVE or REPLAY from a timestamp
+  // was always a guess, and the reviewer is right that an unprovable row is
+  // safer labelled unknown than assigned. The one-time historical repair has
+  // already run on this database; from here every pre-provenance row is simply
+  // sealed as UNKNOWN_LEGACY below and left in whatever run_mode it had. It
+  // cannot reach the gate regardless: reportFor is scoped to the current
+  // strategy_hash, and no legacy row carries it.
+  const INFER = process.env.FT_INFER_LEGACY_PROVENANCE === '1';
+  const [batched] = INFER ? await pool.query(
     `UPDATE ft_strategy_log SET run_mode='REPLAY', source_command='REPLAY_INFERRED'
       WHERE run_mode='LIVE' AND source_command IS NULL AND (strategy_id, strategy_hash, created_at) IN (
         SELECT * FROM (
           SELECT strategy_id, strategy_hash, created_at FROM ft_strategy_log
            WHERE source_command IS NULL
            GROUP BY strategy_id, strategy_hash, created_at HAVING COUNT(*) > 1
-        ) batch)`);
+        ) batch)`) : [{ affectedRows: 0 }];
 
-  const [orphans] = await pool.query(
+  const [orphans] = INFER ? await pool.query(
     `UPDATE ft_strategy_positions p SET p.run_mode='REPLAY', p.source_command='REPLAY_INFERRED'
       WHERE p.run_mode='LIVE' AND p.source_command IS NULL AND EXISTS (
         SELECT 1 FROM ft_strategy_log l
          WHERE l.strategy_id = p.strategy_id AND l.run_mode='REPLAY'
            AND (l.strategy_hash <=> p.strategy_hash)
            AND (l.as_of_date = p.decision_date
-                OR (p.decision_date IS NULL AND p.entry_date BETWEEN l.as_of_date AND l.as_of_date + INTERVAL 5 DAY)))`);
+                OR (p.decision_date IS NULL AND p.entry_date BETWEEN l.as_of_date AND l.as_of_date + INTERVAL 5 DAY)))`) : [{ affectedRows: 0 }];
 
   if (batched.affectedRows || orphans.affectedRows) {
     console.log(`PROVENANCE REPAIR: ${batched.affectedRows} log row(s) and ${orphans.affectedRows} position(s) predating source_command were inferred to be REPLAY.`);
@@ -521,11 +529,11 @@ async function reclassifyBatchWrites(pool) {
   let sealed = 0;
   for (const t of ['ft_strategy_log', 'ft_strategy_positions']) {
     const [r] = await pool.query(
-      `UPDATE ${t} SET source_command = CONCAT('LEGACY_', run_mode) WHERE source_command IS NULL`);
+      `UPDATE ${t} SET source_command = 'UNKNOWN_LEGACY' WHERE source_command IS NULL`);
     sealed += r.affectedRows;
   }
   if (sealed) {
-    console.log(`PROVENANCE SEALED: ${sealed} pre-provenance row(s) stamped LEGACY_<run_mode>.`);
+    console.log(`PROVENANCE SEALED: ${sealed} pre-provenance row(s) stamped UNKNOWN_LEGACY.`);
     console.log('  The timestamp heuristic can never re-examine them; it is a no-op from here.');
   }
 }
@@ -1066,8 +1074,11 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
   if (dup.length) return { skipped: 'already recorded' };
 
   const [openRows] = await pool.query(
-    'SELECT ticker, entry_price, entry_date, weight, units FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=?',
-    [STRATEGY_ID, 'OPEN', runMode]);
+    // Hash-scoped like every other read (review P1.3). Two replay
+    // configurations would otherwise share holdings and close events, which
+    // cannot reach the LIVE gate but makes the diagnostic wrong.
+    'SELECT ticker, entry_price, entry_date, weight, units FROM ft_strategy_positions WHERE strategy_id=? AND status=? AND run_mode=? AND strategy_hash=?',
+    [STRATEGY_ID, 'OPEN', runMode, STRATEGY_HASH]);
   const [ledgerRows] = await pool.query(
     'SELECT ticker, entry_date, exit_date, units, cost_basis, proceeds FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=?',
     [STRATEGY_ID, runMode, STRATEGY_HASH]);
@@ -1093,10 +1104,10 @@ async function decideFor(pool, ctx, i, quiet, runMode) {
     await pool.query(
       `UPDATE ft_strategy_positions SET status='CLOSED', exit_date=?, exit_price=?, exit_reason=?, gross_pct=?, net_pct=?,
               proceeds=?, execution_observed_at=?
-        WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=?`,
+        WHERE strategy_id=? AND ticker=? AND entry_date=? AND status='OPEN' AND run_mode=? AND strategy_hash=?`,
       [tradingDates[execI], px, d.exposure === 0 ? 'REGIME_FLAT' : 'REBALANCE',
        gross.toFixed(4), net.toFixed(4), soldProceeds.toFixed(8), nowSql,
-       STRATEGY_ID, row.ticker, toDateStr(row.entry_date), runMode]);
+       STRATEGY_ID, row.ticker, toDateStr(row.entry_date), runMode, STRATEGY_HASH]);
     closed++;
     const led = ledgerRows.find(l => l.ticker === row.ticker && toDateStr(l.entry_date) === toDateStr(row.entry_date));
     if (led) { led.exit_date = tradingDates[execI]; led.proceeds = soldProceeds; }
@@ -1227,7 +1238,11 @@ function barPrice(s, j) {
  *
  * @param {Array} positionRows - every LIVE position row, any status
  */
-function periodReturns(ctx, logRows, positionRows = []) {
+/**
+ * @param {string} [terminalDate] - the latest NAV mark. Everything after the
+ *   last completed rebalance pair is otherwise invisible to the report.
+ */
+function periodReturns(ctx, logRows, positionRows = [], terminalDate = null) {
   const { dateIdx, tradingDates, series, ihsgClose } = ctx;
   const port = [], bench = [], universe = [], regimes = [], navs = [];
   let turnoverTotal = 0;
@@ -1298,6 +1313,39 @@ function periodReturns(ctx, logRows, positionRows = []) {
     // INSUFFICIENT_UNIVERSE -- a data outage -- count as a market regime.
     regimes.push(a.regime_label || null);
   }
+  // THE OPEN PERIOD (review P0.2). The loop above pairs decisions, so everything
+  // between the last rebalance and today was excluded from total return, excess,
+  // information ratio, drawdown and therefore the gate. The asymmetry is the
+  // dangerous kind: a 10% fall after the last rebalance stayed invisible until
+  // the next one, while cmdMark had been recording it daily all along.
+  if (terminalDate && logRows.length) {
+    const lastLog = logRows[logRows.length - 1];
+    const iLast = dateIdx.get(toDateStr(lastLog.as_of_date));
+    const iTerm = dateIdx.get(terminalDate);
+    if (iLast !== undefined && iTerm !== undefined) {
+      const execLast = iLast + 1;
+      if (execLast < tradingDates.length && iTerm > execLast) {
+        const dLast = tradingDates[execLast];
+        const nav0 = navAt(positionRows, series, execLast, dLast);
+        const nav1 = navAt(positionRows, series, iTerm, terminalDate);
+        if (nav0 > 0) {
+          port.push(nav1 / nav0 - 1);
+          navs.push(nav1);
+          bench.push(ihsgClose[iTerm] / ihsgClose[execLast] - 1);
+          const elig = sb.crossSection(series, iLast, PARAMS);
+          const rets = [];
+          for (const r of elig) {
+            const s2 = series.get(r.ticker);
+            const q0 = barPrice(s2, execLast), q1 = barPrice(s2, iTerm);
+            if (q0 > 0 && q1 > 0) rets.push(q1 / q0 - 1);
+          }
+          universe.push(rets.length ? rets.reduce((x, y) => x + y, 0) / rets.length : 0);
+          regimes.push(lastLog.regime_label || null);
+        }
+      }
+    }
+  }
+
   return { port, bench, universe, regimes, navs, avgTurnover: port.length ? turnoverTotal / port.length : 0 };
 }
 
@@ -1336,12 +1384,14 @@ async function reportFor(pool, ctx, runMode, ids) {
        FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND (strategy_hash IS NULL OR strategy_hash <> ?)
       GROUP BY h ORDER BY n DESC`, HASH);
 
+  // (navRow is read above so the open period can be measured to the mark.)
   // A v2 record must not contain weight-era rows. If the ledger version were
   // ever raised without the hash changing, units would read as 0 and every
   // position would look free — cash intact, market value nil (review P0.3).
   const unconverted = ledger.filter(r => r.units === null || r.cost_basis === null);
 
-  const { port, bench, universe, regimes, avgTurnover } = periodReturns(ctx, logRows, ledger);
+  const { port, bench, universe, regimes, avgTurnover } =
+    periodReturns(ctx, logRows, ledger, navRow ? toDateStr(navRow.mark_date) : null);
   const eq = fg.compound(port), beq = fg.compound(bench), ueq = fg.compound(universe);
   const portRet = eq.length ? eq[eq.length - 1] - 1 : null;
   const benchRet = beq.length ? beq[beq.length - 1] - 1 : null;
@@ -1358,16 +1408,23 @@ async function reportFor(pool, ctx, runMode, ids) {
     calendarMonths: Math.round(months * 10) / 10,
     distinctRegimes: fg.distinctRegimes(regimes),
     fills: fillsRow.n,
-    // From ACTUAL cash (review P1): (proceeds - cost_basis) / cost_basis. The
-    // stored net_pct is grossPct minus the two fee percentages, which is only an
-    // approximation — the buy fee reduces UNITS, so it does not subtract
-    // linearly from the return. Falls back to net_pct only for rows with no
-    // cost basis, which are pre-v2 and already flagged above.
     ledgerValid: unconverted.length === 0,
-    profitFactor: fg.profitFactor(closedRows.map(r => (
-      Number(r.cost_basis) > 0
-        ? ((Number(r.proceeds || 0) - Number(r.cost_basis)) / Number(r.cost_basis)) * 100
-        : r.net_pct))),
+    // NOMINAL money, not per-position percentages (review P0.1). The previous
+    // version computed each position's real return and then handed those
+    // PERCENTAGES to profitFactor, which sums them with equal weight. Position
+    // sizes stopped being equal the moment the ledger became self-financing —
+    // partial fills, a moving NAV, limited cash, retained and stranded names —
+    // so a small winner could outvote a large loser. The reviewer's example: a
+    // cost basis of 0.01 at +100% against 0.50 at -5% reads 20.0 on percentages
+    // and 0.40 on money. Profit factor is a gate criterion, so that is a false
+    // pass on a book that lost money.
+    //
+    // Pre-v2 rows have no cost basis and contribute nothing rather than being
+    // mixed in on a different scale; they are reported separately as
+    // `unconverted` and block the gate outright.
+    profitFactor: fg.profitFactor(closedRows
+      .filter(r => Number(r.cost_basis) > 0)
+      .map(r => Number(r.proceeds || 0) - Number(r.cost_basis))),
     excessReturn: excessUniverse,          // PRIMARY: vs the set names were chosen from
     excessVsIndex: excess,                 // secondary, reported not gated
   };

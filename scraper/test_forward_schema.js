@@ -70,7 +70,12 @@ async function cleanup(pool) {
     process.exit(0);
   }
 
-  // The tables must already exist; setup() owns their DDL and migrations.
+  // Create the schema first, so an EMPTY database is a valid starting point
+  // (review P1.5). test:integration runs this file before the lifecycle test, so
+  // requiring pre-existing tables made a fresh database fail before anything had
+  // a chance to create them.
+  await sf.setup(pool);
+
   const [[tbl]] = await pool.query(
     `SELECT COUNT(*) n FROM information_schema.TABLES
       WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ft_strategy_positions'`);
@@ -196,7 +201,10 @@ async function cleanup(pool) {
       t('a pre-provenance row is sealed rather than left open to re-inference', () => {
         assert.ok(legacy && legacy.source_command !== null,
           'source_command is still NULL, so the heuristic can revisit it on every startup');
-        assert.ok(/^LEGACY_/.test(legacy.source_command), legacy.source_command);
+        // The label is UNKNOWN_LEGACY, not a guess at LIVE or REPLAY: a row whose
+        // provenance was never recorded cannot be proven either way, and the
+        // reviewer is right that saying so beats deciding it from a clock.
+        assert.strictEqual(legacy.source_command, 'UNKNOWN_LEGACY', legacy.source_command);
       });
     }
 
