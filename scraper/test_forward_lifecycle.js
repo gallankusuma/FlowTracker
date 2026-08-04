@@ -173,13 +173,17 @@ function truncated(ctx, n) {
     {
       // Both halves of P0.2: a different strategy_hash, and a same-hash plan
       // whose EXECUTION CONTRACT differs. Neither may be executed by this code.
-      const mkPlan = async (hash, date, buy) => {
+      // A COMPLETE contract on every fixture plan, so each case tests the reason
+      // it means to. An incomplete one is itself stale now, which is the third
+      // case below.
+      const mkPlan = async (hash, date, buy, policy = sf.EXECUTION_POLICY_HASH) => {
         await pool.query(
           `INSERT IGNORE INTO ft_strategy_plan
              (strategy_id, as_of_date, run_mode, generated_at, strategy_hash, exposure, reason,
-              eligible, vetoed, target_json, reference_json, buy_cost, sell_cost, execution_ledger_version, status)
-           VALUES (?,?,'LIVE',NOW(),?,1,'INVESTED',50,10,'[]','{}',?,0.003,2,'PLANNED')`,
-          [IDS.strategyId, date, hash, buy]);
+              eligible, vetoed, target_json, reference_json, buy_cost, sell_cost,
+              execution_ledger_version, execution_policy_hash, status)
+           VALUES (?,?,'LIVE',NOW(),?,1,'INVESTED',50,10,'[]','{}',?,0.003,?,?,'PLANNED')`,
+          [IDS.strategyId, date, hash, buy, sf.EXECUTION_LEDGER_VERSION, policy]);
         const [[row]] = await pool.query(
           'SELECT id FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=? AND strategy_hash=?',
           [IDS.strategyId, date, hash]);
@@ -197,6 +201,25 @@ function truncated(ctx, n) {
       t('a same-hash plan with a different execution contract is EXPIRED too', () => {
         assert.strictEqual(b.status, 'EXPIRED', `status ${b.status}`);
         assert.ok(/EXPIRED_EXECUTION_CONTRACT/.test(b.nofill_json || ''), b.nofill_json);
+      });
+
+      // A plan predating the contract columns has NULLs. An unknown contract is
+      // not a matching one, and backfilling it with today's values would invent
+      // a provenance that never existed (review P0.2).
+      await pool.query(
+        `INSERT IGNORE INTO ft_strategy_plan
+           (strategy_id, as_of_date, run_mode, generated_at, strategy_hash, exposure, reason,
+            eligible, vetoed, target_json, reference_json, status)
+         VALUES (?,?,'LIVE',NOW(),?,1,'INVESTED',50,10,'[]','{}','PLANNED')`,
+        [IDS.strategyId, ctx.tradingDates[planI - 40], IDS.strategyHash]);
+      const [[legacyPlan]] = await pool.query(
+        'SELECT id FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?',
+        [IDS.strategyId, ctx.tradingDates[planI - 40]]);
+      await sf.cmdFill(pool, ctx, true, IDS);
+      const [[c]] = await pool.query('SELECT status, nofill_json FROM ft_strategy_plan WHERE id=?', [legacyPlan.id]);
+      t('a plan with NO recorded execution contract is EXPIRED, not executed', () => {
+        assert.strictEqual(c.status, 'EXPIRED', `status ${c.status}`);
+        assert.ok(/MISSING_EXECUTION_CONTRACT/.test(c.nofill_json || ''), c.nofill_json);
       });
     }
 

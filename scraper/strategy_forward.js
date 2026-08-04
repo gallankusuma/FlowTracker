@@ -79,6 +79,26 @@ const MODEL_VERSION = process.env.AWO_MODEL_VERSION || '1.0.0-forward';
 const EXECUTION_LEDGER_VERSION = 2;
 
 /**
+ * Fingerprint of the execution machinery itself, not just its constants.
+ *
+ * EXECUTION_LEDGER_VERSION only moves when someone remembers to move it, and
+ * the reviewer is right that a change to buyFill, sellFill, markPrice or the
+ * price fallback is exactly the kind of thing that gets shipped without one.
+ * Hashing modules/execution.js catches those automatically.
+ *
+ * HONEST LIMIT: the sizing rule and the fill sequencing live in this file, not
+ * in that module, so they are still covered only by the version constant. This
+ * narrows the manual-bump surface, it does not remove it.
+ */
+const EXECUTION_POLICY_HASH = (() => {
+  try {
+    return crypto.createHash('sha256')
+      .update(require('fs').readFileSync(require('path').join(__dirname, 'modules', 'execution.js')))
+      .digest('hex').slice(0, 16);
+  } catch { return 'unreadable'; }
+})();
+
+/**
  * Identity of the exact strategy configuration a row was produced by. If any of
  * it changes, rows written before and after are not the same track record and
  * must not be pooled.
@@ -95,7 +115,7 @@ const EXECUTION_LEDGER_VERSION = 2;
  * passed to targetBook, so a default that changes upstream in strategy_book.js
  * changes the hash here without anyone remembering to update a list.
  */
-const EFFECTIVE_CONFIG = { ...sb.DEFAULTS, ...PARAMS, rebalanceBars: REBAL_BARS, buyCost: BUY_COST, sellCost: SELL_COST, modelVersion: MODEL_VERSION, executionLedgerVersion: EXECUTION_LEDGER_VERSION };
+const EFFECTIVE_CONFIG = { ...sb.DEFAULTS, ...PARAMS, rebalanceBars: REBAL_BARS, buyCost: BUY_COST, sellCost: SELL_COST, modelVersion: MODEL_VERSION, executionLedgerVersion: EXECUTION_LEDGER_VERSION, executionPolicyHash: EXECUTION_POLICY_HASH };
 const STRATEGY_HASH = crypto.createHash('sha256')
   .update(JSON.stringify({ id: STRATEGY_ID, cfg: Object.keys(EFFECTIVE_CONFIG).sort().map(k => [k, EFFECTIVE_CONFIG[k]]) }))
   .digest('hex').slice(0, 16);
@@ -236,6 +256,7 @@ async function setup(pool) {
       buy_cost DECIMAL(10,6) NULL,
       sell_cost DECIMAL(10,6) NULL,
       execution_ledger_version INT NULL,
+      execution_policy_hash VARCHAR(32) NULL,
       status ENUM('PLANNED','PARTIALLY_FILLED','EXECUTED','EXPIRED') NOT NULL DEFAULT 'PLANNED',
       nofill_json TEXT NULL,
       executed_at DATETIME NULL,
@@ -376,6 +397,7 @@ async function migratePlanTable(pool) {
   if (!(await hasColumn(pool, 'ft_strategy_plan', 'buy_cost'))) contract.push('ADD COLUMN buy_cost DECIMAL(10,6) NULL');
   if (!(await hasColumn(pool, 'ft_strategy_plan', 'sell_cost'))) contract.push('ADD COLUMN sell_cost DECIMAL(10,6) NULL');
   if (!(await hasColumn(pool, 'ft_strategy_plan', 'execution_ledger_version'))) contract.push('ADD COLUMN execution_ledger_version INT NULL');
+  if (!(await hasColumn(pool, 'ft_strategy_plan', 'execution_policy_hash'))) contract.push('ADD COLUMN execution_policy_hash VARCHAR(32) NULL');
   if (contract.length) {
     await pool.query(`ALTER TABLE ft_strategy_plan ${contract.join(', ')}`);
     console.log('MIGRATION: ft_strategy_plan gained its execution contract (buy_cost / sell_cost / execution_ledger_version)');
@@ -728,11 +750,11 @@ async function cmdPlan(pool, ctx, quiet, ids) {
     `INSERT INTO ft_strategy_plan
        (strategy_id, as_of_date, run_mode, generated_at, data_snapshot_hash, strategy_hash, code_commit,
         exposure, reason, regime_label, eligible, vetoed, target_json, reference_json,
-        buy_cost, sell_cost, execution_ledger_version, status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PLANNED')`,
+        buy_cost, sell_cost, execution_ledger_version, execution_policy_hash, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PLANNED')`,
     [strategyId, asOf, 'LIVE', nowSql, snapshotHash(ctx), strategyHash, CODE_COMMIT,
      d.exposure, d.reason, regimeLabel, d.eligible, d.vetoedCount, JSON.stringify(d.target), JSON.stringify(reference),
-     BUY_COST, SELL_COST, EXECUTION_LEDGER_VERSION]);
+     BUY_COST, SELL_COST, EXECUTION_LEDGER_VERSION, EXECUTION_POLICY_HASH]);
 
   if (!quiet) {
     console.log(`PLAN  ${asOf}  ${d.reason}   [market ${regimeLabel || 'UNKNOWN'}]`);
@@ -790,16 +812,35 @@ async function cmdFill(pool, ctx, quiet, ids) {
   const contractDiffers = p =>
     (p.buy_cost !== null && Number(p.buy_cost) !== BUY_COST) ||
     (p.sell_cost !== null && Number(p.sell_cost) !== SELL_COST) ||
-    (p.execution_ledger_version !== null && Number(p.execution_ledger_version) !== EXECUTION_LEDGER_VERSION);
-  const stale = plans.filter(p => (p.strategy_hash && p.strategy_hash !== strategyHash) || contractDiffers(p));
+    (p.execution_ledger_version !== null && Number(p.execution_ledger_version) !== EXECUTION_LEDGER_VERSION) ||
+    (p.execution_policy_hash !== null && p.execution_policy_hash !== EXECUTION_POLICY_HASH);
+
+  // A MISSING contract is not a matching one. The migration adds these columns
+  // as NULL, so a plan created before they existed had `contractDiffers` return
+  // false and was executed by the new implementation as though nothing had
+  // changed — the very case the contract exists to catch. Backfilling those
+  // columns with today's values would be worse: it would invent a provenance
+  // that never existed.
+  const missingContract = p =>
+    p.buy_cost === null || p.sell_cost === null ||
+    p.execution_ledger_version === null || p.execution_policy_hash === null;
+
+  const staleReason = p => {
+    if (!p.strategy_hash) return 'MISSING_STRATEGY_HASH';
+    if (missingContract(p)) return 'MISSING_EXECUTION_CONTRACT';
+    if (p.strategy_hash !== strategyHash) return 'EXPIRED_CONFIG_CHANGE';
+    return 'EXPIRED_EXECUTION_CONTRACT';
+  };
+  const stale = plans.filter(p =>
+    !p.strategy_hash || missingContract(p) || p.strategy_hash !== strategyHash || contractDiffers(p));
   for (const p of stale) {
     await pool.query(
       `UPDATE ft_strategy_plan SET status='EXPIRED', nofill_json=? WHERE id=?`,
       [JSON.stringify({
-        expired: p.strategy_hash && p.strategy_hash !== strategyHash ? 'EXPIRED_CONFIG_CHANGE' : 'EXPIRED_EXECUTION_CONTRACT',
+        expired: staleReason(p),
         planHash: p.strategy_hash, runningHash: strategyHash,
-        planContract: { buy: p.buy_cost, sell: p.sell_cost, ledger: p.execution_ledger_version },
-        runningContract: { buy: BUY_COST, sell: SELL_COST, ledger: EXECUTION_LEDGER_VERSION },
+        planContract: { buy: p.buy_cost, sell: p.sell_cost, ledger: p.execution_ledger_version, policy: p.execution_policy_hash },
+        runningContract: { buy: BUY_COST, sell: SELL_COST, ledger: EXECUTION_LEDGER_VERSION, policy: EXECUTION_POLICY_HASH },
       }), p.id]);
   }
   if (stale.length && !quiet) {
@@ -815,7 +856,7 @@ async function cmdFill(pool, ctx, quiet, ids) {
   let shortfallSum = 0, shortfallN = 0;
 
   for (const p of plans) {
-    if ((p.strategy_hash && p.strategy_hash !== strategyHash) || contractDiffers(p)) continue;   // expired above
+    if (!p.strategy_hash || missingContract(p) || p.strategy_hash !== strategyHash || contractDiffers(p)) continue;   // expired above
     const asOf = toDateStr(p.as_of_date);
     const i = dateIdx.get(asOf);
     if (i === undefined) continue;
@@ -1326,8 +1367,18 @@ function periodReturns(ctx, logRows, positionRows = [], terminalDate = null) {
       const execLast = iLast + 1;
       if (execLast < tradingDates.length && iTerm > execLast) {
         const dLast = tradingDates[execLast];
+        // The same price-convention bug I fixed for the reconciliation in
+        // 73ee652, reintroduced here the next day. navAt defaults to barPrice,
+        // which prefers the OPEN, while cmdMark values the book with markPrice,
+        // which uses the close. So the leg ended at the terminal day's open: a
+        // book that opened at 100 and closed at 90 was marked down by cmdMark
+        // and still reported to the gate as 100. Fixed in one place, left broken
+        // in another — the pattern this codebase keeps producing.
+        //
+        // nav0 keeps barPrice: it is an EXECUTION bar, and the open is what was
+        // actually paid there. nav1 is a valuation, so it takes the close.
         const nav0 = navAt(positionRows, series, execLast, dLast);
-        const nav1 = navAt(positionRows, series, iTerm, terminalDate);
+        const nav1 = navAt(positionRows, series, iTerm, terminalDate, exec.markPrice);
         if (nav0 > 0) {
           port.push(nav1 / nav0 - 1);
           navs.push(nav1);
@@ -1336,7 +1387,9 @@ function periodReturns(ctx, logRows, positionRows = [], terminalDate = null) {
           const rets = [];
           for (const r of elig) {
             const s2 = series.get(r.ticker);
-            const q0 = barPrice(s2, execLast), q1 = barPrice(s2, iTerm);
+            // Same convention as the portfolio leg above, or the benchmark and
+            // the strategy would be measured over different price points.
+            const q0 = barPrice(s2, execLast), q1 = exec.markPrice(s2, iTerm);
             if (q0 > 0 && q1 > 0) rets.push(q1 / q0 - 1);
           }
           universe.push(rets.length ? rets.reduce((x, y) => x + y, 0) / rets.length : 0);
@@ -1409,6 +1462,13 @@ async function reportFor(pool, ctx, runMode, ids) {
     distinctRegimes: fg.distinctRegimes(regimes),
     fills: fillsRow.n,
     ledgerValid: unconverted.length === 0,
+    // A gate reading a mark from last week does not know the record is stale
+    // (review P1.1). The mark must reach the latest complete trading bar.
+    navFresh: !navRow ? null
+      : (() => {
+          const mi = ctx.dateIdx.get(toDateStr(navRow.mark_date));
+          return mi !== undefined && mi >= ctx.tradingDates.length - 2;
+        })(),
     // NOMINAL money, not per-position percentages (review P0.1). The previous
     // version computed each position's real return and then handed those
     // PERCENTAGES to profitFactor, which sums them with equal weight. Position
@@ -1509,7 +1569,7 @@ function printReport(r, ctx) {
   console.log(`Information ratio       ${num(r.infoRatio)}   vs universe (annualised; null when <2 periods or no dispersion)`);
   console.log(`Maximum drawdown        ${r.maxDD === null ? 'n/a' : (r.maxDD * 100).toFixed(2) + '%'}`);
   console.log(`Average turnover        ${(r.avgTurnover * 100).toFixed(1)}% of the book per rebalance`);
-  console.log(`Profit factor           ${num(r.m.profitFactor)}   (gross profit / gross loss, net %)`);
+  console.log(`Profit factor           ${num(r.m.profitFactor)}   (gross nominal profit / gross nominal loss, in book units)`);
   if (r.navRow) {
     console.log('');
     const on = toDateStr(r.navRow.mark_date);
@@ -1621,7 +1681,7 @@ async function main() {
   await pool.end();
 }
 
-module.exports = { setup, loadSeries, reportFor, reclassifyBatchWrites, periodReturns, snapshotHash, cashAt, navAt, INITIAL_CAPITAL, cmdPlan, cmdFill, cmdMark, backfillRegimeLabels, STRATEGY_HASH, EFFECTIVE_CONFIG };
+module.exports = { setup, loadSeries, reportFor, reclassifyBatchWrites, EXECUTION_POLICY_HASH, EXECUTION_LEDGER_VERSION, periodReturns, snapshotHash, cashAt, navAt, INITIAL_CAPITAL, cmdPlan, cmdFill, cmdMark, backfillRegimeLabels, STRATEGY_HASH, EFFECTIVE_CONFIG };
 
 if (require.main === module) {
   main().catch(e => { console.error('FATAL', e); process.exit(1); });

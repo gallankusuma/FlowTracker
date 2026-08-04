@@ -121,6 +121,9 @@ function distinctRegimes(regimes) {
  * @param {number} m.fills
  * @param {number|null} m.profitFactor
  * @param {number|null} m.excessReturn - portfolio minus benchmark, fractional
+ * @param {boolean} [m.navFresh] - false blocks the gate: the performance
+ *   numbers end at a mark that is no longer current, so they describe a book
+ *   nobody has valued recently. null means no mark exists yet.
  * @param {boolean} [m.ledgerValid] - false blocks the gate outright: a ledger
  *   with rows lacking units/cost_basis produces a cash and NAV that are simply
  *   wrong, so there is nothing worth evaluating.
@@ -155,6 +158,15 @@ function evaluateForwardGate(m, gate = GATE) {
   // cost basis read as costing nothing, so cash and NAV — and therefore every
   // number above — are wrong. Reporting them and then evaluating the gate anyway
   // is the same mistake as printing a requirement nobody computes.
+  // A mark from last week cannot describe today's book (review P1.1). Reported
+  // as its own criterion so a rejection says "the marks are stale" rather than
+  // quietly scoring a record whose latest performance nobody has measured.
+  if (m.navFresh === false) {
+    criteria.unshift({
+      name: 'NAV mark reaches the latest complete trading bar', actual: 'no', required: 'yes', pass: false,
+    });
+  }
+
   if (m.ledgerValid === false) {
     criteria.unshift({
       name: 'ledger rows all carry units and a cost basis', actual: 'no', required: 'yes', pass: false,

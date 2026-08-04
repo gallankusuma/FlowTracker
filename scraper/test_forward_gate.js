@@ -152,6 +152,19 @@ t('surfaces excluded replay decisions instead of hiding them', () => {
   assert.strictEqual(r.replayDecisionsExcluded, 19);
 });
 
+t('a stale NAV mark blocks the gate', () => {
+  // Performance numbers that end at last week's mark describe a book nobody has
+  // valued since (review P1.1).
+  const r = fg.evaluateForwardGate({ ...PASSING, navFresh: false });
+  assert.strictEqual(r.status, 'NOT_ELIGIBLE');
+  assert.ok(r.failed.some(f => /NAV mark reaches/.test(f)), JSON.stringify(r.failed));
+});
+
+t('a fresh mark, or no mark at all, adds no criterion', () => {
+  assert.strictEqual(fg.evaluateForwardGate({ ...PASSING, navFresh: true }).status, 'ELIGIBLE_FOR_REVIEW');
+  assert.strictEqual(fg.evaluateForwardGate({ ...PASSING, navFresh: null }).status, 'ELIGIBLE_FOR_REVIEW');
+});
+
 t('an invalid ledger blocks the gate outright, it does not merely warn', () => {
   // Rows without units/cost_basis read as costing nothing, so cash and NAV are
   // wrong and every metric built on them is meaningless (review P1.3).

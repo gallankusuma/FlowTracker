@@ -1,189 +1,169 @@
-Verdict
+P0.1 — Terminal performance masih memakai harga open, bukan actual NAV mark
 
-Belum selesai sepenuhnya di repository yang sekarang terbaca.
+terminalDate berasal dari latest ft_strategy_nav, yang dibuat oleh cmdMark() menggunakan close/mark price.
 
-Perbaikan pada backtest EXP-017 memang sudah masuk. Namun perubahan untuk forward-test live, pemisahan replay, promotion gate, verifier, scheduler, dan pencatatan hasil rerun belum terlihat.
+Namun terminal leg menghitung:
 
-Jadi kemungkinan:
+const nav1 = navAt(
+  positionRows,
+  series,
+  iTerm,
+  terminalDate
+);
 
-tim baru menyelesaikan sebagian perubahan;
-perubahan sisanya belum di-push;
-atau masih berada di working copy/VPS dan belum masuk GitHub.
-Status per komentar terakhir
-Item	Status
-Decision tidak memakai open[T+1]	✅ Selesai pada EXP-017
-EXP-017 memakai strategy_book.targetBook()	✅ Selesai
-NO_FILL untuk pembelian	✅ Selesai
-Random/reverse veto melalui shared strategy module	✅ Selesai
-Harmonic signal diturunkan sizing-nya	✅ Selesai
-Sell NO_FILL mempertahankan posisi	❌ Belum
-Point-in-time universe	❌ Belum
-LIVE terpisah dari REPLAY	❌ Belum
-PLAN dan FILL dua tahap	❌ Belum
-Strategy/code/data version	❌ Belum
-Profit factor dihitung nyata	❌ Belum
-Exact backtest-live parity test	❌ Belum
-Verifier masuk npm test	❌ Belum
-Rerun EXP-017 dicatat sebagai eksperimen baru	❌ Belum
-Cron plan/fill terpisah	❌ Belum
-Temuan yang masih blocking
-1. Forward test masih versi lama
+Karena priceFn tidak diberikan, navAt() memakai barPrice(), yang memprioritaskan open price. Eligible-universe terminal return juga memakai barPrice() pada terminal date.
 
-strategy_forward.js yang sekarang ada masih menerima:
+Jadi secara efektif:
 
---date
---replay
---status
+Observed NAV latest mark  = harga close/mark
+Gate terminal return      = harga open hari yang sama
 
-Belum ada command seperti:
+Contoh:
 
-plan
-fill
-mark
-status
+Open hari ini  : 100
+Close hari ini : 90
 
-Script masih menghitung keputusan dan langsung membaca open[i+1] pada proses yang sama. Dengan begitu, keputusan belum dibekukan sebelum harga execution diketahui.
+cmdMark() melihat penurunan ke 90, tetapi promotion performance dapat tetap berakhir di 100. Kerugian intraday pada latest mark belum masuk ke gate.
 
-Ini berarti statusnya masih:
+Perbaikan
 
-Delayed historical walk-forward recorder, belum live forward test yang murni.
+Terminal portfolio NAV harus menggunakan:
 
-2. Replay masih bercampur dengan live
+const nav1 = navAt(
+  positionRows,
+  series,
+  iTerm,
+  terminalDate,
+  exec.markPrice
+);
 
-Schema tabel masih tidak mempunyai:
+Untuk eligible universe:
 
-run_mode
-decision_timestamp
-execution_timestamp
-strategy_version
-code_commit
-data_snapshot
+const q0 = barPrice(s2, execLast);       // execution open
+const q1 = exec.markPrice(s2, iTerm);    // terminal close/mark
 
---replay masih menulis ke tabel ft_strategy_positions dan ft_strategy_log yang sama dengan proses normal.
+Pilihan paling kuat: gunakan navRow.total_nav langsung sebagai terminal strategy NAV karena itulah observed authoritative mark.
 
-Akibatnya, historical replay masih berpotensi masuk ke:
+P0.2 — Pending legacy plan dengan contract NULL masih dapat dieksekusi
 
-jumlah closed trades;
-win rate;
-average return;
-promotion evaluation.
+Migration menambahkan kolom execution contract sebagai nullable:
 
-Ini harus dipisahkan sebelum angka apa pun disebut forward performance.
+buy_cost NULL
+sell_cost NULL
+execution_ledger_version NULL
 
-3. Promotion gate masih berupa tulisan
+Tetapi contractDiffers() hanya menganggap berbeda jika nilainya tidak null dan tidak sama:
 
-Status masih hanya mengambil:
+p.buy_cost !== null &&
+Number(p.buy_cost) !== BUY_COST
 
-COUNT(*)
-AVG(net_pct)
-SUM(net_pct > 0)
+Skenario:
 
-Namun output tetap menyebut:
+Plan dibuat sebelum execution-contract columns tersedia.
+Migration menambahkan ketiga kolom dengan nilai NULL.
+Plan masih PLANNED dan mempunyai current strategy hash.
+contractDiffers() menghasilkan false.
+Plan lama dieksekusi oleh implementation baru.
 
-profit factor >= 1.10
+Padahal contract plan tersebut tidak diketahui.
 
-Tidak ada kalkulasi gross profit dibagi gross loss. Tidak ada benchmark-relative return, maximum drawdown, information ratio, ataupun jumlah rebalance independen.
+Perbaikan
 
-Jadi gate belum benar-benar dijalankan oleh sistem.
+Contract yang tidak lengkap harus dianggap stale:
 
-4. Point-in-time universe belum diperbaiki
+const missingContract = p =>
+  p.buy_cost === null ||
+  p.sell_cost === null ||
+  p.execution_ledger_version === null;
 
-Forward dan backtest masih melakukan filter global:
+const stale = plans.filter(p =>
+  !p.strategy_hash ||
+  missingContract(p) ||
+  p.strategy_hash !== strategyHash ||
+  contractDiffers(p)
+);
 
-if (s.placed < 400 || s.nConc < 200) {
-  series.delete(ticker);
-}
+Gunakan reason:
 
-Jumlah placed dan nConc tersebut dihitung memakai seluruh dataset.
+MISSING_EXECUTION_CONTRACT
 
-Pada keputusan historis 2024, sistem sudah mengetahui bahwa sebuah saham nantinya akan memiliki 400 price bars dan 200 concentration observations. Ini masih full-sample coverage look-ahead.
+Jangan mengisi contract lama dengan current values melalui migration karena itu akan menciptakan provenance yang tidak pernah ada.
 
-Eligibility seharusnya diperiksa per tanggal keputusan:
+P1 yang disarankan
+1. Gate belum memeriksa freshness NAV
 
-price history available through T
-concentration history available through T
-liquidity through T
-listing status through T
-5. Exact parity verifier belum masuk
+Report menggunakan latest NAV row yang tersedia, tetapi gate tidak memeriksa apakah mark tersebut benar-benar terbaru. Gate criteria saat ini hanya mencakup decisions, months, regimes, fills, profit factor, excess return, dan ledger validity.
 
-verify_strategy_book.js belum terlihat diperbarui dari versi yang:
+Jika cron mark berhenti selama beberapa hari, promotion gate tetap dapat mengevaluasi track record sampai mark lama dan tidak menyadari data performance-nya stale.
 
-hanya memeriksa CAGR berada pada rentang yang masuk akal;
-tidak membandingkan trade-by-trade;
-tidak membandingkan equity curve hash;
-memakai reverseForTest, sementara parameter tersebut tidak digunakan oleh strategy_book;
-tidak memverifikasi reverse control secara nyata.
+Tambahkan:
 
-Lebih penting lagi, verifier tidak terdapat dalam perintah npm test. Test suite sekarang masih hanya menjalankan sepuluh test lama.
+latestNavMarkDate
+latestCompleteTradingDate
+navFresh
 
-Parity test harus memverifikasi tepat:
+Gate harus NOT_ELIGIBLE ketika latest mark tertinggal lebih dari satu complete trading bar.
 
-target tickers per decision date
-buy events
-sell events
-NO_FILL events
-costs
-cash
-holdings
-equity value per period
-final portfolio value
-maximum drawdown
-6. Cron masih satu tahap
+2. Execution policy masih mengandalkan manual version bump
 
-Dokumentasi cron masih berisi:
+Contract menangkap costs dan execution_ledger_version, tetapi perubahan murni pada:
 
-0 1 * * 1-5 node strategy_forward.js
+buyFill();
+sellFill();
+sizing algorithm;
+price fallback;
+transaction sequencing;
 
-Belum ada pemisahan:
+tidak otomatis terdeteksi bila developer lupa menaikkan ledger version.
 
-plan after close
-fill after next market open
-mark after close
+Lebih kuat bila plan menyimpan:
 
-Satu command pukul 08.00 WIB masih menjalankan model lama.
+execution_policy_hash
 
-7. Experiment registry belum diperbarui
+yang berasal dari execution configuration/version yang eksplisit. Alternatif konservatif: expire pending plan bila plan.code_commit !== CODE_COMMIT.
 
-BACKTEST_EXPERIMENTS.md masih berakhir pada EXP-018 dan masih memiliki bagian Open follow-ups lama. Belum ada eksperimen baru, misalnya:
+3. Terminal leg belum punya regression test langsung
 
-EXP-019 — EXP-017 re-run after look-ahead and shared-code fixes
+test_strategy_forward.js sudah menguji deployment cost dan NAV path, tetapi belum terlihat test yang memastikan harga setelah rebalance terakhir masuk melalui terminalDate.
 
-Registry belum menampilkan angka terkoreksi setelah:
+Tambahkan fixture:
 
-menghapus tradeability look-ahead;
-memakai shared target-book implementation;
-mencatat NO_FILL;
-memperbaiki benchmark eligibility.
+last execution NAV = 1.00
+latest mark NAV    = 0.90
 
-Karena itu, angka lama seperti CAGR 16,73% dan excess +8,71% belum bisa digunakan sebagai hasil dari implementasi terbaru.
+dan assert total return menyertakan terminal loss −10%.
 
-Perbaikan yang memang sudah bagus
+4. Label profit factor masih menyebut “net %”
 
-Pada sisi positif, tim sudah menyelesaikan bagian yang cukup penting:
+Output saat ini masih menulis:
 
-strategy_book.js sekarang menyediakan vetoSelector;
-backtest EXP-017 menggunakan targetBook() yang sama dengan production decision module;
-buy-side NO_FILL sudah dicatat;
-eligibility tidak lagi menghapus saham hanya karena tidak mempunyai open pada hari berikutnya;
-random dan reverse control tidak perlu membuat ulang ranking dan buffering;
-harmonic sizing sudah diturunkan setelah tidak menunjukkan edge.
+gross profit / gross loss, net %
 
-Perubahan ini menaikkan integritas research backtest secara nyata.
+padahal input-nya sekarang nominal P&L.
 
-Kesimpulan
+Ganti menjadi:
 
-Research backtest-nya sudah lebih baik, tetapi forward validation infrastructure belum selesai.
+gross nominal profit / gross nominal loss
+Penilaian terbaru
+Area	Sebelumnya	Sekarang
+Nominal profit factor	6.0	9.5
+Latest-period coverage	6.0	8.5
+Provenance handling	9.0	9.5
+Stale-plan protection	9.5	9.0
+NAV reconciliation	8.2	9.3
+Schema/migration testing	8.8	9.2
+Forward infrastructure	9.0	9.2
+Predictive-edge evidence	4.5	4.5
+Kesimpulan akhir
 
-Status sistem saat ini:
+Secara keseluruhan, revisi ini substantif dan benar. Dua masalah promotion yang paling besar—nominal profit factor dan latest open period—sudah ditangani.
 
-Backtest candidate improved — live predictive edge still not independently validated.
+Posisi sistem sekarang:
 
-Prioritas tim berikutnya seharusnya bukan menambah indikator, tetapi menyelesaikan lima hal ini:
+Production-capable forward recorder, dengan promotion gate yang masih membutuhkan terminal close valuation dan missing-contract rejection.
 
-Buat plan dan fill sebagai dua proses terpisah.
-Pisahkan LIVE dan REPLAY secara permanen.
-Hilangkan full-sample universe filter.
-Buat promotion report yang menghitung metrik secara nyata.
-Jalankan ulang EXP-017 dan append hasilnya sebagai eksperimen baru.
+Setelah dua P0 di atas ditutup, gue akan anggap forward validation infrastructure lulus secara engineering.
 
-File strategy_forward.js yang ada di GitHub memiliki SHA yang sama dengan versi audit sebelumnya. Jadi bila tim merasa sudah memperbaikinya, perubahan itu belum masuk ke branch master yang terhubung ke sini.
+Status signal tetap berbeda: infrastrukturnya hampir siap penuh untuk mengumpulkan bukti, tetapi edge HI52W + broker veto masih harus dibuktikan oleh LIVE time selama minimal periode yang ditentukan gate.
+
+Review ini berdasarkan static source terbaru. Gue belum menjalankan npm test dan npm run test:integration langsung terhadap MySQL/VPS production.
