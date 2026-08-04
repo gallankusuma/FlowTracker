@@ -148,6 +148,7 @@ async function setup(pool) {
       as_of_date DATE NOT NULL,
       exposure DECIMAL(4,2) NOT NULL,
       reason VARCHAR(128) NOT NULL,
+      regime_label VARCHAR(16) NULL,
       eligible INT NOT NULL,
       vetoed INT NOT NULL,
       n_target INT NOT NULL,
@@ -173,6 +174,7 @@ async function setup(pool) {
       code_commit VARCHAR(40) NULL,
       exposure DECIMAL(4,2) NOT NULL,
       reason VARCHAR(128) NOT NULL,
+      regime_label VARCHAR(16) NULL,
       eligible INT NOT NULL,
       vetoed INT NOT NULL,
       target_json TEXT NULL,
@@ -207,6 +209,7 @@ async function setup(pool) {
 
   await migratePlanTable(pool);
   await migrateNavTable(pool);
+  await migrateRegimeLabel(pool);
   await migrateProvenance(pool);
 }
 
@@ -214,6 +217,15 @@ async function setup(pool) {
  * Bring an already-created ft_strategy_plan up to date: PARTIALLY_FILLED became
  * a real state and per-ticker no-fills are recorded (review P1.2).
  */
+async function migrateRegimeLabel(pool) {
+  for (const t of ['ft_strategy_plan', 'ft_strategy_log']) {
+    if (!(await hasColumn(pool, t, 'regime_label'))) {
+      await pool.query(`ALTER TABLE ${t} ADD COLUMN regime_label VARCHAR(16) NULL`);
+      console.log(`MIGRATION: ${t}.regime_label added — the gate no longer infers regime from a reason string (review P1.1)`);
+    }
+  }
+}
+
 async function migrateNavTable(pool) {
   const cols = ['cash_value', 'market_value', 'total_nav', 'realized_pnl', 'unrealized_pnl', 'gross_exposure', 'benchmark_nav'];
   const missing = [];
@@ -384,16 +396,39 @@ async function loadSeries(pool) {
  * existed at plan time, rather than taking the timestamp's word for it.
  */
 function snapshotHash(ctx) {
-  let bars = 0, conc = 0;
-  for (const s of ctx.series.values()) {
+  // A CONTENT digest, not a shape digest (review P1.5). This used to hash only
+  // the last date, the number of dates, the ticker count and two row counts. If
+  // a close or a dn0 were CORRECTED in place — a restatement, a re-fetch, a
+  // split adjustment — while the row counts stayed the same, the hash did not
+  // move, so it could not establish that a plan came from the data it claims.
+  //
+  // Worse, two of the four series the decision actually reads contributed
+  // nothing at all: `high` is the numerator of the entire 52-week rank and
+  // `value` drives the liquidity screen. And the IHSG close series was absent in
+  // any form, so a restatement that flipped `exposure` between 1 and 0 — the
+  // difference between fully invested and standing aside — left the hash
+  // unchanged.
+  //
+  // Every value the decision reads now feeds an order-independent digest:
+  // per-ticker digests are XOR-folded so the result does not depend on Map
+  // iteration order, then combined with the IHSG series.
+  const h = crypto.createHash('sha256');
+  let fold = Buffer.alloc(32);
+  for (const [ticker, s] of ctx.series) {
+    const t = crypto.createHash('sha256');
+    t.update(ticker);
     for (let i = 0; i < s.close.length; i++) {
-      if (s.close[i] !== null) bars++;
-      if (s.dn0[i] !== null) conc++;
+      if (s.close[i] === null && s.high[i] === null && s.value[i] === null && s.dn0[i] === null) continue;
+      t.update(`${i}|${s.close[i]}|${s.high[i]}|${s.value[i]}|${s.dn0[i]};`);
     }
+    const d = t.digest();
+    for (let b = 0; b < 32; b++) fold[b] ^= d[b];
   }
-  return crypto.createHash('sha256')
-    .update(JSON.stringify({ lastDate: ctx.tradingDates[ctx.tradingDates.length - 1], n: ctx.tradingDates.length, tickers: ctx.series.size, bars, conc }))
-    .digest('hex').slice(0, 16);
+  h.update(fold);
+  h.update('|IHSG|');
+  for (let i = 0; i < ctx.ihsgClose.length; i++) h.update(`${ctx.ihsgClose[i]};`);
+  h.update(`|n=${ctx.tradingDates.length}|last=${ctx.tradingDates[ctx.tradingDates.length - 1]}|tickers=${ctx.series.size}`);
+  return h.digest('hex').slice(0, 16);
 }
 
 /**
@@ -414,6 +449,33 @@ function snapshotHash(ctx) {
  * executes it was knowable. Everything beyond that needs a live feed and a
  * broker, and this system has neither.
  */
+/**
+ * Fill regime_label on rows written before the column existed.
+ *
+ * Safe, and worth saying why: the label is a deterministic function of
+ * (ihsgClose, ihsgSma, decision bar) — all as-of data that existed when the row
+ * was written. Deriving it later introduces no look-ahead and changes no
+ * decision. Without it the first LIVE decision could never count toward regime
+ * coverage, purely because of when a column was added.
+ */
+async function backfillRegimeLabels(pool, ctx) {
+  const { dateIdx, ihsgClose, ihsgSma } = ctx;
+  for (const t of ['ft_strategy_plan', 'ft_strategy_log']) {
+    const [rows] = await pool.query(
+      `SELECT id, as_of_date FROM ${t} WHERE strategy_id=? AND regime_label IS NULL`, [STRATEGY_ID]);
+    let n = 0;
+    for (const r of rows) {
+      const i = dateIdx.get(toDateStr(r.as_of_date));
+      if (i === undefined) continue;
+      const label = sb.marketRegime(ihsgClose, ihsgSma, i);
+      if (!label) continue;
+      await pool.query(`UPDATE ${t} SET regime_label=? WHERE id=?`, [label, r.id]);
+      n++;
+    }
+    if (n) console.log(`BACKFILL: ${t}.regime_label set on ${n} row(s) from as-of index data`);
+  }
+}
+
 async function cmdPlan(pool, ctx, quiet) {
   const { tradingDates, series, ihsgClose, ihsgSma } = ctx;
   const i = tradingDates.length - 1;              // the latest COMPLETE bar
@@ -443,6 +505,9 @@ async function cmdPlan(pool, ctx, quiet) {
   const d = sb.targetBook({
     series, i, ihsgClose, ihsgSma, currentHoldings: openRows.map(r => r.ticker), opts: PARAMS,
   });
+  // The market condition this decision was made under, recorded at decision
+  // time. A label, never an input (review P1.1).
+  const regimeLabel = sb.marketRegime(ihsgClose, ihsgSma, i);
 
   // Decision-time reference price, for implementation shortfall at fill. This is
   // the last price the decision could possibly have seen — bar i's close.
@@ -455,13 +520,13 @@ async function cmdPlan(pool, ctx, quiet) {
   await pool.query(
     `INSERT INTO ft_strategy_plan
        (strategy_id, as_of_date, run_mode, generated_at, data_snapshot_hash, strategy_hash, code_commit,
-        exposure, reason, eligible, vetoed, target_json, reference_json, status)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'PLANNED')`,
+        exposure, reason, regime_label, eligible, vetoed, target_json, reference_json, status)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,'PLANNED')`,
     [STRATEGY_ID, asOf, 'LIVE', nowSql, snapshotHash(ctx), STRATEGY_HASH, CODE_COMMIT,
-     d.exposure, d.reason, d.eligible, d.vetoedCount, JSON.stringify(d.target), JSON.stringify(reference)]);
+     d.exposure, d.reason, regimeLabel, d.eligible, d.vetoedCount, JSON.stringify(d.target), JSON.stringify(reference)]);
 
   if (!quiet) {
-    console.log(`PLAN  ${asOf}  ${d.reason}`);
+    console.log(`PLAN  ${asOf}  ${d.reason}   [market ${regimeLabel || 'UNKNOWN'}]`);
     console.log(`  eligible ${d.eligible}, vetoed ${d.vetoedCount}`);
     console.log(`  book: ${d.target.length ? d.target.join(', ') : '(flat)'}`);
     console.log('  status PLANNED — no execution price read. Run `fill` once the next bar lands.');
@@ -572,10 +637,10 @@ async function cmdFill(pool, ctx, quiet) {
 
       await conn.query(
         `INSERT IGNORE INTO ft_strategy_log
-           (strategy_id, as_of_date, exposure, reason, eligible, vetoed, n_target, opened, closed, target_json,
+           (strategy_id, as_of_date, exposure, reason, regime_label, eligible, vetoed, n_target, opened, closed, target_json,
             run_mode, decision_created_at, data_available_at, strategy_hash, code_commit)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [STRATEGY_ID, asOf, exposure, p.reason, p.eligible, p.vetoed, target.length, opened, closed,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [STRATEGY_ID, asOf, exposure, p.reason, p.regime_label, p.eligible, p.vetoed, target.length, opened, closed,
          p.target_json, 'LIVE', p.generated_at, p.generated_at, STRATEGY_HASH, CODE_COMMIT]);
 
       // PARTIALLY_FILLED is a real state (review P1.2). Marking a plan EXECUTED
@@ -871,7 +936,9 @@ function periodReturns(ctx, logRows, positionRows = []) {
     // a REGIME_FLAT period, hiding exactly the exposure we failed to shed.
     port.push(gross - cost);
     bench.push(ihsgClose[execB] / ihsgClose[execA] - 1);
-    regimes.push(String(a.regime_label || a.reason || '').split(' ')[0]);
+    // The recorded label only. Falling back to the reason string is what made
+    // INSUFFICIENT_UNIVERSE -- a data outage -- count as a market regime.
+    regimes.push(a.regime_label || null);
   }
   return { port, bench, universe, regimes, avgTurnover: port.length ? turnoverTotal / port.length : 0 };
 }
@@ -885,7 +952,7 @@ async function reportFor(pool, ctx, runMode) {
   // record reads as "the configuration changed" rather than "nothing happened".
   const HASH = [STRATEGY_ID, runMode, STRATEGY_HASH];
   const [logRows] = await pool.query(
-    'SELECT as_of_date, exposure, reason, target_json, opened, closed FROM ft_strategy_log WHERE strategy_id=? AND run_mode=? AND strategy_hash=? ORDER BY as_of_date', HASH);
+    'SELECT as_of_date, exposure, reason, regime_label, target_json, opened, closed FROM ft_strategy_log WHERE strategy_id=? AND run_mode=? AND strategy_hash=? ORDER BY as_of_date', HASH);
   const [closedRows] = await pool.query(
     "SELECT net_pct, exit_date FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=? AND status='CLOSED'", HASH);
   const [openRows] = await pool.query(
@@ -1013,6 +1080,7 @@ async function main() {
   const pool = mysql.createPool({ ...DB, waitForConnections: true, connectionLimit: 5 });
   await setup(pool);
   const ctx = await loadSeries(pool);
+  await backfillRegimeLabels(pool, ctx);
 
   if (o.status) {
     const live = await reportFor(pool, ctx, 'LIVE');
@@ -1073,7 +1141,7 @@ async function main() {
   await pool.end();
 }
 
-module.exports = { periodReturns, snapshotHash, cmdPlan, cmdFill, cmdMark, STRATEGY_HASH };
+module.exports = { periodReturns, snapshotHash, cmdPlan, cmdFill, cmdMark, backfillRegimeLabels, STRATEGY_HASH, EFFECTIVE_CONFIG };
 
 if (require.main === module) {
   main().catch(e => { console.error('FATAL', e); process.exit(1); });

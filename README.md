@@ -58,7 +58,7 @@ Reading any one of them gives a wrong picture of what this system does:
 
 ## Research findings
 
-Seventeen experiments, most of them negative. The registry records failures at the
+Twenty experiments, most of them negative. The registry records failures at the
 same length as successes, because a method that only records what worked cannot
 tell you when to stop.
 
@@ -71,14 +71,27 @@ tell you when to stop.
   fitted on the full sample (EXP-013).
 - **Persistent broker "accumulation" predicts UNDERperformance** — the strongest
   relationship found anywhere in this project, with the sign inverted from the
-  conventional reading (EXP-016). Applied as a veto it passes every control,
-  including a reverse-signal control (EXP-017).
+  conventional reading (EXP-016). Applied as a veto it passes every mechanical
+  control, including a reverse-signal control (EXP-017) — but on the corrected
+  point-in-time universe it does **not** produce positive excess in both halves
+  of the sample, and its low-dose response is not monotone (EXP-020). It is the
+  best candidate here and it is not proven.
 - **Per-position stops and inverse-volatility sizing both make things worse.** The
   only risk layer that transfers out of sample is a plain 200-day moving-average
   market filter (EXP-014).
-- The current candidate is being **forward-tested**, and **it fails its own
-  promotion gate** (profit factor 0.72 against a required 1.10). It will not be
-  tuned to pass.
+- **Same-day entry and exit is structurally negative on IDX**, at every stop and
+  target width tested, and the system's own BUY days are *worse* than the market
+  average, not better (EXP-019).
+- **The broker veto carries the strategy.** Switching each component off in turn,
+  the 52-week-high ranking alone returns −0.88% — close to worthless — while the
+  veto adds ~18pp on top of ranking plus timing. The timing layer costs return
+  and buys drawdown protection.
+- The current candidate is being **forward-tested**, and the live record is
+  currently **empty by design**: the forward test has made one frozen plan and
+  no live fills. The often-quoted profit factor of **0.72 is a REPLAY figure**,
+  produced by seeding the ledger from history, and replayed decisions are now
+  excluded from the promotion gate entirely. There is no live number yet, and
+  the candidate will not be tuned to produce one.
 
 ## Conventions that exist for a reason
 

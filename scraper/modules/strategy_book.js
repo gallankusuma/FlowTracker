@@ -233,6 +233,35 @@ function targetBook({ series, i, ihsgClose, ihsgSma, currentHoldings, opts }) {
   };
 }
 
+/**
+ * Market regime at bar i, as a LABEL for the record — never as a decision input.
+ *
+ * The promotion gate asks whether a track record has been tested in more than
+ * one market. Before this existed it derived the label from the first token of
+ * the strategy's `reason` string, whose only values are INVESTED, REGIME_FLAT
+ * and INSUFFICIENT_UNIVERSE. Two of those share a first token, so the maximum
+ * achievable count was exactly 3 — and only if a DATA OUTAGE was present. A
+ * gate requiring three regimes therefore required something to be broken
+ * (review P1.1).
+ *
+ * Three states, from the index only, using the same SMA the strategy already
+ * trusts: where price sits relative to it, and which way the average itself is
+ * going. SIDEWAYS is the honest label for the mixed cases rather than forcing
+ * everything into up or down.
+ *
+ * Returns null before there is enough history to say anything.
+ */
+function marketRegime(closes, sma, i, slopeBars = 60) {
+  if (!Array.isArray(closes) || !Array.isArray(sma)) return null;
+  const c = closes[i], m = sma[i], mPrev = sma[i - slopeBars];
+  if (!(c > 0) || !(m > 0) || !(mPrev > 0)) return null;
+  const above = c > m;
+  const rising = m > mPrev;
+  if (above && rising) return 'BULL';
+  if (!above && !rising) return 'BEAR';
+  return 'SIDEWAYS';
+}
+
 /** IHSG 200d SMA series from close prices. Backward-only by construction. */
 function smaSeries(closes, period) {
   const out = new Array(closes.length).fill(null);
@@ -245,4 +274,5 @@ function smaSeries(closes, period) {
   return out;
 }
 
-module.exports = { DEFAULTS, crossSection, targetBook, smaSeries, rollingMedian, posfrac, clipDn };
+module.exports = {
+  marketRegime, DEFAULTS, crossSection, targetBook, smaSeries, rollingMedian, posfrac, clipDn };
