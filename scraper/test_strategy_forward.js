@@ -53,122 +53,125 @@ const LOG = [
 const flat = p => [{ open: p, close: p }, { open: p, close: p }, { open: p, close: p }, { open: p, close: p }];
 const move = (p0, p1) => [{ open: p0, close: p0 }, { open: p0, close: p0 }, { open: p0, close: p0 }, { open: p1, close: p1 }];
 
-console.log('\nperiodReturns — weights come from the ledger, not the plan');
+const { cashAt, navAt } = require('./strategy_forward');
+const BUY_COST = 0.0020, SELL_COST = 0.0030;
 
-t('a fully invested book returns the weighted move', () => {
-  // The ledger and the plan must DISAGREE here, or the test proves nothing.
-  // The first version of this case used target_json '[]' and asserted 0, which
-  // the reverted plan-based implementation also returns — it passed either way.
-  // So the plan here names a THIRD ticker that was never filled: a plan-based
-  // reading would price CCC's +50%, the ledger correctly ignores it.
+/**
+ * Build a ledger row the way cmdFill does: spend `spend` of the book at `px`,
+ * receive units net of the buy fee. Exits carry proceeds net of the sell fee.
+ * Costs are therefore INSIDE the NAV path and never added as a separate term.
+ */
+function pos(ticker, entryDate, entryPx, spend, exitDate, exitPx) {
+  const units = (spend * (1 - BUY_COST)) / entryPx;
+  return {
+    ticker, entry_date: entryDate, exit_date: exitDate || null,
+    units, cost_basis: spend,
+    proceeds: exitDate ? units * exitPx * (1 - SELL_COST) : null,
+    weight: spend, status: exitDate ? 'CLOSED' : 'OPEN',
+  };
+}
+
+console.log('\nperiodReturns — one authoritative NAV series');
+
+t('the NAV path, not a weighted price move, is what is reported', () => {
+  // Half the book in each of two names, one +10% and one -10%.
   const ctx = makeCtx({ AAA: move(100, 110), BBB: move(100, 90), CCC: move(100, 150) });
   const log = LOG.map(l => ({ ...l, target_json: '["AAA","BBB","CCC"]' }));
-  const rows = [
-    { ticker: 'AAA', entry_date: DATES[1], exit_date: null, weight: 0.5 },
-    { ticker: 'BBB', entry_date: DATES[1], exit_date: null, weight: 0.5 },
-  ];
+  const rows = [pos('AAA', DATES[1], 100, 0.5), pos('BBB', DATES[1], 100, 0.5)];
   const { port } = periodReturns(ctx, log, rows);
-  // +10% and -10% at half weight each nets to zero. An unweighted mean over the
-  // planned book would have returned (0.10 - 0.10 + 0.50) / 3 = +16.67%.
-  assert.ok(Math.abs(port[0] - 0) < 1e-9, `got ${(port[0] * 100).toFixed(2)}% — a plan-based reading gives +16.67%`);
+  const nav0 = navAt(rows, ctx.series, 1, DATES[1]);
+  const nav1 = navAt(rows, ctx.series, 3, DATES[3]);
+  assert.ok(Math.abs(port[0] - (nav1 / nav0 - 1)) < 1e-12, 'port must BE the NAV ratio');
+  // +10% and -10% cancel, so the book is flat. A plan-based reading would have
+  // priced CCC, which was never bought, at (0.10 - 0.10 + 0.50) / 3 = +16.67%.
+  assert.ok(Math.abs(port[0]) < 1e-9, `expected flat, got ${(port[0] * 100).toFixed(3)}%`);
+});
+
+t('a PARTIAL fill leaves the rest in cash and earns nothing on it', () => {
+  // Two of four intended names filled: half the book deployed, half idle.
+  const ctx = makeCtx({ AAA: move(100, 120), BBB: move(100, 120) });
+  const rows = [pos('AAA', DATES[1], 100, 0.25), pos('BBB', DATES[1], 100, 0.25)];
+  const { port } = periodReturns(ctx, LOG, rows);
+  // Deployed half at +20% is about +10% on the book. An unweighted mean over
+  // the filled names would have said +20%, reinvesting the idle cash.
+  assert.ok(port[0] > 0.095 && port[0] < 0.105, `expected about +10%, got ${(port[0] * 100).toFixed(3)}%`);
+});
+
+t('a position that failed to SELL still counts — it used to vanish', () => {
+  // STUCK is absent from every target_json, so a plan-based reading is blind to
+  // it. It is in the ledger, so the NAV sees the loss.
+  const ctx = makeCtx({ STUCK: move(100, 80) });
+  const rows = [pos('STUCK', DATES[0], 100, 1.0)];
+  const { port } = periodReturns(ctx, LOG, rows);
+  assert.ok(port[0] < -0.19 && port[0] > -0.21, `expected about -20%, got ${(port[0] * 100).toFixed(3)}%`);
+});
+
+t('a HALTED holding is marked at its last real close, not dropped', () => {
+  const ctx = makeCtx({ HALT: [
+    { open: 100, close: 100 }, { open: 100, close: 100 },
+    { open: 70, close: 70 }, { open: 0, close: null },
+  ] });
+  const rows = [pos('HALT', DATES[0], 100, 1.0)];
+  const { port } = periodReturns(ctx, LOG, rows);
+  assert.ok(port[0] < -0.29 && port[0] > -0.31, `expected about -30% from the last real close, got ${(port[0] * 100).toFixed(3)}%`);
 });
 
 t('the ledger ignores a planned name that never filled', () => {
   const ctx = makeCtx({ AAA: move(100, 100), GHOST: move(100, 300) });
   const log = LOG.map(l => ({ ...l, target_json: '["AAA","GHOST"]' }));
-  const rows = [{ ticker: 'AAA', entry_date: DATES[1], exit_date: null, weight: 0.5 }];
+  const rows = [pos('AAA', DATES[1], 100, 0.5)];
   const { port } = periodReturns(ctx, log, rows);
-  assert.strictEqual(port[0], 0, 'GHOST was planned but never filled and must contribute nothing');
+  assert.ok(Math.abs(port[0]) < 1e-9, 'GHOST was planned, never filled, and must contribute nothing');
 });
 
-t('a PARTIAL fill earns nothing on the unfilled slice — the old mean reinvested it', () => {
-  // Two of four intended names filled, so recorded weights sum to 0.5.
-  const ctx = makeCtx({ AAA: move(100, 120), BBB: move(100, 120) });
-  const rows = [
-    { ticker: 'AAA', entry_date: DATES[1], exit_date: null, weight: 0.25 },
-    { ticker: 'BBB', entry_date: DATES[1], exit_date: null, weight: 0.25 },
-  ];
-  const { port } = periodReturns(ctx, LOG, rows);
-  // Half the book at +20% is +10%. An unweighted mean over the filled names
-  // would have said +20%, silently reinvesting the idle cash.
-  assert.ok(Math.abs(port[0] - 0.10) < 1e-9, `expected +10%, got ${(port[0] * 100).toFixed(2)}%`);
+console.log('\ncashAt / navAt — the book cannot spend what it does not have');
+
+t('cash falls by the cost basis and rises by the proceeds', () => {
+  const rows = [pos('A', DATES[1], 100, 0.4, DATES[3], 150)];
+  assert.ok(Math.abs(cashAt(rows, DATES[0]) - 1.0) < 1e-12, 'before entry the book is all cash');
+  assert.ok(Math.abs(cashAt(rows, DATES[1]) - 0.6) < 1e-12, 'entry removes exactly the cost basis');
+  const after = cashAt(rows, DATES[3]);
+  assert.ok(after > 0.6, 'a profitable exit must return more than it cost');
 });
 
-t('a position that failed to SELL still counts — it used to vanish', () => {
-  // STUCK is absent from every target_json (it is what the strategy wanted out
-  // of), so the plan-based version could never see it. It is in the ledger.
-  const ctx = makeCtx({ STUCK: move(100, 80) });
-  const rows = [{ ticker: 'STUCK', entry_date: DATES[0], exit_date: null, weight: 1.0 }];
-  const { port } = periodReturns(ctx, LOG, rows);
-  assert.ok(Math.abs(port[0] - (-0.20)) < 1e-9, `expected -20%, got ${(port[0] * 100).toFixed(2)}%`);
+t('a realized LOSS shrinks the book, so the next allocation shrinks with it', () => {
+  // This is review P0.5. Under the old rule capacity was 1 - committedWeight,
+  // which is blind to realized P&L: after this loss it would still authorise a
+  // full notional 1.0 against a NAV of 0.8, funded by nothing.
+  const ctx = makeCtx({ A: move(100, 100) });
+  const rows = [pos('A', DATES[0], 100, 1.0, DATES[1], 80)];
+  const cash = cashAt(rows, DATES[1]);
+  assert.ok(cash < 0.81 && cash > 0.79, `expected about 0.80 of book left, got ${cash.toFixed(4)}`);
+  const nav = navAt(rows, ctx.series, 1, DATES[1]);
+  assert.ok(Math.abs(nav - cash) < 1e-12, 'with nothing held, NAV is cash');
 });
 
-t('a HALTED holding is marked at its last real close, not dropped', () => {
-  // No print on the final bar. The old code required p1 > 0 and skipped the
-  // name, so a position going untradeable contributed 0.00% instead of a loss.
-  const ctx = makeCtx({ HALT: [
-    { open: 100, close: 100 }, { open: 100, close: 100 },
-    { open: 70, close: 70 }, { open: 0, close: null },
-  ] });
-  const rows = [{ ticker: 'HALT', entry_date: DATES[0], exit_date: null, weight: 1.0 }];
-  const { port } = periodReturns(ctx, LOG, rows);
-  assert.ok(Math.abs(port[0] - (-0.30)) < 1e-9, `expected -30% from the last real close, got ${(port[0] * 100).toFixed(2)}%`);
+t('NAV is cash plus the marked value of what is held', () => {
+  const ctx = makeCtx({ A: move(100, 200) });
+  const rows = [pos('A', DATES[1], 100, 0.5)];
+  const nav = navAt(rows, ctx.series, 3, DATES[3]);
+  const expected = 0.5 + (0.5 * (1 - BUY_COST) / 100) * 200;
+  assert.ok(Math.abs(nav - expected) < 1e-12, `got ${nav}, expected ${expected}`);
 });
 
-t('a position entered AFTER the window opens earns nothing in it, but still pays to enter', () => {
-  // Entering ON the closing boundary is the boundary case worth pinning: the
-  // name contributes no price return to this period because it was not held
-  // through any of it, yet the entry cost is real and lands here.
-  const ctx = makeCtx({ LATE: move(100, 200) });
-  const rows = [{ ticker: 'LATE', entry_date: DATES[3], exit_date: null, weight: 1.0 }];
-  const { port } = periodReturns(ctx, LOG, rows);
-  assert.ok(Math.abs(port[0] - (-0.0020)) < 1e-9,
-    `expected only the buy cost and none of the +100% move, got ${port[0]}`);
-});
-
-t('a position exited BEFORE the window opens is not counted in it', () => {
-  const ctx = makeCtx({ GONE: move(100, 200) });
-  const rows = [{ ticker: 'GONE', entry_date: DATES[0], exit_date: DATES[1], weight: 1.0 }];
-  const { port } = periodReturns(ctx, LOG, rows);
-  assert.strictEqual(port[0], 0);
-});
-
-console.log('\nperiodReturns — costs come from events that happened');
-
-t('an entry at the period boundary is charged the buy cost', () => {
-  const ctx = makeCtx({ NEW: flat(100) });
-  const rows = [{ ticker: 'NEW', entry_date: DATES[3], exit_date: null, weight: 1.0 }];
-  const { port } = periodReturns(ctx, LOG, rows);
-  assert.ok(Math.abs(port[0] - (-0.0020)) < 1e-9, `expected the 0.20% buy cost, got ${port[0]}`);
-});
-
-t('an exit at the period boundary is charged the sell cost', () => {
-  const ctx = makeCtx({ OUT: flat(100) });
-  const rows = [{ ticker: 'OUT', entry_date: DATES[0], exit_date: DATES[3], weight: 1.0 }];
-  const { port } = periodReturns(ctx, LOG, rows);
-  // Held flat through the window, sold at the boundary: only the sell cost.
-  assert.ok(Math.abs(port[0] - (-0.0030)) < 1e-9, `expected the 0.30% sell cost, got ${port[0]}`);
-});
-
-t('re-entering from flat is NOT free — the old churn term made it so', () => {
-  // The previous book was empty, so `book.length ? ... : 0` gave churn 0 and
-  // charged nothing for putting the whole portfolio back on.
-  const ctx = makeCtx({ A: flat(100), B: flat(100) });
-  const rows = [
-    { ticker: 'A', entry_date: DATES[3], exit_date: null, weight: 0.5 },
-    { ticker: 'B', entry_date: DATES[3], exit_date: null, weight: 0.5 },
-  ];
-  const { port, avgTurnover } = periodReturns(ctx, LOG, rows);
-  assert.ok(port[0] < 0, 'entering a full book must cost something');
-  assert.ok(Math.abs(avgTurnover - 1.0) < 1e-9, `turnover should be the full book, got ${avgTurnover}`);
+t('a compounded weighted return and the NAV path disagree — the NAV path wins', () => {
+  // The reviewer's own example: half stock, half cash, stock 100 -> 200 -> 300.
+  // Weights fixed at entry compound to 1.875; the actual book is 2.00.
+  const dates = ['d0', 'd1', 'd2', 'd3'];
+  const series = new Map([['S', { open: [100, 100, 200, 300], high: [100, 100, 200, 300], close: [100, 100, 200, 300], value: [1, 1, 1, 1], dn0: [0, 0, 0, 0], dn0Raw: [0, 0, 0, 0] }]]);
+  const rows = [{ ticker: 'S', entry_date: dates[1], exit_date: null, units: 0.005, cost_basis: 0.5, proceeds: null }];
+  const navMid = 0.5 + 0.005 * 200;      // 1.5
+  const navEnd = 0.5 + 0.005 * 300;      // 2.0
+  assert.ok(Math.abs(navAt(rows, series, 2, dates[2]) - navMid) < 1e-12);
+  assert.ok(Math.abs(navAt(rows, series, 3, dates[3]) - navEnd) < 1e-12);
+  // The old method: +50% then +25%, compounding to 1.875 rather than 2.00.
+  assert.ok(Math.abs(1.5 * 1.25 - 1.875) < 1e-12);
+  assert.notStrictEqual(navEnd, 1.875);
 });
 
 console.log('\nperiodReturns — regime labels');
 
 t('regimes come from the recorded label, never from the reason string', () => {
-  // INSUFFICIENT_UNIVERSE is a data outage. Deriving the label from `reason`
-  // made an outage count as a market regime, which is what let the 3-regime
-  // gate be satisfied only by something being broken (review P1.1).
   const ctx = makeCtx({ A: flat(100) });
   const log = [
     { as_of_date: DATES[0], exposure: 1, reason: 'INSUFFICIENT_UNIVERSE (3 < 20) — book unchanged', regime_label: 'BULL', target_json: '[]' },

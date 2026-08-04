@@ -961,6 +961,36 @@ This is consistent with EXP-020's decomposition, which found the 52-week-high ra
 
 ---
 
+## EXP-2026-08-04-022 — Correction to EXP-021: weight-based accounting overstated the return by 2.67 points
+
+EXP-021 was measured one day before the ledger became self-financing. It recorded a WEIGHT fixed at entry, which cannot express a portfolio — weights do not drift with price, so a book that doubles still reports the weights it opened with. The 2026-08-04 12:33 review gave the worked example: half stock and half cash, stock 100 → 200 → 300, actual NAV 1.00 → 1.50 → **2.00**, but compounding the per-period weighted returns (+50%, then +25%) gives **1.875**.
+
+The ledger now records units and cash flows. NAV is cash plus units times price, period return is `NAV[t] / NAV[t-1] − 1`, and that single series feeds the gate, the information ratio and the drawdown. Costs need no separate term: a buy leaves cash as cost basis and returns fewer units, a sell returns proceeds already net of fees, so fees are inside the NAV path by construction — the old code added an explicit cost term on top of a weighted price move, which double-counted in some periods and missed entirely in others.
+
+Same window, same decisions, same 90 fills:
+
+| | EXP-021 (weight-based) | corrected (self-financing) |
+|---|---|---|
+| Portfolio return | +3.28% | **+0.61%** |
+| Eligible universe | +3.57% | +3.57% |
+| **Excess vs universe** | −0.29% | **−2.96%** |
+| Excess vs IHSG | +16.85% | +14.17% |
+| Information ratio vs universe | −0.05 | **−0.11** |
+| Max drawdown | 19.92% | 20.54% |
+| Profit factor | 1.06 | 1.06 |
+
+**The weight-based figures were 2.67 points too generous.** EXP-021's conclusion is unchanged in direction and stronger in degree: over 20.5 months the strategy trailed the universe it selects from, now by 2.96 points rather than 0.29, with a negative information ratio.
+
+The +14.17% against IHSG remains real and remains almost entirely the SCREEN plus the regime timing, not the stock picking — the set of names that merely passed the screen returned +3.57% while the index fell 13.57%.
+
+A second defect the same rewrite fixed: buying capacity was `1 − committedWeight`, which is blind to realized P&L. After a 20% realized loss the system would still authorise a full notional 1.0 against a NAV of 0.80 — 125% leverage funded by nothing. Buying is now limited by cash that exists, and `mark` prints a loud warning if cash ever goes negative.
+
+**Caveats are unchanged from EXP-021** and still large: REPLAY not live, a different window from EXP-020, the universe leg is fully invested while the strategy stands aside 45% of the time so this bundles selection with timing, and ingest-level survivorship is untouched.
+
+**Status**: supersedes EXP-021's numbers. EXP-021 is left in place per the append-only convention; read this entry for the figures.
+
+---
+
 ## Open follow-ups (not yet done)
 
 - **Re-run EXP-001 through EXP-010 on 10-year data under both horizons** — this is now the highest-value open item. The headline finding ("AWO Full is worse than random entry") was established on a single ~2-year regime with a 15-bar exit; both of those constraints are gone. Report SWING and POSITION side by side rather than replacing one with the other, and label everything survivorship-biased.
