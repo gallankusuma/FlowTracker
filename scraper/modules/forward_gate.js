@@ -32,7 +32,7 @@ const GATE = {
   minDistinctRegimes: 3,       // must have been tested in more than one market
   minFills: 50,                // execution realism, NOT a statistical sample size
   minProfitFactor: 1.10,
-  minExcessReturn: 0,          // must beat buy-and-hold IHSG after costs
+  minExcessReturn: 0,          // vs the ELIGIBLE UNIVERSE after costs, not vs IHSG (review P0.5)
 };
 
 /**
@@ -139,7 +139,13 @@ function evaluateForwardGate(m, gate = GATE) {
     // the old promote gate pass an uncomputed profit factor. Never rely on it.
     { name: 'profit factor', actual: m.profitFactor, required: gate.minProfitFactor,
       pass: m.profitFactor !== null && m.profitFactor !== undefined && m.profitFactor >= gate.minProfitFactor },
-    { name: 'excess return over IHSG, net of costs', actual: m.excessReturn, required: gate.minExcessReturn,
+    // PRIMARY BENCHMARK IS THE ELIGIBLE UNIVERSE, not the index (review P0.5).
+    // The strategy has already screened for liquidity, price-history depth and
+    // broker coverage, so beating IHSG can come entirely from that SCREEN while
+    // the SELECTION adds nothing. Measuring against the set the names were
+    // chosen FROM is what isolates the choice. `excessVsIndex` is carried
+    // through for reporting and deliberately does not gate.
+    { name: 'excess over the eligible universe, net of costs', actual: m.excessReturn, required: gate.minExcessReturn,
       pass: m.excessReturn !== null && m.excessReturn !== undefined && m.excessReturn > gate.minExcessReturn },
   ];
   const failed = criteria.filter(c => !c.pass);

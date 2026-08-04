@@ -114,7 +114,7 @@ t('a null profit factor also fails', () => {
 
 t('a null excess return fails rather than being treated as zero', () => {
   const r = fg.evaluateForwardGate({ ...PASSING, excessReturn: null });
-  assert.ok(r.failed.includes('excess return over IHSG, net of costs'));
+  assert.ok(r.failed.includes('excess over the eligible universe, net of costs'));
 });
 
 t('exactly matching the benchmark is not enough — excess must be strictly positive', () => {

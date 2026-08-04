@@ -60,14 +60,28 @@ const REBAL_BARS = 10;                       // biweekly — the frozen configur
 const PARAMS = { positions: 8, bufferMult: 2, vetoFrac: 0.20, exitOnVeto: true };
 const BUY_COST = 0.20 / 100, SELL_COST = 0.30 / 100;
 
+const MODEL_VERSION = process.env.AWO_MODEL_VERSION || '1.0.0-forward';
+
 /**
- * Identity of the exact strategy configuration a row was produced by. If any
- * of this changes, rows written before and after are not the same track record
- * and must not be pooled — the same lesson candidateKeyFromWeights encodes for
- * the AWO paper trader.
+ * Identity of the exact strategy configuration a row was produced by. If any of
+ * it changes, rows written before and after are not the same track record and
+ * must not be pooled.
+ *
+ * FIXED 2026-08-04 (review P0.4). This used to hash STRATEGY_ID, REBAL_BARS,
+ * the four explicit PARAMS and the two costs — and nothing from
+ * strategy_book.DEFAULTS. So minAdv, hiBars, minHiWindowBars, requirePosfrac,
+ * posfracWindow, regimeSma, minEligible and advWindow could all change without
+ * the hash moving, and records from materially different strategies would pool
+ * into one track record. That was not hypothetical: minHiWindowBars and
+ * requirePosfrac were BOTH ADDED on 2026-08-03, and the hash did not notice.
+ *
+ * It now hashes the full effective configuration — the merge that is actually
+ * passed to targetBook, so a default that changes upstream in strategy_book.js
+ * changes the hash here without anyone remembering to update a list.
  */
+const EFFECTIVE_CONFIG = { ...sb.DEFAULTS, ...PARAMS, rebalanceBars: REBAL_BARS, buyCost: BUY_COST, sellCost: SELL_COST, modelVersion: MODEL_VERSION };
 const STRATEGY_HASH = crypto.createHash('sha256')
-  .update(JSON.stringify({ id: STRATEGY_ID, rebal: REBAL_BARS, params: PARAMS, buy: BUY_COST, sell: SELL_COST }))
+  .update(JSON.stringify({ id: STRATEGY_ID, cfg: Object.keys(EFFECTIVE_CONFIG).sort().map(k => [k, EFFECTIVE_CONFIG[k]]) }))
   .digest('hex').slice(0, 16);
 
 function codeCommit() {
@@ -795,7 +809,7 @@ function barPrice(s, j) {
  */
 function periodReturns(ctx, logRows, positionRows = []) {
   const { dateIdx, tradingDates, series, ihsgClose } = ctx;
-  const port = [], bench = [], regimes = [];
+  const port = [], bench = [], universe = [], regimes = [];
   let turnoverTotal = 0;
 
   for (let k = 0; k < logRows.length - 1; k++) {
@@ -836,6 +850,22 @@ function periodReturns(ctx, logRows, positionRows = []) {
     }
     turnoverTotal += turnover;
 
+    // PRIMARY BENCHMARK: the point-in-time eligible universe, equal-weighted
+    // (review P0.5). IHSG alone is the wrong bar to clear -- this strategy has
+    // already screened for liquidity, price-history depth and broker coverage,
+    // so beating IHSG can come entirely from the SCREEN while the SELECTION adds
+    // nothing. Measuring against the set the names were chosen FROM is what
+    // isolates the choice. Reported alongside IHSG, not instead of it.
+    const elig = sb.crossSection(series, ia, PARAMS);
+    const eligRets = [];
+    for (const r of elig) {
+      const s2 = series.get(r.ticker);
+      const q0 = barPrice(s2, execA), q1 = barPrice(s2, execB);
+      if (!(q0 > 0) || !(q1 > 0)) continue;
+      eligRets.push(q1 / q0 - 1);
+    }
+    universe.push(eligRets.length ? eligRets.reduce((x, y) => x + y, 0) / eligRets.length : 0);
+
     // No `* exposure` factor: standing flat already produces 0 because no rows
     // are open. Multiplying would have zeroed a retained no-fill position during
     // a REGIME_FLAT period, hiding exactly the exposure we failed to shed.
@@ -843,31 +873,40 @@ function periodReturns(ctx, logRows, positionRows = []) {
     bench.push(ihsgClose[execB] / ihsgClose[execA] - 1);
     regimes.push(String(a.regime_label || a.reason || '').split(' ')[0]);
   }
-  return { port, bench, regimes, avgTurnover: port.length ? turnoverTotal / port.length : 0 };
+  return { port, bench, universe, regimes, avgTurnover: port.length ? turnoverTotal / port.length : 0 };
 }
 
 async function reportFor(pool, ctx, runMode) {
+  // EVERY QUERY IS SCOPED TO THE CURRENT strategy_hash (review P0.4). The code
+  // comments have always insisted records from different configurations must
+  // not be pooled; nothing enforced it, because reportFor filtered on
+  // strategy_id and run_mode only. Rows written under an older configuration
+  // are not silently dropped — `otherHashes` below reports them, so an empty
+  // record reads as "the configuration changed" rather than "nothing happened".
+  const HASH = [STRATEGY_ID, runMode, STRATEGY_HASH];
   const [logRows] = await pool.query(
-    'SELECT as_of_date, exposure, reason, target_json, opened, closed FROM ft_strategy_log WHERE strategy_id=? AND run_mode=? ORDER BY as_of_date',
-    [STRATEGY_ID, runMode]);
+    'SELECT as_of_date, exposure, reason, target_json, opened, closed FROM ft_strategy_log WHERE strategy_id=? AND run_mode=? AND strategy_hash=? ORDER BY as_of_date', HASH);
   const [closedRows] = await pool.query(
-    'SELECT net_pct, exit_date FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND status=?',
-    [STRATEGY_ID, runMode, 'CLOSED']);
+    "SELECT net_pct, exit_date FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=? AND status='CLOSED'", HASH);
   const [openRows] = await pool.query(
-    'SELECT ticker, entry_date, entry_price, weight FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND status=? ORDER BY entry_date',
-    [STRATEGY_ID, runMode, 'OPEN']);
+    "SELECT ticker, entry_date, entry_price, weight FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=? AND status='OPEN' ORDER BY entry_date", HASH);
   const [[fillsRow]] = await pool.query(
-    'SELECT COUNT(*) n FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=?', [STRATEGY_ID, runMode]);
+    'SELECT COUNT(*) n FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=?', HASH);
   // The full ledger, every status: this is what was ACTUALLY held (review P0.1).
   const [ledger] = await pool.query(
-    'SELECT ticker, entry_date, exit_date, weight, net_pct, status FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? ORDER BY entry_date',
-    [STRATEGY_ID, runMode]);
+    'SELECT ticker, entry_date, exit_date, weight, net_pct, status FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND strategy_hash=? ORDER BY entry_date', HASH);
+  const [otherHashes] = await pool.query(
+    `SELECT COALESCE(strategy_hash, '(none)') h, COUNT(*) n, MIN(entry_date) d0, MAX(entry_date) d1
+       FROM ft_strategy_positions WHERE strategy_id=? AND run_mode=? AND (strategy_hash IS NULL OR strategy_hash <> ?)
+      GROUP BY h ORDER BY n DESC`, HASH);
 
-  const { port, bench, regimes, avgTurnover } = periodReturns(ctx, logRows, ledger);
-  const eq = fg.compound(port), beq = fg.compound(bench);
+  const { port, bench, universe, regimes, avgTurnover } = periodReturns(ctx, logRows, ledger);
+  const eq = fg.compound(port), beq = fg.compound(bench), ueq = fg.compound(universe);
   const portRet = eq.length ? eq[eq.length - 1] - 1 : null;
   const benchRet = beq.length ? beq[beq.length - 1] - 1 : null;
+  const univRet = ueq.length ? ueq[ueq.length - 1] - 1 : null;
   const excess = (portRet !== null && benchRet !== null) ? portRet - benchRet : null;
+  const excessUniverse = (portRet !== null && univRet !== null) ? portRet - univRet : null;
 
   const dates = logRows.map(r => toDateStr(r.as_of_date));
   const months = dates.length >= 2
@@ -879,14 +918,16 @@ async function reportFor(pool, ctx, runMode) {
     distinctRegimes: fg.distinctRegimes(regimes),
     fills: fillsRow.n,
     profitFactor: fg.profitFactor(closedRows.map(r => r.net_pct)),
-    excessReturn: excess,
+    excessReturn: excessUniverse,          // PRIMARY: vs the set names were chosen from
+    excessVsIndex: excess,                 // secondary, reported not gated
   };
 
   return {
-    runMode, logRows, openRows, closedRows, m,
+    runMode, logRows, openRows, closedRows, m, otherHashes,
     liveStart: dates[0] || null, liveEnd: dates[dates.length - 1] || null,
-    portRet, benchRet, excess,
-    infoRatio: fg.informationRatio(port, bench, REBAL_BARS),
+    portRet, benchRet, univRet, excess, excessUniverse,
+    infoRatio: fg.informationRatio(port, universe, REBAL_BARS),
+    infoRatioIndex: fg.informationRatio(port, bench, REBAL_BARS),
     maxDD: eq.length ? fg.maxDrawdown(eq) : null,
     avgTurnover, periods: port.length,
   };
@@ -900,6 +941,15 @@ function printReport(r, ctx) {
   console.log(`\n${line}`);
   console.log(`${STRATEGY_ID}   run_mode=${r.runMode}   strategy_hash=${STRATEGY_HASH}   commit=${CODE_COMMIT || 'unknown'}`);
   console.log(line);
+
+  if (r.otherHashes && r.otherHashes.length) {
+    console.log('Records under a DIFFERENT configuration exist and are excluded (review P0.4):');
+    for (const o of r.otherHashes) {
+      console.log(`  strategy_hash ${o.h}   ${o.n} position(s)   ${o.d0 ? toDateStr(o.d0) : '?'} .. ${o.d1 ? toDateStr(o.d1) : '?'}`);
+    }
+    console.log('  They are a different strategy and must not be pooled with this one.');
+    console.log('');
+  }
 
   if (!r.logRows.length) {
     console.log(`No ${r.runMode} decisions recorded yet — every statistic below would be undefined, so none are shown.`);
@@ -916,9 +966,11 @@ function printReport(r, ctx) {
   console.log(`Distinct regimes        ${r.m.distinctRegimes}`);
   console.log('');
   console.log(`Portfolio return        ${pct(r.portRet)}   over ${r.periods} holding period(s), net of costs`);
-  console.log(`Benchmark (IHSG)        ${pct(r.benchRet)}`);
-  console.log(`Excess return           ${pct(r.excess)}`);
-  console.log(`Information ratio       ${num(r.infoRatio)}   (annualised; null when <2 periods or no dispersion)`);
+  console.log(`Eligible universe       ${pct(r.univRet)}   PRIMARY benchmark — the set these names were chosen from`);
+  console.log(`Excess vs universe      ${pct(r.excessUniverse)}   <- this is what the gate reads`);
+  console.log(`Benchmark (IHSG)        ${pct(r.benchRet)}   secondary`);
+  console.log(`Excess vs IHSG          ${pct(r.excess)}`);
+  console.log(`Information ratio       ${num(r.infoRatio)}   vs universe (annualised; null when <2 periods or no dispersion)`);
   console.log(`Maximum drawdown        ${r.maxDD === null ? 'n/a' : (r.maxDD * 100).toFixed(2) + '%'}`);
   console.log(`Average turnover        ${(r.avgTurnover * 100).toFixed(1)}% of the book per rebalance`);
   console.log(`Profit factor           ${num(r.m.profitFactor)}   (gross profit / gross loss, net %)`);
