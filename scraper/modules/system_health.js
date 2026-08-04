@@ -283,7 +283,7 @@ async function missingSessions(pool, {
  * is irreversible, and re-ingesting the affected range may be the better fix —
  * that is a decision, not a repair.
  */
-async function phantomSessions(pool, { table = 'idx_stock_prices', col = 'date' } = {}) {
+async function phantomSessions(pool, { table = 'idx_stock_prices', col = 'date', useIndexCalendar = true } = {}) {
   const [rows] = await pool.query(
     `SELECT ${col} AS d, COUNT(*) AS n,
             SUM(volume = 0 AND open_price = high_price AND high_price = low_price
@@ -291,6 +291,34 @@ async function phantomSessions(pool, { table = 'idx_stock_prices', col = 'date' 
             SUM(close_price) AS closeSum, SUM(volume) AS volSum,
             DAYOFWEEK(${col}) AS dow
        FROM ${table} GROUP BY ${col} ORDER BY ${col}`);
+
+  // NO_INDEX_BAR — the strongest signature, and the one the three heuristics
+  // below miss. ^JKSE is the exchange's own index: if it has no bar for a date,
+  // IDX did not trade, whatever the price table says. This catches the holidays
+  // whose price rows look ordinary enough to pass a flat-ratio test (2026-05-01,
+  // 2026-06-01 and 2026-06-16 carried 31 to 120 tickers of plausible-looking
+  // data for days the exchange was shut).
+  //
+  // Bounded to the index series' own range on purpose: outside it, absence of a
+  // bar says nothing. And it is a WEAKER claim than the others in one specific
+  // way — if the INDEX series itself has a hole, a real session would be flagged.
+  // Callers repair index gaps before trusting this, and the label is reported
+  // separately so that judgement stays visible rather than baked in.
+  let indexed = null;
+  if (useIndexCalendar) {
+    try {
+      const [[b]] = await pool.query('SELECT MIN(date) lo, MAX(date) hi FROM idx_ihsg_history');
+      if (b.lo && b.hi) {
+        const [idx] = await pool.query('SELECT date FROM idx_ihsg_history');
+        indexed = {
+          lo: b.lo, hi: b.hi,
+          set: new Set(idx.map(r => (r.date instanceof Date
+            ? `${r.date.getFullYear()}-${String(r.date.getMonth() + 1).padStart(2, '0')}-${String(r.date.getDate()).padStart(2, '0')}`
+            : String(r.date).slice(0, 10)))),
+        };
+      }
+    } catch { /* no index series: fall back to the heuristics alone */ }
+  }
 
   const iso = d => (d instanceof Date
     ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
@@ -310,7 +338,12 @@ async function phantomSessions(pool, { table = 'idx_stock_prices', col = 'date' 
         Number(prev.closeSum) === Number(r.closeSum) &&
         Number(prev.volSum) === Number(r.volSum)) signatures.push('DUPLICATE_OF_PRIOR');
 
-    if (signatures.length) out.push({ date: iso(r.d), rows: n, signatures });
+    const d = iso(r.d);
+    if (indexed && d >= iso(indexed.lo) && d <= iso(indexed.hi) && !indexed.set.has(d)) {
+      signatures.push('NO_INDEX_BAR');
+    }
+
+    if (signatures.length) out.push({ date: d, rows: n, signatures });
   }
   return out;
 }

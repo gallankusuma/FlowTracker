@@ -216,6 +216,31 @@ async function checkPhantomSessions(pool) {
   return phantom.map(p => p.date);
 }
 
+/* ── check 1c: real sessions the price table is missing ────────────────────
+   The mirror of the gap check, and it only became meaningful once the phantom
+   rows were purged on 2026-08-04: eight of those dates had genuine ^JKSE bars
+   with real volume, so the exchange DID trade and the price rows were a scraper
+   failure rather than a holiday. Deleting them was right — an absent bar is
+   honest where a fabricated flat one is not — but it leaves real holes, and a
+   hole nothing looks for is how this all started. Not auto-repaired: back-filling
+   per-stock OHLC for 2018 needs a historical source this system does not have. */
+async function checkPriceGaps(pool) {
+  line('\nPrice series — trading sessions the index has and prices do not');
+  const gaps = await sh.missingSessions(pool, {
+    table: 'idx_stock_prices', col: 'date', reference: 'idx_ihsg_history', referenceCol: 'date',
+    days: 4000,
+  });
+  if (!gaps.missing.length) { line(`  ok — ${gaps.checked} sessions, all present`); return; }
+
+  line(`  ${gaps.missing.length} session(s) with an index bar but no prices:`);
+  line(`    ${gaps.missing.join(', ')}`);
+  report({
+    level: 'WARN',
+    what: `${gaps.missing.length} trading session(s) missing from idx_stock_prices`,
+    detail: `${gaps.missing.join(', ')}. The index traded on these days. Not auto-repaired: back-filling per-stock OHLC for these dates needs a historical source this system does not have.`,
+  });
+}
+
 /* ── check 2: the forward test's nightly stages ────────────────────────────
    fill/plan/mark are idempotent by construction (`plan already exists — never
    recomputed`), so re-running a stage that died is safe. */
@@ -372,6 +397,7 @@ async function main() {
     // until it knows which dates were never sessions.
     const phantomDates = await checkPhantomSessions(pool);
     await checkIhsgGaps(pool, phantomDates);
+    await checkPriceGaps(pool);
     await checkFreshness(pool);
     await checkForwardStages(pool);
     await checkVirtualPortfolio(pool);
@@ -416,7 +442,7 @@ async function main() {
   }
 }
 
-module.exports = { checkIhsgGaps, checkPhantomSessions, checkForwardStages, checkVirtualPortfolio, RECUR_THRESHOLD, RECUR_WINDOW };
+module.exports = { checkIhsgGaps, checkPhantomSessions, checkPriceGaps, checkForwardStages, checkVirtualPortfolio, RECUR_THRESHOLD, RECUR_WINDOW };
 
 if (require.main === module) {
   main().catch(e => {
