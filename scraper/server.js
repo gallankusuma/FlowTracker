@@ -4772,34 +4772,18 @@ function computeForeignDivergence(foreignBuy, foreignSell, domesticBuy, domestic
 
 const { computeConvictionTier, detectMarketDirection } = require('./modules/conviction');
 const { fetchYahooCandles, fetchYahooLiveQuote, yfCache } = require('./yahoo-candles');
+const ihsgModule = require('./modules/ihsg');
 
 // ─── IHSG (Jakarta Composite Index) — real macro regime context ─────────────
 // Top-level (not inside main()) so routes registered after main() — like
 // /api/signal-scanner — can actually see these via hoisting.
 async function fetchAndCacheIHSG() {
-  const [[latestRow]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
-  const latest = latestRow?.d ? String(latestRow.d).split('T')[0] : null;
-  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
-  if (latest && latest >= yesterday) return { skipped: true, latest };
-
-  const { candles } = await fetchYahooCandles('^JKSE', '2y');
-  if (!candles.length) return { skipped: true, error: 'no data from Yahoo' };
-
-  const values = [];
-  for (let i = 0; i < candles.length; i++) {
-    const c = candles[i];
-    const prevClose = i > 0 ? candles[i - 1].close : c.close;
-    const changePct = prevClose > 0 ? ((c.close - prevClose) / prevClose) * 100 : 0;
-    values.push([c.date, c.open, c.high, c.low, c.close, c.volume, Math.round(changePct * 10000) / 10000]);
-  }
-  const [result] = await pool.query(
-    `INSERT INTO idx_ihsg_history (date, open_price, high_price, low_price, close_price, volume, change_pct)
-     VALUES ?
-     ON DUPLICATE KEY UPDATE open_price=VALUES(open_price), high_price=VALUES(high_price),
-       low_price=VALUES(low_price), close_price=VALUES(close_price), volume=VALUES(volume), change_pct=VALUES(change_pct)`,
-    [values]
-  );
-  return { saved: result.affectedRows, candles: candles.length };
+  // Delegates to modules/ihsg.js so the scheduled refresh and this on-request
+  // one cannot drift apart — the same reason strategy_book.js is shared between
+  // the backtest and the live recorder. The partial-bar guard lives there too:
+  // this used to write Yahoo's provisional intraday candle straight in, so
+  // between 09:00 and 16:00 WIB the series could hold a close that was not one.
+  return ihsgModule.refreshIHSG(pool, fetchYahooCandles);
 }
 
 function toDateStr(d) { return d instanceof Date ? d.toISOString().split('T')[0] : String(d).split('T')[0]; }

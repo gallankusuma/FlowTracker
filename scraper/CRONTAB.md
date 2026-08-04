@@ -81,6 +81,31 @@ manual equivalent if a specific date ever needs recomputing.
  0  9   * * 1-5   paper_trader.py settle idx                    # 16:00 WIB
 ```
 
+### IHSG index history — `idx_ihsg_history`
+```
+10 13 * * 1-5   node refresh_ihsg.js                           # 20:10 WIB
+```
+Added 2026-08-04, and it runs BEFORE the forward cycle below on purpose: the
+200-day SMA regime filter reads this table, and a plan decided on a stale index
+is a plan decided on the wrong regime.
+
+Until this existed the series had no scheduled refresh at all. `fetchAndCacheIHSG()`
+lived in server.js and ran only when someone hit `/api/ihsg`, `/api/ihsg-factors`,
+`/api/signal-scanner` or POSTed `/api/sectors/pull-broker` — and no cron entry
+calls an HTTP endpoint, so freshness depended on a human opening a page.
+
+It was worse than that. The function compared `String(dateColumn).split('T')[0]`
+— which on a Date yields `"Fri Jul 31 2026 07:00:00 GM"`, with no `T` to split
+on — against an ISO date. Weekday names start with letters, letters sort above
+digits, so the guard was true for any existing row and the function returned
+`{ skipped: true }` every time it was called. The data in the table came from a
+manual backfill, which is why it stopped on the day that backfill ran.
+
+A separate process rather than a step inside server.js's nightly job,
+deliberately: that job would carry it fine right up until the PM2 process is
+unhealthy, which is exactly when a stale regime filter does the most damage.
+The script exits non-zero if the series is still behind `idx_stock_prices`.
+
 ### EXP-017 forward paper test — `ft_strategy_plan` / `ft_strategy_positions` / `ft_strategy_log` / `ft_strategy_nav`
 ```
 15 13 * * 1-5   node strategy_forward.js fill                  # 20:15 WIB
