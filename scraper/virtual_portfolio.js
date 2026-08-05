@@ -43,6 +43,7 @@ require('dotenv').config();
 const mysql = require('mysql2/promise');
 const vb = require('./modules/virtual_broker');
 const sb = require('./modules/strategy_book');
+const charter = require('./modules/virtual_charter');
 
 const DB = {
   host: process.env.DB_HOST || 'localhost',
@@ -53,9 +54,23 @@ const DB = {
 
 const SOURCE_STRATEGY = 'HI52W_REGIME_BROKERVETO_V1';
 
+/**
+ * THE OFFICIAL V2 ACCOUNTS.
+ *
+ * Renamed from POSITION_100M / INTRADAY_EOD_100M on 2026-08-05, deliberately.
+ * Those were development accounts: they existed while the session calendar, the
+ * missing-bar blocking, the retirement unwind and the migration guards were
+ * still being written. They traded nothing, but "it happened to hold no
+ * positions" is a weak reason to call a record official. The rename makes the
+ * separation structural rather than a matter of trust — the old rows retire,
+ * these start from Rp100 juta, and no query can accidentally pool them.
+ *
+ * Their identity and their pass/fail criteria are frozen in `virtual_charter`
+ * BEFORE any result exists. See modules/virtual_charter.js.
+ */
 const ACCOUNTS = [
-  { code: 'POSITION_100M', exitPolicy: vb.EXIT_POLICIES.POSITION },
-  { code: 'INTRADAY_EOD_100M', exitPolicy: vb.EXIT_POLICIES.INTRADAY_EOD },
+  { code: 'POSITION_100M_V2', exitPolicy: vb.EXIT_POLICIES.POSITION },
+  { code: 'INTRADAY_EOD_100M_V2', exitPolicy: vb.EXIT_POLICIES.INTRADAY_EOD },
 ];
 
 const toDateStr = d => d instanceof Date
@@ -282,6 +297,41 @@ async function setup(pool, quiet = false) {
        vb.DEFAULT_CONFIG.startingCash, vb.DEFAULT_CONFIG.startingCash, vb.DEFAULT_CONFIG.startingCash]);
   }
 
+  // Freeze the charter for each identity — the official start date and the
+  // evaluation gate, written once, before any trade exists. A gate agreed after
+  // seeing the results is not a gate.
+  await charter.ensureTable(pool);
+  const [[firstSession]] = await pool.query(
+    'SELECT MIN(date) d FROM idx_ihsg_history WHERE date > CURDATE()')
+    .catch(() => [[{ d: null }]]);
+  const [[latestSession]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+  // The next session if the calendar already has one, otherwise the latest —
+  // recorded honestly either way rather than guessing at a future date.
+  const officialStart = toDateStr(firstSession?.d) || toDateStr(latestSession?.d);
+
+  for (const a of ACCOUNTS) {
+    const r = await charter.freezeCharter(pool, {
+      accountCode: a.code, strategyId: SOURCE_STRATEGY, strategyHash: stratHash,
+      executionPolicyHash: vb.executionPolicyHash({}, a.exitPolicy),
+      configVersion: vb.DEFAULT_CONFIG.version,
+      startingCapital: vb.DEFAULT_CONFIG.startingCash,
+      officialStartDate: officialStart, exitPolicy: a.exitPolicy,
+    });
+    if (quiet) continue;
+    if (r.frozen) {
+      console.log(`CHARTER  ${a.code} frozen — start ${officialStart}, commit ${r.charter.code_commit || 'unknown'}`);
+      console.log(`         gate: ${JSON.parse(r.charter.gate_json).kind}, ` +
+        `${JSON.parse(r.charter.gate_json).minTradingDays} days / ${JSON.parse(r.charter.gate_json).minClosedTrades} trades minimum`);
+    } else if (r.gateDrift) {
+      // The code's gate no longer matches the frozen one. The frozen one wins;
+      // this is the whole point of freezing it. Say so loudly rather than
+      // silently honouring whichever copy the reader happens to look at.
+      console.log(`CHARTER  ** ${a.code}: the gate in code differs from the FROZEN gate.`);
+      console.log('         The frozen one stands. Changing the criteria requires a new');
+      console.log('         identity and an account that starts again from Rp100 juta.');
+    }
+  }
+
   await retireSupersededAccounts(pool, SOURCE_STRATEGY, quiet);
 }
 
@@ -349,14 +399,22 @@ async function retireSupersededAccounts(pool, strategyId, quiet = false) {
             (SELECT COUNT(*) FROM virtual_positions p WHERE p.account_id=a.id) positions
        FROM virtual_accounts a WHERE a.strategy_id=? AND a.status IN ('ACTIVE','RETIRING')`, [strategyId]);
 
+  // Three ways an account can be superseded, and the third was missing until
+  // 2026-08-05: an account whose CODE is no longer in the roster. Renaming
+  // POSITION_100M to POSITION_100M_V2 left the old row with identical hashes, so
+  // nothing retired it and both ran in parallel — the duplicate-account problem
+  // again, wearing a different hat.
+  const currentCodes = new Set(ACCOUNTS.map(a => a.code));
   const superseded = rows.filter(r =>
+    !currentCodes.has(r.account_code) ||
     !currentPolicies.has(r.execution_policy_hash) ||
     (stratHash !== 'UNSET' && r.strategy_hash !== stratHash));
 
   const changed = [];
   for (const r of superseded) {
+    const retired = !currentCodes.has(r.account_code);
     const policyChanged = !currentPolicies.has(r.execution_policy_hash);
-    const reason = policyChanged ? 'POLICY_CHANGE' : 'STRATEGY_CHANGE';
+    const reason = (retired || policyChanged) ? 'POLICY_CHANGE' : 'STRATEGY_CHANGE';
 
     // PENDING ORDERS ARE CANCELLED, NOT INHERITED.
     // An order scheduled under v1 and filled by v2's resolver would be recorded
@@ -382,7 +440,8 @@ async function retireSupersededAccounts(pool, strategyId, quiet = false) {
       changed.push({ ...r, newStatus: next });
     }
     if (quiet) continue;
-    const why = !currentPolicies.has(r.execution_policy_hash) ? 'the execution contract changed' : 'the strategy hash changed';
+    const why = retired ? 'this account code is no longer in the roster'
+      : policyChanged ? 'the execution contract changed' : 'the strategy hash changed';
     console.log(`SETUP  ${r.account_code} -> ${next} (policy ${r.execution_policy_hash}, strategy ${r.strategy_hash}) — ${why}`);
     if (busy) {
       console.log(`       ${r.openPositions} position(s) still open.`);

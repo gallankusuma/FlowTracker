@@ -69,3 +69,6 @@ Revisi/
 # Per-machine Claude Code permissions. Not shared config, and it accumulates
 # literal commands — which is how the production VPS address ended up committed.
 .claude/settings.local.json
+
+# Written by the deploy, not by a developer: the commit a box is actually running.
+scraper/.deployed-commit

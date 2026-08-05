@@ -383,6 +383,111 @@ async function checkJobRegistry(pool) {
   }
 }
 
+/**
+ * BURN-IN — consecutive clean trading days, counted by the machine.
+ *
+ * The 2026-08-05 review asked for ten consecutive sessions with no manual
+ * database repair and no invariant failure, and for the count to RESTART on any
+ * bug. Counting that by hand is exactly the "remember to check" habit this
+ * watchdog exists to replace, and a streak a human maintains is a streak a human
+ * can be generous about.
+ *
+ * One row per session, written by the watchdog after everything else has run.
+ * The streak is derived by walking backwards until a failure — never stored as a
+ * number that could drift from the rows it summarises.
+ *
+ * A day with no data at all does not count as clean. Silence is not evidence.
+ */
+async function recordBurnIn(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS virtual_burnin (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      session_date DATE NOT NULL,
+      passed TINYINT(1) NOT NULL,
+      checks_json TEXT NULL,
+      failures_json TEXT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_session (session_date)
+    )`);
+
+  const [[sess]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+  const sessionDate = iso(sess?.d);
+  if (!sessionDate) { line('\nBurn-in — no session calendar yet, nothing to record'); return null; }
+
+  // The checklist the review specified, each answered from data rather than
+  // from whether a job claimed success.
+  const checks = {};
+  const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
+  checks.priceDataCurrent = iso(px?.d) === sessionDate;
+  checks.calendarCurrent = !(await sh.missingSessions(pool, { table: 'idx_ihsg_history', col: 'date' })).missing.length;
+
+  const [accts] = await pool.query(
+    `SELECT id, account_code, cash_balance, total_nav, performance_eligible
+       FROM virtual_accounts WHERE status IN ('ACTIVE','RETIRING')`);
+  checks.accountsExist = accts.length > 0;
+  checks.cashNonNegative = accts.every(a => Number(a.cash_balance) >= -1e-6);
+  checks.performanceEligible = accts.every(a => Number(a.performance_eligible) === 1);
+
+  const [[marked]] = await pool.query(
+    `SELECT COUNT(DISTINCT account_id) n FROM virtual_nav WHERE mark_date = ?`, [sessionDate]);
+  checks.navMarkedToday = accts.length > 0 && Number(marked.n) === accts.length;
+
+  const [[navOk]] = await pool.query(
+    `SELECT COUNT(*) bad FROM virtual_nav
+      WHERE mark_date = ? AND ABS(total_nav - (cash_value + market_value)) > 1`, [sessionDate]);
+  checks.navIdentityHolds = Number(navOk.bad) === 0;
+
+  const [[dupes]] = await pool.query(
+    `SELECT COUNT(*) n FROM (
+       SELECT order_id FROM virtual_positions GROUP BY order_id HAVING COUNT(*) > 1) x`);
+  checks.noDuplicateFills = Number(dupes.n) === 0;
+
+  const [[blockedRows]] = await pool.query(
+    `SELECT COUNT(*) n FROM virtual_trade_events WHERE event='DATA_BLOCKED' AND event_date=?`, [sessionDate]);
+  checks.noSkippedUnknownBar = Number(blockedRows.n) === 0;
+
+  let reconcileProblems = [];
+  try {
+    const vp = require('./virtual_portfolio');
+    reconcileProblems = await vp.cmdReconcile(pool, {});
+  } catch (e) { reconcileProblems = [`reconcile could not run: ${e.message}`]; }
+  checks.reconcileClean = reconcileProblems.length === 0;
+
+  checks.watchdogHealthy = !findings.some(f => f.level === 'FAIL' || f.level === 'RECURRING');
+
+  const failures = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);
+  if (reconcileProblems.length) failures.push(...reconcileProblems.map(p => `reconcile: ${p}`));
+  const passed = failures.length === 0;
+
+  await pool.query(
+    `INSERT INTO virtual_burnin (session_date, passed, checks_json, failures_json)
+     VALUES (?,?,?,?)
+     ON DUPLICATE KEY UPDATE passed=VALUES(passed), checks_json=VALUES(checks_json), failures_json=VALUES(failures_json)`,
+    [sessionDate, passed ? 1 : 0, JSON.stringify(checks), failures.length ? JSON.stringify(failures) : null]);
+
+  // Walk backwards. The streak is DERIVED, never stored — a stored counter can
+  // drift from the rows it claims to summarise, and only in the flattering
+  // direction.
+  const [rows] = await pool.query(
+    'SELECT session_date, passed FROM virtual_burnin ORDER BY session_date DESC');
+  let streak = 0;
+  for (const r of rows) { if (!Number(r.passed)) break; streak++; }
+
+  line('\nBurn-in');
+  line(`  session ${sessionDate}: ${passed ? 'CLEAN' : 'FAILED'}`);
+  for (const [k, v] of Object.entries(checks)) line(`    ${v ? 'ok  ' : '**  '}${k}`);
+  if (failures.length) for (const f of failures) line(`    -> ${f}`);
+  line(`  consecutive clean sessions: ${streak} of 10`);
+  if (!passed) {
+    line('  the count RESTARTS. Ten clean sessions means ten in a row, not ten in total.');
+    report({ level: 'FAIL', what: `burn-in session ${sessionDate} failed`, detail: failures.join('; ') });
+  } else if (streak >= 10) {
+    line('  TEN CONSECUTIVE CLEAN SESSIONS. Operationally stable.');
+    line('  This says nothing whatsoever about whether the strategy makes money.');
+  }
+  return { sessionDate, passed, streak, checks, failures };
+}
+
 async function main() {
   const pool = mysql.createPool({ ...DB, waitForConnections: true, connectionLimit: 5 });
   const started = Date.now();
@@ -402,6 +507,9 @@ async function main() {
     await checkForwardStages(pool);
     await checkVirtualPortfolio(pool);
     await checkJobRegistry(pool);
+
+    // Last of all: today's burn-in verdict, computed from everything above.
+    await recordBurnIn(pool);
 
     // WOULD_REPAIR counts as unresolved. A dry run that finds 17 broken sessions
     // and exits 0 is reporting success about a system it just found broken.
@@ -442,7 +550,7 @@ async function main() {
   }
 }
 
-module.exports = { checkIhsgGaps, checkPhantomSessions, checkPriceGaps, checkForwardStages, checkVirtualPortfolio, RECUR_THRESHOLD, RECUR_WINDOW };
+module.exports = { checkIhsgGaps, checkPhantomSessions, checkPriceGaps, checkForwardStages, recordBurnIn, checkVirtualPortfolio, RECUR_THRESHOLD, RECUR_WINDOW };
 
 if (require.main === module) {
   main().catch(e => {

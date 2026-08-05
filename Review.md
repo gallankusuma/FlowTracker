@@ -1,332 +1,169 @@
-V2 sudah layak untuk shadow operation, tetapi belum gue anggap authoritative track record karena masih ada tiga blocker operasional/data-integrity.
+Bro, menurut gue jangan tambah fitur trading baru dulu. Next step terbaik adalah mengubah V2 dari “kode yang bagus” menjadi operasional yang terbukti stabil.
 
-Yang sudah beres
-Temuan sebelumnya	Status
-Strategy A dan B berbagi modal	✅
-Phantom weekend menjadi entry date	✅
-Retained ticker dibeli berulang	✅
-Per-ticker cap tidak aggregate	✅
-Sizing memakai NAV kemarin	✅
-Gap-through-stop fill terlalu bagus	✅
-ATR berbeda dari sistem utama	✅
-Order dieksekusi berdasarkan alfabet	✅
-Missing ticker dianggap no-fill	✅
-Retiring account langsung hilang	✅
-Mark dan account NAV tidak atomic	✅
-Counter bertambah sebelum commit	✅
-Scheduled event tidak punya order ID	✅
-Strategy isolation sudah benar
+Urutan yang gue sarankan
+1. Tutup empat blocker terakhir
 
-Account sekarang memiliki strategy_hash, dan unique identity sudah mencakup strategy, strategy hash, account code, serta execution policy. Strategy hash baru menghasilkan account Rp100 juta baru, bukan melanjutkan NAV lama.
+Prioritas paling atas:
 
-Kalender perdagangan sudah benar di code
+Jalankan refresh_ihsg.js sebelum virtual_portfolio resolve.
+Tambahkan hard guard SESSION_CALENDAR_STALE; resolve harus gagal kalau kalender IHSG tertinggal dari price data.
+Missing atau incomplete bar harus memblokir perjalanan posisi, bukan dilewati ke candle berikutnya.
+Saat strategy hash atau execution policy berubah:
+SCHEDULED dan DATA_PENDING dibatalkan;
+open position lama di-force-close dengan alasan POLICY_CHANGE_EXIT atau tetap memakai resolver versi lama.
+Migration enum wajib fail loudly, jangan menggunakan .catch(() => {}).
+
+Ini penting karena arithmetic dan sizing sekarang sudah cukup kuat; risiko terbesarnya justru engine bekerja dengan kalender atau data lifecycle yang salah.
+
+2. Bekukan versi resmi
+
+Setelah blocker ditutup, buat identitas final:
+
+Virtual Broker Version : 2
+Starting Capital       : Rp100.000.000
+Official Start Date    : tanggal trading berikutnya
+Strategy Hash          : ...
+Execution Policy Hash  : ...
+Code Commit            : ...
+
+Account hasil development sebelumnya jangan digabung dengan record resmi.
+
+Buat account baru:
+
+POSITION_100M_V2
+INTRADAY_EOD_100M_V2
+
+Keduanya mulai dari nol dengan Rp100 juta masing-masing.
+
+3. Jalankan seluruh test di environment database
+
+Wajib hijau:
+
+npm test
+npm run test:integration
+
+Lalu tambahkan test terakhir yang belum terkunci:
+
+stale IHSG calendar → resolve gagal
+incomplete exit bar → posisi tidak boleh membaca hari berikutnya
+policy change → pending order dibatalkan
+retiring account → open position benar-benar ditutup
+migration enum lama → berhasil naik ke schema baru
+
+Current test suite sebenarnya sudah cukup kuat dan telah mencakup strategy isolation, retained ticker, gap execution, NAV reconciliation, dan idempotency.
+
+4. Jalankan burn-in selama 10 hari bursa
+
+Selama periode ini, jangan ubah parameter trading.
+
+Setiap malam periksa:
+
+price data current
+IHSG calendar current
+resolve success
+schedule success
+NAV mark success
+reconcile = 0 problems
+watchdog = healthy
+cash >= 0
+NAV = cash + market value
+no duplicate fill
+no skipped unknown bar
 
-loadBars() sekarang menggunakan idx_ihsg_history sebagai session calendar dan membuang price rows di luar kalender tersebut. Weekend atau public-holiday phantom tidak lagi bisa menjadi T+1 entry atau holding bar.
+Target burn-in:
 
-Retained ticker dan prioritas target
+10 hari bursa berturut-turut tanpa manual database repair dan tanpa invariant failure.
 
-Ticker yang masih open tidak dibuatkan order baru. target_rank juga disimpan, dan fill diproses berdasarkan rank rekomendasi—bukan urutan alfabet.
+Kalau ada bug, perbaiki dan restart hitungan 10 hari. Burn-in ini menguji operasional, belum menguji apakah strateginya profitable.
 
-Sizing sekarang memakai kondisi opening
+5. Buat dashboard portfolio yang benar-benar operasional
 
-Sebelum setiap fill, engine menghitung ulang:
+Frontend minimal menampilkan:
 
-opening NAV = cash + market value seluruh holding pada opening price
-
-Gross exposure dan ticker exposure juga memakai opening market value, bukan cost basis.
-
-Gap execution sudah realistis
-
-Gap turun melewati stop sekarang exit pada open, bukan harga stop yang sudah tidak dapat diperdagangkan. Missing high atau low juga tidak lagi dianggap sebagai quiet bar.
-
-Risk layer sudah satu sumber
-
-Virtual broker sekarang mengambil horizon dan risk geometry dari trade_policy.js, serta ATR dari awo_technical.calcATR(). Versi execution contract juga dinaikkan ke 2.
-
-Testing bertambah signifikan
-
-Integration test sekarang mengunci session calendar, retained ticker, target rank, strategy-hash mismatch, retiring account, NAV/account consistency, serta corruption detection. Test virtual broker dan database lifecycle juga masuk ke command test resmi.
-
-P0.1 — Urutan cron sekarang bertentangan dengan kalender baru
-
-Ini blocker paling konkret.
-
-Code sekarang membutuhkan idx_ihsg_history sudah memiliki sesi hari ini sebelum resolve. Namun dokumentasi cron masih menunjukkan:
-
-20:00  virtual_portfolio.js resolve
-20:10  refresh_ihsg.js
-
-Karena loadBars() memakai IHSG sebagai date axis, pada pukul 20:00 sesi hari ini kemungkinan belum terlihat.
-
-Skenarionya:
-
-Senin 20:30  order dijadwalkan
-Selasa 19:30 price Selasa masuk
-Selasa 20:00 resolve berjalan
-Selasa belum ada di kalender IHSG
-→ order tidak di-fill
-
-Selasa 20:10 IHSG baru diperbarui
-Selasa 20:35 NAV ditandai tanpa posisi tersebut
-
-Rabu 20:00 order baru diproses secara retrospektif
-dengan entry_date Selasa
-
-Hasilnya:
-
-trade diproses terlambat satu malam;
-NAV Selasa tidak mencerminkan trade yang seharusnya aktif Selasa;
-realized P&L intraday Selasa baru muncul di account pada Rabu;
-historical NAV tidak direstate.
-Perbaikan
-
-Urutan minimal:
-
-19:30  price pull selesai
-20:05  refresh IHSG
-20:10  virtual resolve
-20:15  strategy forward fill
-20:20  strategy plan
-20:25  strategy mark
-20:30  virtual schedule
-20:35  virtual mark
-20:40  reconcile
-
-Lebih aman lagi, cmdResolve() harus menolak berjalan bila:
-
-latest IHSG session < latest valid price session
-
-Jangan hanya mengandalkan cron timing. Return non-zero dengan alasan:
-
-SESSION_CALENDAR_STALE
-
-Catatan: gue hanya dapat memeriksa CRONTAB.md, bukan live crontab VPS. Kalau VPS sudah diubah tetapi dokumentasinya belum, dokumentasinya perlu disinkronkan.
-
-P0.2 — Missing exit bar masih dilewati, lalu engine membaca hari berikutnya
-
-resolveBar() sudah benar mengembalikan:
-
-open = true
-unpriced = true
-
-atau:
-
-open = true
-dataIncomplete = true
-
-untuk bar yang hilang atau tidak lengkap.
-
-Namun orchestration melakukan:
-
-if (r.open) continue;
-
-Artinya engine lanjut ke sesi berikutnya.
-
-Ini tidak aman.
-
-Contoh:
-
-Hari 1  position open
-Hari 2  high/low hilang
-        sebenarnya mungkin menyentuh stop
-Hari 3  harga naik dan menyentuh target
-
-Engine saat ini bisa mencatat TARGET pada hari 3, padahal posisi mungkin sudah stop pada hari 2.
-
-Untuk INTRADAY_EOD, dampaknya lebih jelas:
-
-Entry-day bar incomplete
-→ posisi tidak EOD_CLOSE
-→ engine lanjut ke hari berikutnya
-→ trade intraday berubah menjadi multi-day trade
-Perbaikan
-
-Saat menemukan missing/incomplete session setelah entry:
-
-if (r.unpriced || r.dataIncomplete) {
-  log DATA_BLOCKED;
-  break;
-}
-
-Bukan continue.
-
-Position harus menunggu session tersebut diperbaiki sebelum membaca sesi setelahnya.
-
-Tambahkan state atau event:
-
-PRICE_HISTORY_BLOCKED
-DATA_INCOMPLETE_EXIT_BAR
-
-Account tersebut juga harus diberi:
-
-NAV_DEGRADED
-performance_eligible = false
-
-sampai gap data selesai.
-
-Unit test saat ini membuktikan pure resolver mengembalikan dataIncomplete, tetapi belum menguji bahwa lifecycle berhenti dan tidak melompat ke candle berikutnya.
-
-P0.3 — Retiring execution contract masih dapat mencampur v1 dan v2
-
-RETIRING sekarang diproses oleh cmdResolve(), yang memang diperlukan agar open positions tidak hilang. Namun ini menimbulkan masalah versioning lain.
-
-Retirement menganggap account masih sibuk jika ada posisi open atau order berstatus SCHEDULED.
-
-Lalu cmdResolve() memproses account RETIRING dan order:
-
-SCHEDULED
-DATA_PENDING
-
-menggunakan implementation code yang sedang berjalan.
-
-Skenario deployment v1 → v2:
-
-Order dibuat saat v1
-Belum fill
-Code v2 dideploy
-Account v1 menjadi RETIRING
-Order v1 tetap di-fill menggunakan resolver v2
-
-config_json memang menyimpan angka lama, tetapi tidak menyimpan implementation lama:
-
-gap handling berubah;
-opening NAV logic berubah;
-missing-bar handling berubah;
-aggregate exposure logic berubah.
-
-Jadi hasilnya dicatat sebagai account v1, tetapi dieksekusi oleh algorithm v2.
-
-Selain itu, retirement menghitung pending hanya dari status='SCHEDULED', bukan DATA_PENDING. Account dengan satu DATA_PENDING dan tanpa posisi open dapat berubah menjadi CLOSED, membuat order tersebut tidak pernah diperiksa lagi.
-
-Solusi aman
-
-Saat contract atau strategy berubah:
-
-SCHEDULED / DATA_PENDING
-→ CANCELLED
-→ reason POLICY_CHANGE atau STRATEGY_CHANGE
-
-Untuk posisi yang sudah open, pilih satu:
-
-dispatch resolver berdasarkan config.version; atau
-force-close pada first available tradable price dengan:
-POLICY_CHANGE_EXIT
-STRATEGY_CHANGE_EXIT
-
-Opsi kedua lebih sederhana dan audit-friendly.
-
-Jangan meneruskan v1 positions melalui v2 resolver sambil menyebut record-nya v1.
-
-P0.4 — Migration error masih disembunyikan
-
-Migration enum menggunakan:
-
-await pool.query(...).catch(() => {});
-
-untuk menambahkan:
-
-RETIRING
-DATA_PENDING
-DATA_MISSING
-
-Kalau migration gagal karena permission, incompatible schema, atau data issue, setup tetap terlihat sukses. Runtime baru gagal saat mencoba menulis status tersebut.
-
-Ini mengulang pola yang sebelumnya sudah beberapa kali terjadi: initialization melanjutkan proses walaupun schema sebenarnya belum siap.
-
-Perbaikan
-
-Jangan swallow error pada migration wajib:
-
-await pool.query(`ALTER TABLE ...`);
-
-Setelah migration, verifikasi melalui information_schema bahwa enum benar-benar memiliki seluruh status.
-
-Integration test perlu membuat legacy scratch table dengan enum lama, menjalankan migration, lalu membuktikan row dapat diubah menjadi:
-
-RETIRING
-DATA_PENDING
-DATA_MISSING
-P1 yang masih tersisa
-Reconciliation memakai config terbaru, bukan frozen account config
-
-cmdReconcile() memeriksa seluruh account menggunakan:
-
-vb.DEFAULT_CONFIG.maxPositions
-vb.DEFAULT_CONFIG.maxGrossExposure
-vb.DEFAULT_CONFIG.allowPyramiding
-vb.DEFAULT_CONFIG.maxPositionNotional
-
-Untuk account v1 atau custom config, invariant-nya bisa salah. Parse acct.config_json dan gunakan frozen config account itu sendiri.
-
-cmdMark() belum mengambil consistent ledger snapshot
-
-Write NAV dan account total sekarang atomic, tetapi cash, positions, dan realized P&L dibaca sebelum transaction dimulai. Transaction baru dimulai pada tahap write.
-
-Jika resolve berjalan bersamaan, mark bisa menggabungkan cash lama dengan positions baru atau sebaliknya.
-
-Mulai transaction sebelum membaca:
-
-account FOR UPDATE
-open positions
-closed P&L
-prices
-NAV write
-account total update
-commit
-
-Reconcile juga perlu memeriksa:
-
-latest nav.cash_value = current account.cash_balance
-latest nav.open_positions = actual open positions
-Unpriced opening holding masih dibawa pada cost
-
-Saat sizing, existing holding tanpa opening print dinilai menggunakan cost_basis.
-
-Jika saham sudah naik 100%, exposure dapat terhitung setengah dari nilai terakhir. Gunakan last valid close sebelum entry date, atau blok seluruh new fills saat opening NAV tidak dapat ditentukan dengan cukup baik.
-
-Per-name reconcile melewati session calendar
-
-Per-ticker cap check membaca:
-
-SELECT close_price
-FROM idx_stock_prices
-ORDER BY date DESC
-LIMIT 1
-
-tanpa memfilter tanggal melalui idx_ihsg_history.
-
-Jadi phantom weekend row yang sudah dibuang oleh loadBars() masih dapat memengaruhi reconciliation. Gunakan harga pada latest authoritative NAV mark/session.
-
-Penilaian terbaru
-Area	Sebelumnya	Sekarang
-Strategy-hash isolation	5,5	9,2
-Trading-calendar logic	5,0	9,0
-Position sizing	7,5	9,2
-Gap execution realism	6,8	9,0
-Retained-name handling	5,5	9,3
-Auditability	8,7	9,2
-Testing	8,7	9,1
-Migration safety	7,0	7,0
-Operational scheduling	7,0	6,0
-Authoritative evidence readiness	6,8	8,0
-Kesimpulan
-
-Secara logic utama, revisi ini bagus dan substantif. V2 sekarang sudah mempunyai:
-
-fresh Rp100 juta per strategy hash;
-authoritative session calendar;
-opening-NAV risk sizing;
-realistic gap fills;
-aggregate ticker protection;
-ranked order allocation;
-retiring-account lifecycle;
-atomic NAV write;
-stronger integration tests.
-
-Posisinya sekarang:
-
-Layak dijalankan sebagai shadow virtual broker v2, tetapi official performance record baru dianggap valid setelah cron calendar order dan missing-bar blocking dibereskan.
-
-Yang paling mendesak bukan lagi formula tradingnya, bro. Sekarang masalah utamanya adalah kapan data dianggap tersedia dan apakah engine boleh melompati data yang tidak diketahui. Dua hal itu bisa mengubah hasil trade walaupun semua arithmetic lainnya sudah benar.
-
-Review ini static source review. Gue belum menjalankan npm test atau npm run test:integration langsung terhadap MySQL/VPS production.
+Account summary
+Starting capital
+Current NAV
+Cash
+Market value
+Gross exposure
+Realized P&L
+Unrealized P&L
+Return %
+Maximum drawdown
+Open positions
+Ticker
+Quantity / lot
+Entry
+Current price
+Stop loss
+Profit target
+Market value
+Unrealized P&L
+Holding days
+Order queue
+Scheduled
+Data pending
+Data missing
+Rejected
+No fill
+Filled
+Cancelled
+Journal
+Recommendation
+Order scheduled
+Filled
+SL/PT created
+Exit
+Fee
+Slippage
+Net P&L
+Exit reason
+Strategy hash
+Policy hash
+
+Pastikan DATA_PENDING dan NAV_DEGRADED terlihat mencolok, bukan tersembunyi sebagai catatan kecil.
+
+6. Tentukan evaluation gate sebelum melihat hasil
+
+Sebelum track record bertambah, bekukan kriterianya. Contoh untuk POSITION_100M_V2:
+
+Minimum period          : 60 trading days
+Minimum closed trades   : 30
+Maximum drawdown        : <= 12%
+Profit factor           : >= 1.20
+Net return              : > 0 setelah fee/slippage
+No ledger violations    : wajib
+No policy changes       : wajib
+
+Untuk INTRADAY_EOD_100M_V2, jangan memakai target profit sebagai ekspektasi. Account itu adalah control/challenger untuk membuktikan apakah closing pada hari yang sama memang merusak edge.
+
+Jangan mengubah SL, PT, target R, fee, atau sizing setelah melihat beberapa trade jelek. Perubahan parameter harus menghasilkan policy hash dan account baru.
+
+Setelah itu baru pertimbangkan broker integration
+
+Urutannya sebaiknya:
+
+Virtual broker
+→ stable shadow record
+→ broker sandbox/read-only
+→ broker order mirroring dengan approval manual
+→ small-capital controlled execution
+→ full automation
+
+Tahap pertama broker integration sebaiknya hanya:
+
+membaca buying power;
+membaca portfolio;
+menghasilkan proposed orders;
+manusia menekan approve;
+reconcile broker fills terhadap proposed fills.
+
+Belum perlu mengizinkan sistem langsung mengirim order tanpa approval.
+
+Fokus sprint berikutnya
+
+Menurut gue satu sprint berikutnya cukup fokus pada:
+
+Data lifecycle hardening → fresh V2 account → 10-day burn-in → operational dashboard.
+
+Setelah itu kita berhenti menilai kualitas code dan mulai menilai kualitas sistem dari data yang benar-benar dihasilkan setiap hari.
