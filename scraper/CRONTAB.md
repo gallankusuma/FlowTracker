@@ -83,8 +83,17 @@ manual equivalent if a specific date ever needs recomputing.
 
 ### IHSG index history — `idx_ihsg_history`
 ```
-10 13 * * 1-5   node refresh_ihsg.js                           # 20:10 WIB
+ 5 13 * * 1-5   node refresh_ihsg.js                           # 20:05 WIB
 ```
+**Moved from 20:10 to 20:05 on 2026-08-05, and the five minutes matter.**
+`virtual_portfolio.js loadBars()` now takes its session axis from this table, so
+it must be current BEFORE `resolve` runs. It was not: resolve sat at 20:00 and
+this at 20:10, so on any evening the index had not refreshed, today's session was
+not on the axis, every order silently went unfilled, and the trade was booked a
+day late with a NAV history that never showed the position on the day it was
+actually held. `cmdResolve` now also refuses outright with
+`SESSION_CALENDAR_STALE` rather than trusting the schedule — an ordering that
+exists only in a crontab is one edit away from being wrong, silently.
 Added 2026-08-04, and it runs BEFORE the forward cycle below on purpose: the
 200-day SMA regime filter reads this table, and a plan decided on a stale index
 is a plan decided on the wrong regime.
@@ -147,10 +156,24 @@ Records intentions only. It places no orders and touches no broker.
 
 ### Virtual portfolio — `virtual_accounts` / `virtual_orders` / `virtual_positions` / `virtual_trade_events` / `virtual_nav`
 ```
- 0 13 * * 1-5   node virtual_portfolio.js resolve               # 20:00 WIB
+10 13 * * 1-5   node virtual_portfolio.js resolve               # 20:10 WIB
 30 13 * * 1-5   node virtual_portfolio.js schedule              # 20:30 WIB
 35 13 * * 1-5   node virtual_portfolio.js mark                  # 20:35 WIB
 40 13 * * 1-5   node virtual_portfolio.js reconcile             # 20:40 WIB
+```
+
+**The whole nightly chain, in dependency order (WIB):**
+```
+19:30  prices land (server.js nightly cron)
+20:05  refresh_ihsg      writes the session calendar
+20:10  virtual resolve   READS that calendar - must come after it
+20:15  forward fill
+20:20  forward plan      writes ft_strategy_plan
+20:25  forward mark
+20:30  virtual schedule  READS that plan - must come after it
+20:35  virtual mark
+20:40  virtual reconcile
+20:50  watchdog          checks what all of the above actually produced
 ```
 Added 2026-08-04. Two simulated Rp100 juta accounts, `POSITION_100M` and
 `INTRADAY_EOD_100M`, driven by the same recommendations under different exit

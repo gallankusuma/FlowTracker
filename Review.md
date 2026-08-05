@@ -1,365 +1,332 @@
-P0 — wajib diperbaiki sebelum track record dianggap valid
-1. Account masih mencampur strategy hash berbeda
+V2 sudah layak untuk shadow operation, tetapi belum gue anggap authoritative track record karena masih ada tiga blocker operasional/data-integrity.
 
-virtual_accounts hanya mempunyai:
+Yang sudah beres
+Temuan sebelumnya	Status
+Strategy A dan B berbagi modal	✅
+Phantom weekend menjadi entry date	✅
+Retained ticker dibeli berulang	✅
+Per-ticker cap tidak aggregate	✅
+Sizing memakai NAV kemarin	✅
+Gap-through-stop fill terlalu bagus	✅
+ATR berbeda dari sistem utama	✅
+Order dieksekusi berdasarkan alfabet	✅
+Missing ticker dianggap no-fill	✅
+Retiring account langsung hilang	✅
+Mark dan account NAV tidak atomic	✅
+Counter bertambah sebelum commit	✅
+Scheduled event tidak punya order ID	✅
+Strategy isolation sudah benar
 
-strategy_id
-execution_policy_hash
+Account sekarang memiliki strategy_hash, dan unique identity sudah mencakup strategy, strategy hash, account code, serta execution policy. Strategy hash baru menghasilkan account Rp100 juta baru, bukan melanjutkan NAV lama.
 
-Tidak mempunyai strategy_hash.
+Kalender perdagangan sudah benar di code
 
-Sedangkan order memang menyimpan strategy_hash, tetapi seluruh order lama dan baru tetap memakai cash dan NAV account yang sama. cmdSchedule() juga mengambil latest plan berdasarkan strategy_id saja.
+loadBars() sekarang menggunakan idx_ihsg_history sebagai session calendar dan membuang price rows di luar kalender tersebut. Weekend atau public-holiday phantom tidak lagi bisa menjadi T+1 entry atau holding bar.
 
-Skenario:
+Retained ticker dan prioritas target
 
-Strategy hash A menghasilkan profit Rp10 juta
-Configuration berubah menjadi hash B
-Order B masuk account yang sama
-NAV B dimulai dari Rp110 juta
+Ticker yang masih open tidak dibuatkan order baru. target_rank juga disimpan, dan fill diproses berdasarkan rank rekomendasi—bukan urutan alfabet.
 
-Track record B akhirnya membawa keuntungan A.
+Sizing sekarang memakai kondisi opening
 
+Sebelum setiap fill, engine menghitung ulang:
+
+opening NAV = cash + market value seluruh holding pada opening price
+
+Gross exposure dan ticker exposure juga memakai opening market value, bukan cost basis.
+
+Gap execution sudah realistis
+
+Gap turun melewati stop sekarang exit pada open, bukan harga stop yang sudah tidak dapat diperdagangkan. Missing high atau low juga tidak lagi dianggap sebagai quiet bar.
+
+Risk layer sudah satu sumber
+
+Virtual broker sekarang mengambil horizon dan risk geometry dari trade_policy.js, serta ATR dari awo_technical.calcATR(). Versi execution contract juga dinaikkan ke 2.
+
+Testing bertambah signifikan
+
+Integration test sekarang mengunci session calendar, retained ticker, target rank, strategy-hash mismatch, retiring account, NAV/account consistency, serta corruption detection. Test virtual broker dan database lifecycle juga masuk ke command test resmi.
+
+P0.1 — Urutan cron sekarang bertentangan dengan kalender baru
+
+Ini blocker paling konkret.
+
+Code sekarang membutuhkan idx_ihsg_history sudah memiliki sesi hari ini sebelum resolve. Namun dokumentasi cron masih menunjukkan:
+
+20:00  virtual_portfolio.js resolve
+20:10  refresh_ihsg.js
+
+Karena loadBars() memakai IHSG sebagai date axis, pada pukul 20:00 sesi hari ini kemungkinan belum terlihat.
+
+Skenarionya:
+
+Senin 20:30  order dijadwalkan
+Selasa 19:30 price Selasa masuk
+Selasa 20:00 resolve berjalan
+Selasa belum ada di kalender IHSG
+→ order tidak di-fill
+
+Selasa 20:10 IHSG baru diperbarui
+Selasa 20:35 NAV ditandai tanpa posisi tersebut
+
+Rabu 20:00 order baru diproses secara retrospektif
+dengan entry_date Selasa
+
+Hasilnya:
+
+trade diproses terlambat satu malam;
+NAV Selasa tidak mencerminkan trade yang seharusnya aktif Selasa;
+realized P&L intraday Selasa baru muncul di account pada Rabu;
+historical NAV tidak direstate.
 Perbaikan
 
-Tambahkan ke account:
+Urutan minimal:
 
-strategy_hash VARCHAR(32) NOT NULL
+19:30  price pull selesai
+20:05  refresh IHSG
+20:10  virtual resolve
+20:15  strategy forward fill
+20:20  strategy plan
+20:25  strategy mark
+20:30  virtual schedule
+20:35  virtual mark
+20:40  reconcile
 
-Unique identity:
+Lebih aman lagi, cmdResolve() harus menolak berjalan bila:
 
-strategy_id
-strategy_hash
-account_code
-execution_policy_hash
+latest IHSG session < latest valid price session
 
-cmdSchedule() harus mengambil plan untuk hash account tersebut. Plan tanpa hash tidak boleh dijadwalkan.
+Jangan hanya mengandalkan cron timing. Return non-zero dengan alasan:
 
-Saat source strategy hash berubah, buat account baru dengan modal Rp100 juta dan archive account lama.
+SESSION_CALENDAR_STALE
 
-2. Trading calendar memakai idx_stock_prices
+Catatan: gue hanya dapat memeriksa CRONTAB.md, bukan live crontab VPS. Kalau VPS sudah diubah tetapi dokumentasinya belum, dokumentasinya perlu disinkronkan.
 
-loadBars() membangun date axis dari:
+P0.2 — Missing exit bar masih dilewati, lalu engine membaca hari berikutnya
 
-SELECT DISTINCT date
-FROM idx_stock_prices
+resolveBar() sudah benar mengembalikan:
 
-Padahal dokumentasi production sendiri mencatat bahwa idx_stock_prices pernah mempunyai puluhan tanggal phantom berupa weekend, public holiday, zero-volume flat bar, dan copied-forward bar.
+open = true
+unpriced = true
 
-Dampaknya bisa sangat material:
+atau:
 
-entry T+1 jatuh ke hari libur palsu;
-ATR menghitung phantom bars;
-holding_bars menghitung non-trading sessions;
-TIME_EXIT terjadi terlalu cepat;
-EOD account melakukan trade pada tanggal bursa tutup.
-Perbaikan
+open = true
+dataIncomplete = true
 
-Gunakan idx_ihsg_history sebagai authoritative session calendar:
+untuk bar yang hilang atau tidak lengkap.
 
-SELECT date
-FROM idx_ihsg_history
-ORDER BY date
+Namun orchestration melakukan:
 
-Kemudian hanya terima price bar yang tanggalnya berada dalam calendar tersebut.
+if (r.open) continue;
 
-Tambahkan regression test:
+Artinya engine lanjut ke sesi berikutnya.
 
-signal Jumat
-ada phantom row Sabtu
-entry wajib Senin, bukan Sabtu
-3. Superseded account bisa ditutup dengan posisi masih OPEN
-
-retireSupersededAccounts() langsung mengubah account lama menjadi:
-
-status = CLOSED
-
-walaupun account tersebut masih mempunyai position history—dan query hanya menghitung semua positions, bukan memastikan tidak ada posisi terbuka.
-
-Setelah status menjadi CLOSED, loadAccounts() tidak mengambil account itu lagi. Akibatnya posisi OPEN milik account lama:
-
-tidak dicek SL/PT;
-tidak pernah TIME_EXIT;
-tidak di-mark;
-tidak pernah mengembalikan cash;
-tidak ikut reconciliation.
-Perbaikan
-
-Gunakan lifecycle:
-
-ACTIVE
-RETIRING
-CLOSED
-
-RETIRING:
-
-tidak menerima order baru;
-tetap menjalankan exit dan mark;
-tetap direconcile;
-berubah menjadi CLOSED hanya ketika tidak ada scheduled order dan open position.
-
-Alternatifnya, force-close seluruh posisi dengan alasan eksplisit:
-
-POLICY_CHANGE_EXIT
-
-Jangan menutup account secara administratif sambil meninggalkan posisi terbuka.
-
-4. Position account bisa membeli ticker yang sama berulang kali
-
-cmdSchedule() menjadwalkan seluruh ticker di target_json pada setiap plan. Ia tidak memeriksa apakah account sudah memiliki ticker tersebut.
-
-Padahal target book memang mempertahankan current holdings yang masih berada dalam buffer. Jadi ticker yang sama secara normal dapat muncul lagi pada rebalance berikutnya.
-
-Skenario:
-
-Plan 1: BBCA
-→ membeli 12,5% NAV
-
-Plan 2: BBCA masih retained
-→ membeli BBCA lagi
-
-Plan 3: BBCA masih retained
-→ membeli lagi
-
-maxPositionNotional saat ini diterapkan per order, bukan aggregate per ticker. Satu ticker dapat melewati 12,5% account.
-
-Perbaikan
-
-Untuk POSITION_100M:
-
-target ticker sudah OPEN → jangan buat order baru
-
-atau implementasikan top-up berdasarkan aggregate position value, bukan posisi baru.
-
-Sebelum fill, hitung:
-
-SUM(current market value)
-WHERE account_id=?
-  AND ticker=?
-  AND status='OPEN'
-
-Lalu enforce maximum notional per ticker secara aggregate.
-
-Tambahkan unique/invariant bahwa satu account tidak boleh memiliki beberapa independent OPEN positions pada ticker yang sama kecuali pyramiding memang menjadi policy eksplisit dan masuk policy hash.
-
-5. Position sizing memakai NAV lama dan cost basis, bukan opening exposure
-
-Pada saat fill, code memakai:
-
-acc.total_nav
-SUM(open position cost_basis)
-
-untuk menghitung risk budget dan gross exposure.
-
-total_nav tersebut adalah NAV mark sebelumnya. SUM(cost_basis) juga bukan current market exposure.
+Ini tidak aman.
 
 Contoh:
 
-NAV kemarin       Rp100 juta
-Existing holdings gap -20%
-Actual opening NAV Rp84 juta
+Hari 1  position open
+Hari 2  high/low hilang
+        sebenarnya mungkin menyentuh stop
+Hari 3  harga naik dan menyentuh target
 
-Sizing masih memakai Rp100 juta
+Engine saat ini bisa mencatat TARGET pada hari 3, padahal posisi mungkin sudah stop pada hari 2.
 
-Risk 0,5% menjadi Rp500 ribu, padahal seharusnya sekitar Rp420 ribu.
+Untuk INTRADAY_EOD, dampaknya lebih jelas:
 
-Sebaliknya, winner yang sudah naik besar dapat membuat exposure aktual melewati 90%, tetapi cost basis masih terlihat rendah.
-
+Entry-day bar incomplete
+→ posisi tidak EOD_CLOSE
+→ engine lanjut ke hari berikutnya
+→ trade intraday berubah menjadi multi-day trade
 Perbaikan
 
-Di dalam account lock, sebelum setiap fill:
+Saat menemukan missing/incomplete session setelah entry:
 
-opening cash
-+ current holdings × opening price
-= opening NAV
+if (r.unpriced || r.dataIncomplete) {
+  log DATA_BLOCKED;
+  break;
+}
 
-Gross exposure:
+Bukan continue.
 
-Σ current holdings × opening price
+Position harus menunggu session tersebut diperbaiki sebelum membaca sesi setelahnya.
 
-Risk budget dan exposure cap harus menggunakan dua angka tersebut.
+Tambahkan state atau event:
 
-6. Gap stop masih dieksekusi terlalu bagus
+PRICE_HISTORY_BLOCKED
+DATA_INCOMPLETE_EXIT_BAR
 
-resolveBar() hanya membaca high, low, dan close. Bila low melewati stop, exit selalu dianggap terjadi tepat pada stopPrice.
+Account tersebut juga harus diberi:
 
-Contoh:
+NAV_DEGRADED
+performance_eligible = false
 
-stop           950
-open berikutnya 800
+sampai gap data selesai.
 
-Code saat ini keluar dari 950 dikurangi slippage, padahal tidak ada kesempatan menjual di 950. Simulasi menjadi terlalu optimistis.
+Unit test saat ini membuktikan pure resolver mengembalikan dataIncomplete, tetapi belum menguji bahwa lifecycle berhenti dan tidak melompat ke candle berikutnya.
 
-Perbaikan gap-aware
+P0.3 — Retiring execution contract masih dapat mencampur v1 dan v2
 
-Untuk posisi long:
+RETIRING sekarang diproses oleh cmdResolve(), yang memang diperlukan agar open positions tidak hilang. Namun ini menimbulkan masalah versioning lain.
 
-open <= stop
-→ exit quote = open
+Retirement menganggap account masih sibuk jika ada posisi open atau order berstatus SCHEDULED.
 
-open >= target
-→ exit quote = open atau target,
-  sesuai asumsi limit-order yang didokumentasikan
+Lalu cmdResolve() memproses account RETIRING dan order:
 
-setelah itu baru cek intraday low/high
-
-resolveBar() perlu menerima:
-
-open
-high
-low
-close
-
-Data high atau low yang kosong juga jangan dianggap “tidak menyentuh level”. Itu harus menjadi DATA_INCOMPLETE, bukan otomatis EOD_CLOSE.
-
-P1 — perlu dibereskan untuk kualitas engineering
-ATR dan trade policy kembali mempunyai implementation kedua
-
-trade_policy.js secara eksplisit dibuat sebagai single source of truth.
-
-Namun virtual broker kembali meng-hardcode:
-
-maxHoldBars = 40
-riskAtrMult = 2.5
-fallbackRiskPct = 5
-targetR = 2
-
-dan membuat atrFrom() sendiri.
-
-Lebih spesifik lagi, fungsi tersebut diberi label “Wilder ATR”, tetapi sebenarnya hanya menghitung simple average dari 14 true ranges terakhir. awo_technical.js menggunakan Wilder smoothing yang sesungguhnya.
-
-Akibatnya virtual portfolio dapat mempunyai SL, PT, dan quantity berbeda dari trade-plan engine existing.
-
-Gunakan kembali:
-
-tradePolicy.resolve()
-calcATR()/calcTechnicalFactors()
-computeTradePlan()
-
-atau beri nama policy baru secara eksplisit dan jangan mengklaim bahwa ia sama dengan trade policy existing.
-
-Urutan order menjadi alfabetis
-
-Scheduled orders diproses dengan:
-
-ORDER BY signal_date, ticker
-
-Jika cash atau exposure habis, ticker alfabetis pertama mendapat prioritas. Hasil portfolio dapat bergantung pada nama kode saham.
-
-Simpan:
-
-target_rank
-
-ketika scheduling, lalu execute berdasarkan rank target.
-
-Missing ticker row langsung dianggap NO_FILL
-
-Jika global trading date ada tetapi ticker row tidak ada, order langsung menjadi:
-
-NO_FILL / NO_OPEN_PRICE
-
-Missing row bisa berarti:
-
-saham suspended;
-scraper gagal;
-ticker belum ter-ingest;
-data masih incomplete.
-
-Pisahkan:
-
-NO_FILL_CONFIRMED
-DATA_MISSING
+SCHEDULED
 DATA_PENDING
 
-Data outage tidak boleh terlihat seperti execution outcome.
+menggunakan implementation code yang sedang berjalan.
 
-Unmarkable position dibawa kembali ke cost basis
+Skenario deployment v1 → v2:
 
-markToMarket() menilai ticker tanpa harga memakai cost_basis.
+Order dibuat saat v1
+Belum fill
+Code v2 dideploy
+Account v1 menjadi RETIRING
+Order v1 tetap di-fill menggunakan resolver v2
 
-Setelah saham naik atau turun jauh, satu missing close dapat membuat NAV meloncat kembali ke entry value.
+config_json memang menyimpan angka lama, tetapi tidak menyimpan implementation lama:
 
-Gunakan:
+gap handling berubah;
+opening NAV logic berubah;
+missing-bar handling berubah;
+aggregate exposure logic berubah.
 
-last valid close;
-last successfully stored mark;
-baru fallback ke cost, dengan account ditandai NAV_DEGRADED.
-cmdMark() belum atomic
+Jadi hasilnya dicatat sebagai account v1, tetapi dieksekusi oleh algorithm v2.
 
-NAV upsert dan update virtual_accounts.total_nav dilakukan dalam dua autocommit statement.
+Selain itu, retirement menghitung pending hanya dari status='SCHEDULED', bukan DATA_PENDING. Account dengan satu DATA_PENDING dan tanpa posisi open dapat berubah menjadi CLOSED, membuat order tersebut tidak pernah diperiksa lagi.
 
-Crash di antaranya dapat membuat:
+Solusi aman
 
-virtual_nav = benar
-account.total_nav = lama
+Saat contract atau strategy berubah:
 
-Fill berikutnya memakai account.total_nav lama untuk sizing. Reconciliation saat ini juga tidak membandingkan kedua angka tersebut.
+SCHEDULED / DATA_PENDING
+→ CANCELLED
+→ reason POLICY_CHANGE atau STRATEGY_CHANGE
 
-Bungkus mark + account update dalam transaction dan tambahkan invariant:
+Untuk posisi yang sudah open, pilih satu:
 
-account.total_nav = latest virtual_nav.total_nav
-Counter bertambah sebelum commit
+dispatch resolver berdasarkan config.version; atau
+force-close pada first available tradable price dengan:
+POLICY_CHANGE_EXIT
+STRATEGY_CHANGE_EXIT
 
-filled++, noFill++, rejected++, dan closed++ bertambah sebelum transaction selesai. Jika commit gagal, console summary dapat mengatakan berhasil walaupun database rollback.
+Opsi kedua lebih sederhana dan audit-friendly.
 
-Pindahkan counter setelah commit() atau gunakan per-transaction local result.
+Jangan meneruskan v1 positions melalui v2 resolver sambil menyebut record-nya v1.
 
-Scheduled event tidak menyimpan order_id
+P0.4 — Migration error masih disembunyikan
 
-Order dibuat dengan INSERT IGNORE, tetapi ORDER_SCHEDULED event tidak menerima r.insertId. Scheduling juga tidak transaction-wrapped.
+Migration enum menggunakan:
 
-Journal timeline akan lebih kuat jika setiap event langsung terhubung ke order yang membuatnya.
+await pool.query(...).catch(() => {});
 
-Test coverage
+untuk menambahkan:
 
-Test suite-nya sudah termasuk kategori kuat:
+RETIRING
+DATA_PENDING
+DATA_MISSING
 
-unit test virtual broker masuk npm test;
-MySQL lifecycle masuk npm run test:integration;
-integration test wajib database dan tidak silently skip;
-watchdog menjalankan reconciliation production.
+Kalau migration gagal karena permission, incompatible schema, atau data issue, setup tetap terlihat sukses. Runtime baru gagal saat mencoba menulis status tersebut.
 
-Regression test yang masih perlu ditambahkan:
+Ini mengulang pola yang sebelumnya sudah beberapa kali terjadi: initialization melanjutkan proses walaupun schema sebenarnya belum siap.
 
-strategy hash A → B starts fresh account
-phantom weekend cannot become entry day
-retired account with open position keeps resolving
-retained ticker is not bought twice
-aggregate per-ticker cap
-overnight NAV gap changes sizing
-gap-through-stop exits at opening price
-missing high/low cannot become EOD_CLOSE
-rank order survives limited cash
-mark/account update rollback together
-Penilaian
-Area	Nilai
-Core architecture	9,0
-Cash accounting	8,8
-Idempotency	8,8
-Auditability/journal	8,7
-Testing	8,7
-Strategy-version isolation	5,5
-Trading-calendar integrity	5,0
-Execution realism	6,8
-Production evidence readiness	6,8
+Perbaikan
+
+Jangan swallow error pada migration wajib:
+
+await pool.query(`ALTER TABLE ...`);
+
+Setelah migration, verifikasi melalui information_schema bahwa enum benar-benar memiliki seluruh status.
+
+Integration test perlu membuat legacy scratch table dengan enum lama, menjalankan migration, lalu membuktikan row dapat diubah menjadi:
+
+RETIRING
+DATA_PENDING
+DATA_MISSING
+P1 yang masih tersisa
+Reconciliation memakai config terbaru, bukan frozen account config
+
+cmdReconcile() memeriksa seluruh account menggunakan:
+
+vb.DEFAULT_CONFIG.maxPositions
+vb.DEFAULT_CONFIG.maxGrossExposure
+vb.DEFAULT_CONFIG.allowPyramiding
+vb.DEFAULT_CONFIG.maxPositionNotional
+
+Untuk account v1 atau custom config, invariant-nya bisa salah. Parse acct.config_json dan gunakan frozen config account itu sendiri.
+
+cmdMark() belum mengambil consistent ledger snapshot
+
+Write NAV dan account total sekarang atomic, tetapi cash, positions, dan realized P&L dibaca sebelum transaction dimulai. Transaction baru dimulai pada tahap write.
+
+Jika resolve berjalan bersamaan, mark bisa menggabungkan cash lama dengan positions baru atau sebaliknya.
+
+Mulai transaction sebelum membaca:
+
+account FOR UPDATE
+open positions
+closed P&L
+prices
+NAV write
+account total update
+commit
+
+Reconcile juga perlu memeriksa:
+
+latest nav.cash_value = current account.cash_balance
+latest nav.open_positions = actual open positions
+Unpriced opening holding masih dibawa pada cost
+
+Saat sizing, existing holding tanpa opening print dinilai menggunakan cost_basis.
+
+Jika saham sudah naik 100%, exposure dapat terhitung setengah dari nilai terakhir. Gunakan last valid close sebelum entry date, atau blok seluruh new fills saat opening NAV tidak dapat ditentukan dengan cukup baik.
+
+Per-name reconcile melewati session calendar
+
+Per-ticker cap check membaca:
+
+SELECT close_price
+FROM idx_stock_prices
+ORDER BY date DESC
+LIMIT 1
+
+tanpa memfilter tanggal melalui idx_ihsg_history.
+
+Jadi phantom weekend row yang sudah dibuang oleh loadBars() masih dapat memengaruhi reconciliation. Gunakan harga pada latest authoritative NAV mark/session.
+
+Penilaian terbaru
+Area	Sebelumnya	Sekarang
+Strategy-hash isolation	5,5	9,2
+Trading-calendar logic	5,0	9,0
+Position sizing	7,5	9,2
+Gap execution realism	6,8	9,0
+Retained-name handling	5,5	9,3
+Auditability	8,7	9,2
+Testing	8,7	9,1
+Migration safety	7,0	7,0
+Operational scheduling	7,0	6,0
+Authoritative evidence readiness	6,8	8,0
 Kesimpulan
 
-Ini sudah pantas disebut:
+Secara logic utama, revisi ini bagus dan substantif. V2 sekarang sudah mempunyai:
 
-Virtual broker dengan real cash ledger dan auditable portfolio lifecycle.
+fresh Rp100 juta per strategy hash;
+authoritative session calendar;
+opening-NAV risk sizing;
+realistic gap fills;
+aggregate ticker protection;
+ranked order allocation;
+retiring-account lifecycle;
+atomic NAV write;
+stronger integration tests.
 
-Bukan lagi paper trade sederhana.
+Posisinya sekarang:
 
-Tetapi track record-nya belum boleh dipakai untuk menilai kualitas strategi sampai minimal empat hal diselesaikan:
+Layak dijalankan sebagai shadow virtual broker v2, tetapi official performance record baru dianggap valid setelah cron calendar order dan missing-bar blocking dibereskan.
 
-account diisolasi berdasarkan strategy hash;
-trading calendar pindah ke IHSG session calendar;
-superseded account tidak meninggalkan open positions;
-retained ticker tidak dibeli berulang dan per-name cap berlaku aggregate.
+Yang paling mendesak bukan lagi formula tradingnya, bro. Sekarang masalah utamanya adalah kapan data dianggap tersedia dan apakah engine boleh melompati data yang tidak diketahui. Dua hal itu bisa mengubah hasil trade walaupun semua arithmetic lainnya sudah benar.
 
-Setelah seluruh perubahan accounting/execution selesai, naikkan:
-
-DEFAULT_CONFIG.version = 2
-
-dan mulai account Rp100 juta yang baru. Jangan mencampur record versi sekarang dengan engine hasil revisi berikutnya.
-
-Review ini berdasarkan static source terbaru di GitHub. Gue belum menjalankan npm test dan npm run test:integration langsung terhadap MySQL/VPS production.
+Review ini static source review. Gue belum menjalankan npm test atau npm run test:integration langsung terhadap MySQL/VPS production.

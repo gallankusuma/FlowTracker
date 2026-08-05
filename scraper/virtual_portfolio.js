@@ -71,6 +71,44 @@ async function hasColumn(pool, table, column) {
   return r.length > 0;
 }
 
+/**
+ * Widen an ENUM, and PROVE it worked.
+ *
+ * These migrations used to be `await pool.query(ALTER ...).catch(() => {})`.
+ * The swallow was there because re-running an already-applied ALTER is
+ * harmless — but it also swallowed a permission error, an incompatible column,
+ * and a row whose value the new enum could not hold. setup() then reported
+ * success against a schema that was not ready, and the failure surfaced hours
+ * later as a runtime write error in the middle of a transaction.
+ *
+ * That is the same pattern as every silent failure in this system's history, so
+ * it does not get a fourth outing. The ALTER is allowed to throw, and afterwards
+ * information_schema is READ BACK to confirm every required value is really
+ * present. A migration that says it worked has to be able to prove it.
+ */
+async function migrateEnum(pool, table, column, values, suffix) {
+  const present = async () => {
+    const [[r]] = await pool.query(
+      `SELECT COLUMN_TYPE t FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?`, [table, column]);
+    if (!r) throw new Error(`${table}.${column} does not exist`);
+    return values.filter(v => !r.t.includes(`'${v}'`));
+  };
+
+  if (!(await present()).length) return { alreadyCurrent: true };
+
+  const def = `ENUM(${values.map(v => `'${v}'`).join(',')}) ${suffix}`;
+  await pool.query(`ALTER TABLE ${table} MODIFY COLUMN ${column} ${def}`);
+
+  const missing = await present();
+  if (missing.length) {
+    throw new Error(
+      `${table}.${column} migration reported success but ${missing.join(', ')} ` +
+      `${missing.length === 1 ? 'is' : 'are'} still not in the enum`);
+  }
+  return { migrated: true };
+}
+
 async function setup(pool, quiet = false) {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS virtual_accounts (
@@ -109,15 +147,25 @@ async function setup(pool, quiet = false) {
   if (!await hasColumn(pool, 'virtual_accounts', 'retired_at')) {
     await pool.query('ALTER TABLE virtual_accounts ADD COLUMN retired_at TIMESTAMP NULL AFTER total_nav');
   }
-  await pool.query(
-    `ALTER TABLE virtual_accounts MODIFY COLUMN status ENUM('ACTIVE','RETIRING','CLOSED') NOT NULL DEFAULT 'ACTIVE'`
-  ).catch(() => {});
+  if (!await hasColumn(pool, 'virtual_accounts', 'performance_eligible')) {
+    await pool.query('ALTER TABLE virtual_accounts ADD COLUMN performance_eligible TINYINT(1) NOT NULL DEFAULT 1 AFTER status');
+  }
+  if (!await hasColumn(pool, 'virtual_accounts', 'data_blocked_json')) {
+    await pool.query('ALTER TABLE virtual_accounts ADD COLUMN data_blocked_json TEXT NULL AFTER performance_eligible');
+  }
+  await migrateEnum(pool, 'virtual_accounts', 'status',
+    ['ACTIVE', 'RETIRING', 'CLOSED'], `NOT NULL DEFAULT 'ACTIVE'`);
   const [[uq]] = await pool.query(
     `SELECT COUNT(*) n FROM information_schema.STATISTICS
       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_accounts'
         AND INDEX_NAME='uq_account' AND COLUMN_NAME='strategy_hash'`);
   if (!Number(uq.n)) {
-    await pool.query('ALTER TABLE virtual_accounts DROP INDEX uq_account').catch(() => {});
+    // Ask whether it exists rather than dropping and swallowing the answer. The
+    // swallow would have hidden a permission failure here just as well.
+    const [[has]] = await pool.query(
+      `SELECT COUNT(*) n FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_accounts' AND INDEX_NAME='uq_account'`);
+    if (Number(has.n)) await pool.query('ALTER TABLE virtual_accounts DROP INDEX uq_account');
     await pool.query(
       'ALTER TABLE virtual_accounts ADD UNIQUE KEY uq_account (account_code, strategy_id, strategy_hash, execution_policy_hash)');
   }
@@ -150,13 +198,16 @@ async function setup(pool, quiet = false) {
       KEY idx_status (account_id, status)
     )`);
 
+  // POLICY_CHANGE_EXIT and STRATEGY_CHANGE_EXIT do not fit in VARCHAR(16), and
+  // a silently truncated exit reason is a falsified record.
+  await pool.query('ALTER TABLE virtual_positions MODIFY COLUMN exit_reason VARCHAR(24) NULL');
+
   if (!await hasColumn(pool, 'virtual_orders', 'target_rank')) {
     await pool.query('ALTER TABLE virtual_orders ADD COLUMN target_rank INT NULL AFTER quantity');
   }
-  await pool.query(
-    `ALTER TABLE virtual_orders MODIFY COLUMN status
-       ENUM('SCHEDULED','FILLED','NO_FILL','REJECTED','CANCELLED','DATA_MISSING','DATA_PENDING')
-       NOT NULL DEFAULT 'SCHEDULED'`).catch(() => {});
+  await migrateEnum(pool, 'virtual_orders', 'status',
+    ['SCHEDULED', 'FILLED', 'NO_FILL', 'REJECTED', 'CANCELLED', 'DATA_MISSING', 'DATA_PENDING'],
+    `NOT NULL DEFAULT 'SCHEDULED'`);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS virtual_positions (
@@ -174,7 +225,7 @@ async function setup(pool, quiet = false) {
       status ENUM('OPEN','CLOSED') NOT NULL DEFAULT 'OPEN',
       exit_date DATE NULL,
       exit_price DECIMAL(15,2) NULL,
-      exit_reason VARCHAR(16) NULL,
+      exit_reason VARCHAR(24) NULL,
       exit_fee DECIMAL(20,2) NULL,
       proceeds DECIMAL(20,2) NULL,
       gross_pnl DECIMAL(20,2) NULL,
@@ -304,7 +355,27 @@ async function retireSupersededAccounts(pool, strategyId, quiet = false) {
 
   const changed = [];
   for (const r of superseded) {
-    const busy = Number(r.openPositions) > 0 || Number(r.scheduled) > 0;
+    const policyChanged = !currentPolicies.has(r.execution_policy_hash);
+    const reason = policyChanged ? 'POLICY_CHANGE' : 'STRATEGY_CHANGE';
+
+    // PENDING ORDERS ARE CANCELLED, NOT INHERITED.
+    // An order scheduled under v1 and filled by v2's resolver would be recorded
+    // against a v1 account while being executed by a different algorithm —
+    // different gap handling, different opening-NAV sizing, different
+    // missing-bar handling. config_json freezes the NUMBERS, not the code.
+    // DATA_PENDING is included: counting only SCHEDULED let an account with a
+    // pending order and no open positions go CLOSED, and that order was then
+    // never looked at again.
+    const [cancelled] = await pool.query(
+      `UPDATE virtual_orders SET status='CANCELLED', reject_reason=?
+        WHERE account_id=? AND status IN ('SCHEDULED','DATA_PENDING')`, [reason, r.id]);
+    if (cancelled.affectedRows && !quiet) {
+      console.log(`SETUP  ${r.account_code}: ${cancelled.affectedRows} pending order(s) CANCELLED (${reason})`);
+      console.log('       They were decided under a contract that no longer exists.');
+    }
+    r.scheduled = 0;
+
+    const busy = Number(r.openPositions) > 0;
     const next = busy ? 'RETIRING' : 'CLOSED';
     if (r.status !== next) {
       await pool.query('UPDATE virtual_accounts SET status=?, retired_at=COALESCE(retired_at, NOW()) WHERE id=?', [next, r.id]);
@@ -314,8 +385,9 @@ async function retireSupersededAccounts(pool, strategyId, quiet = false) {
     const why = !currentPolicies.has(r.execution_policy_hash) ? 'the execution contract changed' : 'the strategy hash changed';
     console.log(`SETUP  ${r.account_code} -> ${next} (policy ${r.execution_policy_hash}, strategy ${r.strategy_hash}) — ${why}`);
     if (busy) {
-      console.log(`       ${r.openPositions} position(s) still open, ${r.scheduled} order(s) scheduled.`);
-      console.log('       RETIRING: no new orders, but exits and marks keep running until the book is empty.');
+      console.log(`       ${r.openPositions} position(s) still open.`);
+      console.log(`       RETIRING: they will be force-closed at the next available open with ${reason}_EXIT,`);
+      console.log('       not run to their natural stop or target under a resolver they were not opened under.');
     } else if (Number(r.positions) > 0) {
       console.log(`       ${r.positions} position(s) of history kept and CLOSED, not deleted.`);
       console.log('       Its track record ends here and must not be pooled with the new one.');
@@ -494,7 +566,44 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
  * One transaction per order: the order, the position, the cash and the event
  * move together or not at all.
  */
+/**
+ * Is the session calendar caught up with the prices?
+ *
+ * THE FAILURE THIS PREVENTS (2026-08-05 review, confirmed on the live box).
+ * loadBars now takes its date axis from idx_ihsg_history. The cron ran
+ * `resolve` at 20:00 WIB and `refresh_ihsg` at 20:10 — ten minutes AFTER the
+ * calendar it depends on. So on any evening the index had not yet refreshed,
+ * today's session was not on the axis and every order silently went unfilled,
+ * to be picked up a day late with the right entry_date but a NAV history that
+ * never showed the position on the day it was actually held.
+ *
+ * Reordering the cron fixes today. This makes the dependency explicit so it
+ * cannot rot again: an ordering that exists only as a cron schedule is one
+ * edit away from being wrong, and the failure is silent.
+ */
+async function sessionCalendarState(pool) {
+  const [[ihsg]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+  const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
+  const calendar = toDateStr(ihsg?.d);
+  const prices = toDateStr(px?.d);
+  return { calendar, prices, stale: !!(calendar && prices && calendar < prices) };
+}
+
 async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
+  const cal = await sessionCalendarState(pool);
+  if (cal.stale) {
+    // Refuse rather than under-fill. A run that quietly fills nothing looks
+    // exactly like a day with no signals, which is the shape of every silent
+    // failure this project has had.
+    if (!quiet) {
+      console.log(`RESOLVE  SESSION_CALENDAR_STALE — refusing to run.`);
+      console.log(`  prices reach ${cal.prices} but the IHSG session calendar only reaches ${cal.calendar}.`);
+      console.log('  Filling now would skip today\'s session entirely and book it a day late.');
+      console.log('  Run `node refresh_ihsg.js` first; the cron order is 20:05 IHSG, then 20:10 resolve.');
+    }
+    return { blocked: 'SESSION_CALENDAR_STALE', calendar: cal.calendar, prices: cal.prices, summary: [] };
+  }
+
   const accounts = await loadAccounts(pool, strategyId);
   const { bars, dates, dateIdx } = await loadBars(pool);
   const summary = [];
@@ -502,6 +611,61 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
   for (const acct of accounts) {
     const cfg = { ...vb.DEFAULT_CONFIG, ...(acct.config_json ? JSON.parse(acct.config_json) : {}) };
     let filled = 0, noFill = 0, rejected = 0, closed = 0, dataMissing = 0, dataPending = 0;
+    const blocked = [];
+
+    // ── a retiring account does not trade, it unwinds ────────────────────
+    // Its positions were opened under an execution contract that no longer
+    // exists. Running them on to their natural stop or target under the CURRENT
+    // resolver would record a v2 execution as a v1 result — the numbers in
+    // config_json are frozen, the algorithm is not. So they are closed at the
+    // first available price with an explicit reason, which is auditable in a way
+    // "it eventually hit its target, under different rules" is not.
+    if (acct.status === 'RETIRING') {
+      const [openRows] = await pool.query(
+        `SELECT * FROM virtual_positions WHERE account_id=? AND status='OPEN' ORDER BY entry_date`, [acct.id]);
+      const [[why]] = await pool.query(
+        `SELECT reject_reason r FROM virtual_orders WHERE account_id=? AND status='CANCELLED'
+          ORDER BY id DESC LIMIT 1`, [acct.id]);
+      const exitReason = `${why?.r === 'STRATEGY_CHANGE' ? 'STRATEGY' : 'POLICY'}_CHANGE_EXIT`;
+
+      for (const p of openRows) {
+        // The first price at which it could actually have been sold: today's
+        // open. No price yet means it stays open and the account stays RETIRING.
+        const today = dates[dates.length - 1];
+        const px = bars.get(p.ticker)?.get(today)?.open;
+        if (!(px > 0)) continue;
+
+        const proceeds = vb.sellProceeds(p.quantity, px, cfg);
+        const grossPnl = proceeds.gross - (Number(p.cost_basis) - Number(p.entry_fee));
+        const netPnl = proceeds.net - Number(p.cost_basis);
+        const eIdx = dateIdx.get(toDateStr(p.entry_date));
+        const conn = await pool.getConnection();
+        try {
+          await conn.beginTransaction();
+          const [upd] = await conn.query(
+            `UPDATE virtual_positions SET status='CLOSED', exit_date=?, exit_price=?, exit_reason=?, exit_fee=?,
+                    proceeds=?, gross_pnl=?, net_pnl=?, return_pct=?, holding_bars=?
+              WHERE id=? AND status='OPEN'`,
+            [today, proceeds.fillPrice, exitReason, proceeds.fee, proceeds.net, grossPnl, netPnl,
+             (netPnl / Number(p.cost_basis)) * 100,
+             eIdx === undefined ? null : dates.length - eIdx, p.id]);
+          if (upd.affectedRows === 1) {
+            await conn.query('UPDATE virtual_accounts SET cash_balance = cash_balance + ? WHERE id=?', [proceeds.net, acct.id]);
+            await logEvent(conn, acct.id, exitReason, today,
+              { positionId: p.id, ticker: p.ticker, detail: { price: proceeds.fillPrice, netPnl } });
+          }
+          await conn.commit();
+          if (upd.affectedRows === 1) closed++;
+        } catch (e) {
+          await conn.rollback();
+          console.error(`RESOLVE  forced exit ${p.id} rolled back: ${e.message}`);
+        } finally { conn.release(); }
+      }
+
+      summary.push({ account: acct.account_code, status: acct.status, filled: 0, noFill: 0,
+                     rejected: 0, closed, dataMissing: 0, dataPending: 0, blocked: 0, unwinding: true });
+      continue;
+    }
 
     // ── fills ────────────────────────────────────────────────────────────
     // BY TARGET RANK, not alphabetically. When cash or exposure runs out the
@@ -531,16 +695,26 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
         // inside the account lock.
         const [openPos] = await conn.query(
           `SELECT ticker, quantity, cost_basis FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
-        let openingExposure = 0, tickerExposure = 0, unpricedHoldings = 0;
+        let openingExposure = 0, tickerExposure = 0, stalePriced = 0, unpricedHoldings = 0;
         for (const p of openPos) {
-          const px = bars.get(p.ticker)?.get(entryDate)?.open;
-          // A holding with no opening print is carried at cost for exposure
-          // purposes and counted, so the caps stay conservative rather than
-          // silently treating it as worth nothing.
-          const value = px > 0 ? Number(p.quantity) * px : Number(p.cost_basis);
-          if (!(px > 0)) unpricedHoldings++;
-          openingExposure += value;
-          if (p.ticker === o.ticker) tickerExposure += value;
+          let px = bars.get(p.ticker)?.get(entryDate)?.open;
+          // No opening print: walk back to the last close this system has for
+          // the name, BEFORE the entry date. Cost basis was the old fallback and
+          // it is badly wrong for a holding that has moved — a name that has
+          // doubled would be counted at half its value, so exposure reads low
+          // and the caps let the book run further than they should.
+          if (!(px > 0)) {
+            const series = bars.get(p.ticker);
+            for (let k = sIdx; k >= 0 && !(px > 0); k--) {
+              const c = series?.get(dates[k])?.close;
+              if (c > 0) px = c;
+            }
+            if (px > 0) stalePriced++; else unpricedHoldings++;
+          }
+          openingExposure += px > 0 ? Number(p.quantity) * px : Number(p.cost_basis);
+          if (p.ticker === o.ticker) {
+            tickerExposure += px > 0 ? Number(p.quantity) * px : Number(p.cost_basis);
+          }
         }
         const openingNav = Number(acc.cash_balance) + openingExposure;
 
@@ -561,6 +735,16 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
           await logEvent(conn, acct.id, status, entryDate,
             { orderId: o.id, ticker: o.ticker, detail: { sessionsSince } });
           outcome = status === 'DATA_MISSING' ? 'dataMissing' : 'dataPending';
+        } else if (unpricedHoldings > 0) {
+          // A holding this system has NEVER seen a price for makes the opening
+          // NAV a guess, and every cap — risk budget, gross exposure, per-name —
+          // is a fraction of that NAV. Sizing a new position against a number
+          // built partly on cost basis is how a book quietly ends up larger than
+          // its own limits. Wait instead; the order is retried tomorrow.
+          await conn.query(`UPDATE virtual_orders SET status='DATA_PENDING', reject_reason='OPENING_NAV_UNRELIABLE' WHERE id=?`, [o.id]);
+          await logEvent(conn, acct.id, 'DATA_PENDING', entryDate,
+            { orderId: o.id, ticker: o.ticker, detail: { unpricedHoldings, reason: 'OPENING_NAV_UNRELIABLE' } });
+          outcome = 'dataPending';
         } else if (!(bar.open > 0)) {
           // The row exists and says there was no opening price. That IS an
           // execution outcome: the name was halted or never opened.
@@ -653,6 +837,27 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
           bar, stopPrice: Number(p.stop_price), targetPrice: Number(p.target_price),
           exitPolicy: acct.exit_policy, barsHeld: i - eIdx + 1, config: cfg,
         });
+
+        // A SESSION WE CANNOT READ BLOCKS THE WALK. It does not get skipped.
+        //
+        // `continue` here was unsafe in a way that quietly rewrites history: if
+        // day 2's high and low are missing and day 3 reaches the target, the
+        // engine books a TARGET on day 3 — when the position may well have been
+        // stopped out on day 2. It cannot know, so it must not choose the
+        // profitable reading by default. For INTRADAY_EOD it is starker still:
+        // an incomplete entry bar turns a same-day trade into a multi-day one,
+        // which is a different strategy.
+        //
+        // So the position waits. It stays OPEN, the account is flagged, and the
+        // walk resumes only once that session's data arrives.
+        if (r.unpriced || r.dataIncomplete) {
+          blocked.push({ position: p, date: d, reason: r.dataIncomplete ? 'DATA_INCOMPLETE_EXIT_BAR' : 'PRICE_HISTORY_BLOCKED' });
+          await logEvent(pool, acct.id, 'DATA_BLOCKED', d, {
+            positionId: p.id, ticker: p.ticker,
+            detail: { reason: r.dataIncomplete ? 'DATA_INCOMPLETE_EXIT_BAR' : 'PRICE_HISTORY_BLOCKED', barsHeld: i - eIdx + 1 },
+          });
+          break;
+        }
         if (r.open) continue;
 
         const proceeds = vb.sellProceeds(p.quantity, r.exitPrice, cfg);
@@ -681,7 +886,18 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
         break;
       }
     }
-    summary.push({ account: acct.account_code, status: acct.status, filled, noFill, rejected, closed, dataMissing, dataPending });
+    // An account whose exit walk is blocked cannot produce a trustworthy NAV or
+    // a comparable performance number: some of its positions are frozen mid-walk
+    // on a session nobody can read. Say so on the account rather than letting the
+    // number look ordinary.
+    await pool.query(
+      'UPDATE virtual_accounts SET performance_eligible=? , data_blocked_json=? WHERE id=?',
+      [blocked.length ? 0 : 1,
+       blocked.length ? JSON.stringify(blocked.map(b => ({ ticker: b.position.ticker, date: b.date, reason: b.reason }))) : null,
+       acct.id]);
+
+    summary.push({ account: acct.account_code, status: acct.status, filled, noFill, rejected, closed,
+                   dataMissing, dataPending, blocked: blocked.length });
   }
 
   if (!quiet) for (const s of summary) {
@@ -689,6 +905,11 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
       (s.status === 'RETIRING' ? '   [RETIRING - exits only]' : ''));
     if (s.dataMissing || s.dataPending) {
       console.log(`         ${s.dataPending} awaiting data, ${s.dataMissing} with data confirmed missing — NOT counted as no-fills`);
+    }
+    if (s.blocked) {
+      console.log(`         ** ${s.blocked} position(s) BLOCKED on an unreadable session — the walk stopped there`);
+      console.log('            performance_eligible=0 until that data arrives. The engine will');
+      console.log('            not read past a bar it cannot see and guess which level was hit first.');
     }
   }
   return summary;
@@ -702,41 +923,46 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
   const out = [];
 
   for (const acct of accounts) {
-    const [open] = await pool.query(
-      `SELECT ticker, quantity, cost_basis FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
-    const [[realized]] = await pool.query(
-      `SELECT COALESCE(SUM(net_pnl),0) r FROM virtual_positions WHERE account_id=? AND status='CLOSED'`, [acct.id]);
-    const [[acc]] = await pool.query('SELECT cash_balance, starting_cash FROM virtual_accounts WHERE id=?', [acct.id]);
+    // ONE SNAPSHOT, INSIDE THE TRANSACTION, WITH THE ACCOUNT LOCKED.
+    // The write was already atomic, but cash, positions and realized P&L were
+    // READ beforehand on autocommit. A resolve running concurrently could close
+    // a position between those reads, and the mark would then combine old cash
+    // with a new position list — a NAV that never existed at any instant.
+    const conn = await pool.getConnection();
+    let m, realizedPnl, openCount, startingCash, unrealized;
+    try {
+      await conn.beginTransaction();
+      const [[acc]] = await conn.query(
+        'SELECT cash_balance, starting_cash FROM virtual_accounts WHERE id=? FOR UPDATE', [acct.id]);
+      const [open] = await conn.query(
+        `SELECT ticker, quantity, cost_basis FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
+      const [[realized]] = await conn.query(
+        `SELECT COALESCE(SUM(net_pnl),0) r FROM virtual_positions WHERE account_id=? AND status='CLOSED'`, [acct.id]);
 
     // The last close this system actually has for a name, whatever its date.
     // Used when today's close is missing, BEFORE falling back to cost: a name
     // that has doubled should not snap back to its entry value because one
     // print did not arrive.
-    const lastCloseOf = t => {
-      const series = bars.get(t);
-      if (!series) return null;
-      for (let i = dates.length - 1; i >= 0; i--) {
-        const c = series.get(dates[i])?.close;
-        if (c > 0) return c;
-      }
-      return null;
-    };
+      const lastCloseOf = t => {
+        const series = bars.get(t);
+        if (!series) return null;
+        for (let i = dates.length - 1; i >= 0; i--) {
+          const c = series.get(dates[i])?.close;
+          if (c > 0) return c;
+        }
+        return null;
+      };
 
-    const m = vb.markToMarket({
-      cash: Number(acc.cash_balance), positions: open,
-      priceOf: t => bars.get(t)?.get(today)?.close || 0,
-      lastCloseOf,
-    });
-    const openCost = open.reduce((a, p) => a + Number(p.cost_basis), 0);
-    const unrealized = m.marketValue - openCost;
+      m = vb.markToMarket({
+        cash: Number(acc.cash_balance), positions: open,
+        priceOf: t => bars.get(t)?.get(today)?.close || 0,
+        lastCloseOf,
+      });
+      realizedPnl = Number(realized.r);
+      openCount = open.length;
+      startingCash = Number(acc.starting_cash);
+      unrealized = m.marketValue - open.reduce((a, p) => a + Number(p.cost_basis), 0);
 
-    // ONE TRANSACTION. These used to be two autocommit statements, so a crash
-    // between them left virtual_nav correct and virtual_accounts.total_nav
-    // stale — and the next fill sized against the stale one. Reconciliation did
-    // not compare them either, so the disagreement was invisible.
-    const conn = await pool.getConnection();
-    try {
-      await conn.beginTransaction();
       await conn.query(
         `INSERT INTO virtual_nav (account_id, mark_date, cash_value, market_value, total_nav,
                                   realized_pnl, unrealized_pnl, gross_exposure, open_positions, unmarkable)
@@ -744,21 +970,19 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
          ON DUPLICATE KEY UPDATE cash_value=VALUES(cash_value), market_value=VALUES(market_value),
            total_nav=VALUES(total_nav), realized_pnl=VALUES(realized_pnl), unrealized_pnl=VALUES(unrealized_pnl),
            gross_exposure=VALUES(gross_exposure), open_positions=VALUES(open_positions), unmarkable=VALUES(unmarkable)`,
-        [acct.id, today, m.cash, m.marketValue, m.totalNav, Number(realized.r), unrealized,
-         m.totalNav > 0 ? m.marketValue / m.totalNav : 0, open.length,
+        [acct.id, today, m.cash, m.marketValue, m.totalNav, realizedPnl, unrealized,
+         m.totalNav > 0 ? m.marketValue / m.totalNav : 0, openCount,
          [...m.unmarkable, ...m.stale.map(t => `${t}(stale)`)].join(',') || null]);
       await conn.query('UPDATE virtual_accounts SET total_nav=? WHERE id=?', [m.totalNav, acct.id]);
       await conn.commit();
     } catch (e) {
       await conn.rollback();
       console.error(`MARK  ${acct.account_code} rolled back: ${e.message}`);
-      conn.release();
       continue;
-    }
-    conn.release();
+    } finally { conn.release(); }
 
     out.push({ account: acct.account_code, status: acct.status, ...m,
-               realized: Number(realized.r), unrealized, startingCash: Number(acc.starting_cash) });
+               realized: realizedPnl, unrealized, startingCash });
   }
 
   if (!quiet) for (const o of out) {
@@ -841,6 +1065,10 @@ async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
 
   for (const acct of accounts) {
     const A = acct.account_code;
+    // THE ACCOUNT'S OWN FROZEN CONFIG, not whatever the code currently defaults
+    // to. A v1 account checked against v2's caps is being judged by rules it was
+    // never run under, which produces both false alarms and false clean bills.
+    const acfg = { ...vb.DEFAULT_CONFIG, ...(acct.config_json ? JSON.parse(acct.config_json) : {}) };
     const [[led]] = await pool.query(
       `SELECT COALESCE(SUM(CASE WHEN status='OPEN'   THEN cost_basis END),0) openCost,
               COALESCE(SUM(CASE WHEN status='CLOSED' THEN net_pnl    END),0) realized,
@@ -852,15 +1080,15 @@ async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
     check(cash >= -1e-6, `${A}: cash is NEGATIVE (${rp(cash)}) — the account borrowed`);
     check(Math.abs(cash - expected) < 1,
       `${A}: cash ${rp(cash)} does not equal starting - open cost + realized (${rp(expected)})`);
-    check(Number(led.nOpen) <= vb.DEFAULT_CONFIG.maxPositions,
-      `${A}: ${led.nOpen} open positions, the limit is ${vb.DEFAULT_CONFIG.maxPositions}`);
+    check(Number(led.nOpen) <= acfg.maxPositions,
+      `${A}: ${led.nOpen} open positions, the limit is ${acfg.maxPositions}`);
 
     const [[nav]] = await pool.query(
       'SELECT * FROM virtual_nav WHERE account_id=? ORDER BY mark_date DESC LIMIT 1', [acct.id]);
     if (nav) {
       check(Math.abs(Number(nav.total_nav) - (Number(nav.cash_value) + Number(nav.market_value))) < 1,
         `${A}: the last NAV mark does not equal cash + market value`);
-      check(Number(nav.gross_exposure) <= vb.DEFAULT_CONFIG.maxGrossExposure + 1e-6,
+      check(Number(nav.gross_exposure) <= acfg.maxGrossExposure + 1e-6,
         `${A}: gross exposure ${(Number(nav.gross_exposure) * 100).toFixed(1)}% is over the ceiling`);
       // The two NAV numbers must agree. They live in different rows and used to
       // be written by two separate autocommit statements, so a crash between
@@ -868,6 +1096,11 @@ async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
       // nothing compared them.
       check(Math.abs(Number(acct.total_nav) - Number(nav.total_nav)) < 1,
         `${A}: account.total_nav ${rp(acct.total_nav)} != latest virtual_nav ${rp(nav.total_nav)} — a mark was written but the account was not`);
+      // The mark must also agree with the ledger it claims to summarise.
+      check(Math.abs(Number(nav.cash_value) - Number(acct.cash_balance)) < 1,
+        `${A}: the last NAV mark says cash ${rp(nav.cash_value)}, the account holds ${rp(acct.cash_balance)}`);
+      check(Number(nav.open_positions) === Number(led.nOpen),
+        `${A}: the last NAV mark counts ${nav.open_positions} open position(s), the ledger has ${led.nOpen}`);
     }
 
     // One OPEN position per name, unless pyramiding is an explicit policy.
@@ -875,7 +1108,7 @@ async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
     const [dupes] = await pool.query(
       `SELECT ticker, COUNT(*) n FROM virtual_positions WHERE account_id=? AND status='OPEN'
         GROUP BY ticker HAVING n > 1`, [acct.id]);
-    if (!vb.DEFAULT_CONFIG.allowPyramiding) {
+    if (!acfg.allowPyramiding) {
       check(!dupes.length,
         `${A}: ${dupes.map(d => `${d.ticker} x${d.n}`).join(', ')} held as multiple independent OPEN positions, but pyramiding is off`);
     }
@@ -886,14 +1119,20 @@ async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
       const [byTicker] = await pool.query(
         `SELECT ticker, SUM(quantity) q FROM virtual_positions WHERE account_id=? AND status='OPEN' GROUP BY ticker`, [acct.id]);
       for (const t of byTicker) {
+        // ON THE SESSION CALENDAR. `ORDER BY date DESC LIMIT 1` over the raw
+        // price table would happily pick up a phantom weekend row that
+        // loadBars() has already refused — the reconciliation contradicting the
+        // engine it is supposed to be checking.
         const [[px]] = await pool.query(
-          'SELECT close_price c FROM idx_stock_prices WHERE stock_code=? ORDER BY date DESC LIMIT 1', [t.ticker]);
+          `SELECT p.close_price c FROM idx_stock_prices p
+             JOIN idx_ihsg_history i ON i.date = p.date
+            WHERE p.stock_code=? ORDER BY p.date DESC LIMIT 1`, [t.ticker]);
         if (!px?.c) continue;
         const frac = (Number(t.q) * Number(px.c)) / Number(nav.total_nav);
         // 1.5x the cap: drift from a winner is expected and is not a bug; this
         // is looking for a name that was BOUGHT past the limit.
-        check(frac <= vb.DEFAULT_CONFIG.maxPositionNotional * 1.5,
-          `${A}: ${t.ticker} is ${(frac * 100).toFixed(1)}% of NAV, cap is ${(vb.DEFAULT_CONFIG.maxPositionNotional * 100).toFixed(1)}%`);
+        check(frac <= acfg.maxPositionNotional * 1.5,
+          `${A}: ${t.ticker} is ${(frac * 100).toFixed(1)}% of NAV, cap is ${(acfg.maxPositionNotional * 100).toFixed(1)}%`);
       }
     }
 
@@ -902,6 +1141,12 @@ async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
     // stayed open, unmonitored and never returning their cash.
     if (acct.status === 'CLOSED') {
       check(!Number(led.nOpen), `${A}: status is CLOSED but ${led.nOpen} position(s) are still OPEN`);
+    }
+
+    // A blocked exit walk means some positions are frozen on a session nobody
+    // can read, so the account's numbers are not comparable to anything.
+    if (Number(acct.performance_eligible) === 0) {
+      problems.push(`${A}: performance_eligible=0 — ${acct.data_blocked_json || 'exit walk blocked'}`);
     }
 
     const [[x]] = await pool.query(
@@ -957,7 +1202,8 @@ async function main() {
 
 module.exports = {
   setup, cmdSchedule, cmdResolve, cmdMark, cmdStatus, cmdReconcile,
-  retireSupersededAccounts, loadAccounts, loadBars, ACCOUNTS, SOURCE_STRATEGY,
+  retireSupersededAccounts, loadAccounts, loadBars, sessionCalendarState, migrateEnum,
+  ACCOUNTS, SOURCE_STRATEGY,
 };
 
 if (require.main === module) {

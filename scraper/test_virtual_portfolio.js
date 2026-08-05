@@ -574,6 +574,166 @@ async function cashByAccount(pool) {
         `expected a NAV disagreement, got ${JSON.stringify(problems)}`);
     });
 
+    console.log('\nvirtual portfolio — the 2026-08-05 second round');
+
+    await t('RESOLVE REFUSES TO RUN ON A STALE SESSION CALENDAR', async () => {
+      // The live cron ran resolve at 20:00 and refresh_ihsg at 20:10, so on any
+      // evening the index had not refreshed, today's session was off the axis
+      // and every order silently went unfilled — to be booked a day late.
+      const state = await vp.sessionCalendarState(pool);
+      assert.strictEqual(state.stale, false, 'sanity: the calendar is current right now');
+
+      // Push the price series one session ahead of the calendar, exactly as the
+      // 19:30 pull followed by no IHSG refresh would.
+      const ahead = (() => {
+        const d = new Date(`${state.prices}T00:00:00Z`);
+        do { d.setUTCDate(d.getUTCDate() + 1); } while (d.getUTCDay() === 0 || d.getUTCDay() === 6);
+        return d.toISOString().slice(0, 10);
+      })();
+      await pool.query(
+        `INSERT INTO idx_stock_prices (stock_code, date, open_price, high_price, low_price, close_price)
+         VALUES ('ZZTFLAT',?,1000,1010,990,1000) ON DUPLICATE KEY UPDATE open_price=1000`, [ahead]);
+      try {
+        const now = await vp.sessionCalendarState(pool);
+        assert.strictEqual(now.stale, true, 'the calendar must now read as behind');
+        const r = await vp.cmdResolve(pool, true, OPTS);
+        assert.strictEqual(r.blocked, 'SESSION_CALENDAR_STALE');
+        assert.deepStrictEqual(r.summary, [], 'nothing may be resolved while the calendar is behind');
+      } finally {
+        await pool.query(`DELETE FROM idx_stock_prices WHERE stock_code='ZZTFLAT' AND date=?`, [ahead]);
+      }
+    });
+
+    await t('AN UNREADABLE SESSION BLOCKS THE WALK — the engine does not read past it', async () => {
+      // The dangerous case: day 2's high/low missing, day 3 reaches the target.
+      // Skipping day 2 books a TARGET that may never have happened, because the
+      // position could have been stopped out on the bar nobody can read.
+      const held = await q(pool,
+        `SELECT p.id, p.ticker, p.account_id FROM virtual_positions p JOIN virtual_accounts a ON a.id=p.account_id
+          WHERE a.strategy_id=? AND p.status='OPEN' LIMIT 1`, [STRATEGY]);
+      assert.ok(held.length, 'need an open position to block');
+      const pos = held[0];
+
+      // Blank the high and low on the latest session, then put a target-clearing
+      // bar nowhere the engine may legally look yet.
+      const last = dates[dates.length - 1];
+      const [orig] = await q(pool,
+        'SELECT high_price h, low_price l FROM idx_stock_prices WHERE stock_code=? AND date=?', [pos.ticker, last]);
+      await pool.query(
+        'UPDATE idx_stock_prices SET high_price=0, low_price=0 WHERE stock_code=? AND date=?', [pos.ticker, last]);
+      try {
+        await vp.cmdResolve(pool, true, OPTS);
+        const [after] = await q(pool, 'SELECT status, exit_reason FROM virtual_positions WHERE id=?', [pos.id]);
+        assert.strictEqual(after.status, 'OPEN', 'the position must wait, not resolve on a later bar');
+
+        const [ev] = await q(pool,
+          `SELECT COUNT(*) n FROM virtual_trade_events WHERE position_id=? AND event='DATA_BLOCKED'`, [pos.id]);
+        assert.ok(Number(ev.n) >= 1, 'the block must be journalled, not merely implied by inaction');
+
+        const [acct] = await q(pool,
+          'SELECT performance_eligible, data_blocked_json FROM virtual_accounts WHERE id=?', [pos.account_id]);
+        assert.strictEqual(Number(acct.performance_eligible), 0,
+          'an account with a frozen exit walk cannot report a comparable number');
+        assert.ok(acct.data_blocked_json && acct.data_blocked_json.includes(pos.ticker));
+      } finally {
+        await pool.query(
+          'UPDATE idx_stock_prices SET high_price=?, low_price=? WHERE stock_code=? AND date=?',
+          [orig.h, orig.l, pos.ticker, last]);
+        await vp.cmdResolve(pool, true, OPTS);
+      }
+    });
+
+    await t('once the data returns, the account becomes eligible again', async () => {
+      const rows = await q(pool,
+        'SELECT performance_eligible FROM virtual_accounts WHERE strategy_id=?', [STRATEGY]);
+      for (const r of rows) assert.strictEqual(Number(r.performance_eligible), 1);
+    });
+
+    await t('MIGRATIONS PROVE THEMSELVES — a widened enum is read back, not assumed', async () => {
+      // The old code did ALTER ... .catch(() => {}), so a migration that failed
+      // on permissions reported success and the runtime broke hours later.
+      await pool.query('DROP TABLE IF EXISTS zz_enum_probe');
+      await pool.query(`CREATE TABLE zz_enum_probe (id INT PRIMARY KEY, status ENUM('A','B') NOT NULL DEFAULT 'A')`);
+      await pool.query(`INSERT INTO zz_enum_probe (id,status) VALUES (1,'A')`);
+      try {
+        const r = await vp.migrateEnum(pool, 'zz_enum_probe', 'status', ['A', 'B', 'C'], `NOT NULL DEFAULT 'A'`);
+        assert.strictEqual(r.migrated, true);
+        // The proof the review asked for: the new value can actually be written.
+        await pool.query(`UPDATE zz_enum_probe SET status='C' WHERE id=1`);
+        const [row] = await q(pool, 'SELECT status FROM zz_enum_probe WHERE id=1');
+        assert.strictEqual(row.status, 'C');
+        // And re-running is a no-op rather than a repeated ALTER.
+        const again = await vp.migrateEnum(pool, 'zz_enum_probe', 'status', ['A', 'B', 'C'], `NOT NULL DEFAULT 'A'`);
+        assert.strictEqual(again.alreadyCurrent, true);
+      } finally {
+        await pool.query('DROP TABLE IF EXISTS zz_enum_probe');
+      }
+    });
+
+    await t('a migration that CANNOT succeed throws instead of reporting success', async () => {
+      await assert.rejects(
+        () => vp.migrateEnum(pool, 'zz_table_that_does_not_exist', 'status', ['A'], 'NULL'),
+        /does not exist/,
+        'a missing table must not be swallowed');
+    });
+
+    await t('PENDING ORDERS ARE CANCELLED when the contract changes, not inherited', async () => {
+      // An order scheduled under v1 and filled by v2's resolver is recorded as
+      // v1 while being executed by a different algorithm.
+      const acct = (await q(pool,
+        `SELECT id FROM virtual_accounts WHERE strategy_id=? AND exit_policy='INTRADAY_EOD'`, [STRATEGY]))[0];
+      await pool.query(
+        `INSERT INTO virtual_orders (account_id, ticker, side, signal_date, status, execution_policy_hash)
+         VALUES (?, 'ZZTSTOP', 'BUY', ?, 'DATA_PENDING', 'x')
+         ON DUPLICATE KEY UPDATE status='DATA_PENDING'`, [acct.id, dates[dates.length - 3]]);
+      await pool.query(
+        `UPDATE virtual_accounts SET execution_policy_hash='0000gonepolicy2' WHERE id=?`, [acct.id]);
+      try {
+        await vp.retireSupersededAccounts(pool, STRATEGY, true);
+        const [o] = await q(pool,
+          `SELECT status, reject_reason FROM virtual_orders WHERE account_id=? AND ticker='ZZTSTOP' AND signal_date=?`,
+          [acct.id, dates[dates.length - 3]]);
+        assert.strictEqual(o.status, 'CANCELLED', 'a DATA_PENDING order survived a contract change');
+        assert.ok(/POLICY_CHANGE|STRATEGY_CHANGE/.test(o.reject_reason), o.reject_reason);
+      } finally {
+        await pool.query(`DELETE FROM virtual_orders WHERE account_id=? AND ticker='ZZTSTOP' AND signal_date=?`,
+          [acct.id, dates[dates.length - 3]]);
+        await pool.query(
+          `UPDATE virtual_accounts SET execution_policy_hash=?, status='ACTIVE' WHERE id=?`,
+          [vb.executionPolicyHash({}, 'INTRADAY_EOD'), acct.id]);
+      }
+    });
+
+    await t('a retiring account UNWINDS at the first available price, it does not keep trading', async () => {
+      const acct = (await q(pool,
+        `SELECT id FROM virtual_accounts WHERE strategy_id=? AND exit_policy='POSITION'`, [STRATEGY]))[0];
+      const before = await q(pool,
+        `SELECT COUNT(*) n FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
+      assert.ok(Number(before[0].n) >= 1, 'need an open position to unwind');
+
+      await pool.query(`UPDATE virtual_accounts SET execution_policy_hash='0000gonepolicy3' WHERE id=?`, [acct.id]);
+      try {
+        await vp.retireSupersededAccounts(pool, STRATEGY, true);
+        const [st] = await q(pool, 'SELECT status FROM virtual_accounts WHERE id=?', [acct.id]);
+        assert.strictEqual(st.status, 'RETIRING');
+
+        await vp.cmdResolve(pool, true, OPTS);
+        const [after] = await q(pool,
+          `SELECT COUNT(*) n FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
+        assert.strictEqual(Number(after.n), 0, 'the retiring account still holds positions');
+
+        const [closedRow] = await q(pool,
+          `SELECT exit_reason FROM virtual_positions WHERE account_id=? AND status='CLOSED'
+            ORDER BY id DESC LIMIT 1`, [acct.id]);
+        assert.ok(/_CHANGE_EXIT$/.test(closedRow.exit_reason),
+          `expected an explicit policy/strategy exit, got ${closedRow.exit_reason}`);
+      } finally {
+        await pool.query(
+          `UPDATE virtual_accounts SET execution_policy_hash=?, status='ACTIVE' WHERE id=?`,
+          [vb.executionPolicyHash({}, 'POSITION'), acct.id]);
+      }
+    });
+
     console.log('\nvirtual portfolio — a changed execution contract');
 
     // LAST on purpose. This inserts an extra account row, and an extra row is
