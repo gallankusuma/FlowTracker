@@ -34,6 +34,7 @@ const vb = require('./modules/virtual_broker');
 const STRATEGY = 'TEST_VIRTUAL_DO_NOT_TRADE';
 const OPTS = { strategyId: STRATEGY };
 const TICKERS = ['ZZTSTOP', 'ZZTTGT', 'ZZTFLAT'];
+const PLAN_HASH = 'testvirtual00001';
 const REQUIRE_DB = process.argv.includes('--require-db') || process.env.FT_REQUIRE_DB === '1';
 
 let pass = 0, fail = 0;
@@ -130,10 +131,10 @@ async function cashByAccount(pool) {
     // design exists to make.
     for (const a of vp.ACCOUNTS) {
       await pool.query(
-        `INSERT INTO virtual_accounts (account_code, strategy_id, exit_policy, execution_policy_hash,
+        `INSERT INTO virtual_accounts (account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash,
                                        config_json, starting_cash, cash_balance, total_nav)
-         VALUES (?,?,?,?,?,?,?,?)`,
-        [`TEST_${a.exitPolicy}`, STRATEGY, a.exitPolicy, vb.executionPolicyHash({}, a.exitPolicy),
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [`TEST_${a.exitPolicy}`, STRATEGY, PLAN_HASH, a.exitPolicy, vb.executionPolicyHash({}, a.exitPolicy),
          JSON.stringify(vb.DEFAULT_CONFIG), 100_000_000, 100_000_000, 100_000_000]);
     }
     await pool.query(
@@ -141,7 +142,7 @@ async function cashByAccount(pool) {
                                      data_snapshot_hash, code_commit, exposure, reason, regime_label,
                                      eligible, vetoed, target_json, status)
        VALUES (?,?,'LIVE',NOW(),?,?,?,1.00,'TEST PLAN','INVESTED',?,0,?,'PLANNED')`,
-      [STRATEGY, signalDate, 'testvirtual00001', 'testsnapshot0001', 'testcommit',
+      [STRATEGY, signalDate, PLAN_HASH, 'testsnapshot0001', 'testcommit',
        TICKERS.length, JSON.stringify(TICKERS)]);
 
     console.log('\nvirtual portfolio — scheduling');
@@ -376,8 +377,201 @@ async function cashByAccount(pool) {
             SET p.stop_price = p.entry_price + 1
           WHERE a.strategy_id=? AND p.status='OPEN'`, [STRATEGY]);
       const problems = await vp.cmdReconcile(pool, OPTS);
+      // Restore it. Leaving a corrupted stop behind meant every later
+      // reconcile in this file carried a phantom second problem.
+      await pool.query(
+        `UPDATE virtual_positions p JOIN virtual_accounts a ON a.id=p.account_id
+            SET p.stop_price = p.entry_price - 50
+          WHERE a.strategy_id=? AND p.status='OPEN'`, [STRATEGY]);
       assert.ok(problems.some(p => /impossible stop/.test(p)),
         `expected a stop failure, got: ${JSON.stringify(problems)}`);
+      const after = await vp.cmdReconcile(pool, OPTS);
+      assert.deepStrictEqual(after, [], 'the ledger must be clean again once the stop is restored');
+    });
+
+    console.log('\nvirtual portfolio — the 2026-08-05 review');
+
+    await t('A PHANTOM WEEKEND BAR CANNOT BECOME THE ENTRY DAY', () => {
+      // The failure this guards: a Friday signal filling on a "Saturday" row.
+      // The axis is idx_ihsg_history, so a price row outside the session
+      // calendar is invisible no matter what the price table says.
+      const bad = dates.filter(d => {
+        const dow = new Date(`${d}T00:00:00Z`).getUTCDay();
+        return dow === 0 || dow === 6;
+      });
+      assert.deepStrictEqual(bad, [], `the session axis contains weekend dates: ${bad.join(', ')}`);
+    });
+
+    await t('a price row dated off the session calendar is dropped, not used', async () => {
+      // Written directly, exactly as a bad ingest would. The Saturday after the
+      // last session is not a session, so the bar must never be reachable.
+      const sat = (() => {
+        const d = new Date(`${dates[dates.length - 1]}T00:00:00Z`);
+        do { d.setUTCDate(d.getUTCDate() + 1); } while (d.getUTCDay() !== 6);
+        return d.toISOString().slice(0, 10);
+      })();
+      await pool.query(
+        `INSERT INTO idx_stock_prices (stock_code, date, open_price, high_price, low_price, close_price)
+         VALUES ('ZZTFLAT',?,1,1,1,1) ON DUPLICATE KEY UPDATE open_price=1`, [sat]);
+      try {
+        const loaded = await vp.loadBars(pool);
+        assert.ok(!loaded.dates.includes(sat), 'a weekend date reached the session axis');
+        assert.ok(!loaded.bars.get('ZZTFLAT')?.has(sat), 'a weekend bar reached the price map');
+        assert.ok(loaded.offCalendar >= 1, 'the drop must be COUNTED, not silent');
+      } finally {
+        await pool.query(`DELETE FROM idx_stock_prices WHERE stock_code='ZZTFLAT' AND date=?`, [sat]);
+      }
+    });
+
+    await t('A RETAINED TICKER IS NOT BOUGHT TWICE', async () => {
+      // ZZTFLAT is still OPEN on the position account. A new plan naming it
+      // again must not schedule a second order.
+      const nextSignal = dates[dates.length - 1];
+      await pool.query(
+        `INSERT INTO ft_strategy_plan (strategy_id, as_of_date, run_mode, generated_at, strategy_hash,
+                                       data_snapshot_hash, code_commit, exposure, reason, regime_label,
+                                       eligible, vetoed, target_json, status)
+         VALUES (?,?,'LIVE',NOW(),?,?,?,1.00,'RETAIN TEST','INVESTED',1,0,?,'PLANNED')
+         ON DUPLICATE KEY UPDATE target_json=VALUES(target_json)`,
+        [STRATEGY, nextSignal, PLAN_HASH, 'testsnapshot0001', 'testcommit', JSON.stringify(['ZZTFLAT'])]);
+
+      const r = await vp.cmdSchedule(pool, true, OPTS);
+      assert.ok(r.held >= 1, `expected the retained holding to be skipped, got ${JSON.stringify(r)}`);
+      const [c] = await q(pool,
+        `SELECT COUNT(*) n FROM virtual_orders o JOIN virtual_accounts a ON a.id=o.account_id
+          WHERE a.strategy_id=? AND a.exit_policy='POSITION' AND o.ticker='ZZTFLAT'`, [STRATEGY]);
+      assert.strictEqual(Number(c.n), 1, 'a second order was created for a name already held');
+    });
+
+    await t('orders carry their TARGET RANK, so cash does not go to the alphabet', async () => {
+      const rows = await q(pool,
+        `SELECT o.ticker, o.target_rank FROM virtual_orders o JOIN virtual_accounts a ON a.id=o.account_id
+          WHERE a.strategy_id=? AND a.exit_policy='POSITION' AND o.signal_date=?
+          ORDER BY o.target_rank`, [STRATEGY, signalDate]);
+      assert.strictEqual(rows.length, TICKERS.length);
+      assert.deepStrictEqual(rows.map(r => r.ticker), TICKERS,
+        'rank order must reproduce the plan order, not alphabetical order');
+      assert.deepStrictEqual(rows.map(r => Number(r.target_rank)), [0, 1, 2]);
+    });
+
+    await t('A PLAN FROM A DIFFERENT STRATEGY HASH IS NOT SCHEDULED INTO THIS ACCOUNT', async () => {
+      // The scenario the review named: hash A made Rp10 juta, config changes to
+      // hash B, B's orders land in A's account and B starts from Rp110 juta.
+      const d = dates[dates.length - 1];
+      await pool.query('DELETE FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?', [STRATEGY, d]);
+      await pool.query(
+        `INSERT INTO ft_strategy_plan (strategy_id, as_of_date, run_mode, generated_at, strategy_hash,
+                                       data_snapshot_hash, code_commit, exposure, reason, regime_label,
+                                       eligible, vetoed, target_json, status)
+         VALUES (?,?,'LIVE',NOW(),'DIFFERENTHASH01',?,?,1.00,'HASH B','INVESTED',1,0,?,'PLANNED')`,
+        [STRATEGY, d, 'testsnapshot0001', 'testcommit', JSON.stringify(['ZZTSTOP'])]);
+
+      const before = await q(pool,
+        `SELECT COUNT(*) n FROM virtual_orders o JOIN virtual_accounts a ON a.id=o.account_id WHERE a.strategy_id=?`, [STRATEGY]);
+      const r = await vp.cmdSchedule(pool, true, OPTS);
+      const after = await q(pool,
+        `SELECT COUNT(*) n FROM virtual_orders o JOIN virtual_accounts a ON a.id=o.account_id WHERE a.strategy_id=?`, [STRATEGY]);
+
+      assert.strictEqual(r.scheduled, 0, 'orders from another strategy hash were scheduled');
+      assert.strictEqual(r.mismatched, 2, 'both accounts should have refused it');
+      assert.strictEqual(Number(after[0].n), Number(before[0].n), 'the order table changed');
+    });
+
+    await t('a plan with NO strategy hash is refused outright', async () => {
+      const d = dates[dates.length - 1];
+      await pool.query('DELETE FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?', [STRATEGY, d]);
+      await pool.query(
+        `INSERT INTO ft_strategy_plan (strategy_id, as_of_date, run_mode, generated_at, strategy_hash,
+                                       data_snapshot_hash, code_commit, exposure, reason, regime_label,
+                                       eligible, vetoed, target_json, status)
+         VALUES (?,?,'LIVE',NOW(),NULL,?,?,1.00,'NO HASH','INVESTED',1,0,?,'PLANNED')`,
+        [STRATEGY, d, 'testsnapshot0001', 'testcommit', JSON.stringify(['ZZTSTOP'])]);
+      const r = await vp.cmdSchedule(pool, true, OPTS);
+      assert.strictEqual(r.reason, 'PLAN_WITHOUT_HASH');
+      assert.strictEqual(r.scheduled, 0);
+      await pool.query('DELETE FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?', [STRATEGY, d]);
+    });
+
+    await t('A RETIRING ACCOUNT KEEPS RESOLVING ITS OPEN POSITIONS', async () => {
+      // The failure: CLOSED hid the account from loadAccounts() while a
+      // position was still open, so it was never stopped out, never timed out,
+      // never marked, and never returned its cash.
+      await pool.query(
+        `UPDATE virtual_accounts SET status='RETIRING' WHERE strategy_id=? AND exit_policy='POSITION'`, [STRATEGY]);
+      const loaded = await vp.loadAccounts(pool, STRATEGY);
+      assert.ok(loaded.some(a => a.status === 'RETIRING'),
+        'a retiring account must still be loaded for exits and marks');
+
+      // ...but it must take no new orders.
+      const d = dates[dates.length - 1];
+      await pool.query(
+        `INSERT INTO ft_strategy_plan (strategy_id, as_of_date, run_mode, generated_at, strategy_hash,
+                                       data_snapshot_hash, code_commit, exposure, reason, regime_label,
+                                       eligible, vetoed, target_json, status)
+         VALUES (?,?,'LIVE',NOW(),?,?,?,1.00,'RETIRING TEST','INVESTED',1,0,?,'PLANNED')`,
+        [STRATEGY, d, PLAN_HASH, 'testsnapshot0001', 'testcommit', JSON.stringify(['ZZTSTOP'])]);
+      const before = await q(pool,
+        `SELECT COUNT(*) n FROM virtual_orders o JOIN virtual_accounts a ON a.id=o.account_id
+          WHERE a.strategy_id=? AND a.exit_policy='POSITION'`, [STRATEGY]);
+      await vp.cmdSchedule(pool, true, OPTS);
+      const after = await q(pool,
+        `SELECT COUNT(*) n FROM virtual_orders o JOIN virtual_accounts a ON a.id=o.account_id
+          WHERE a.strategy_id=? AND a.exit_policy='POSITION'`, [STRATEGY]);
+      assert.strictEqual(Number(after[0].n), Number(before[0].n), 'a retiring account accepted a new order');
+
+      // And marking must still cover it.
+      const marks = await vp.cmdMark(pool, true, OPTS);
+      assert.ok(marks.some(m => m.status === 'RETIRING'), 'a retiring account was not marked');
+
+      await pool.query('DELETE FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?', [STRATEGY, d]);
+      await pool.query(`UPDATE virtual_accounts SET status='ACTIVE' WHERE strategy_id=? AND exit_policy='POSITION'`, [STRATEGY]);
+    });
+
+    await t('an account is NOT closed while it still holds something', async () => {
+      // retireSupersededAccounts must route a busy account to RETIRING.
+      await pool.query(
+        `UPDATE virtual_accounts SET execution_policy_hash='0000gonepolicy1'
+          WHERE strategy_id=? AND exit_policy='POSITION'`, [STRATEGY]);
+      try {
+        await vp.retireSupersededAccounts(pool, STRATEGY, true);
+        const [a] = await q(pool,
+          `SELECT status FROM virtual_accounts WHERE strategy_id=? AND execution_policy_hash='0000gonepolicy1'`, [STRATEGY]);
+        assert.strictEqual(a.status, 'RETIRING',
+          'an account with an open position must not go straight to CLOSED');
+      } finally {
+        await pool.query(
+          `UPDATE virtual_accounts SET execution_policy_hash=?, status='ACTIVE'
+            WHERE strategy_id=? AND exit_policy='POSITION'`,
+          [vb.executionPolicyHash({}, 'POSITION'), STRATEGY]);
+      }
+    });
+
+    await t('the NAV mark and the account total move together', async () => {
+      // They were two autocommit statements; a crash between them left the
+      // account sizing its next fill against a stale NAV, and nothing compared
+      // the two numbers.
+      await vp.cmdMark(pool, true, OPTS);
+      const rows = await q(pool,
+        `SELECT a.account_code, a.total_nav, v.total_nav navRow
+           FROM virtual_accounts a
+           JOIN virtual_nav v ON v.account_id = a.id
+          WHERE a.strategy_id=? AND v.mark_date = (SELECT MAX(mark_date) FROM virtual_nav WHERE account_id=a.id)`,
+        [STRATEGY]);
+      assert.ok(rows.length >= 2);
+      for (const r of rows) {
+        assert.ok(Math.abs(Number(r.total_nav) - Number(r.navRow)) < 1,
+          `${r.account_code}: account ${r.total_nav} vs nav row ${r.navRow}`);
+      }
+    });
+
+    await t('a stale account NAV is caught by reconcile, not just left there', async () => {
+      const before = await q(pool,
+        `SELECT id, total_nav FROM virtual_accounts WHERE strategy_id=? AND exit_policy='POSITION'`, [STRATEGY]);
+      await pool.query('UPDATE virtual_accounts SET total_nav = total_nav + 777777 WHERE id=?', [before[0].id]);
+      const problems = await vp.cmdReconcile(pool, OPTS);
+      await pool.query('UPDATE virtual_accounts SET total_nav=? WHERE id=?', [before[0].total_nav, before[0].id]);
+      assert.ok(problems.some(p => /latest virtual_nav/.test(p)),
+        `expected a NAV disagreement, got ${JSON.stringify(problems)}`);
     });
 
     console.log('\nvirtual portfolio — a changed execution contract');
@@ -392,10 +586,10 @@ async function cashByAccount(pool) {
       // hash, so the new account row landed BESIDE the old one, both stayed
       // ACTIVE, and every stage ran twice against four accounts.
       await pool.query(
-        `INSERT INTO virtual_accounts (account_code, strategy_id, exit_policy, execution_policy_hash,
+        `INSERT INTO virtual_accounts (account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash,
                                        config_json, starting_cash, cash_balance, total_nav)
-         VALUES ('TEST_STALE_CONTRACT',?,'POSITION','0000staleconTract','{}',100000000,100000000,100000000)`,
-        [STRATEGY]);
+         VALUES ('TEST_STALE_CONTRACT',?,?,'POSITION','0000staleconTract','{}',100000000,100000000,100000000)`,
+        [STRATEGY, PLAN_HASH]);
       const before = await vp.loadAccounts(pool, STRATEGY);
       assert.strictEqual(before.length, 3, 'the stale row must be ACTIVE to begin with, or this proves nothing');
 

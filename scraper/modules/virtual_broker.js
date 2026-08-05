@@ -32,6 +32,8 @@
 'use strict';
 
 const crypto = require('crypto');
+const policy = require('./trade_policy');
+const { calcATR } = require('../awo_technical');
 
 /** IDX board lot. Position sizes are always a whole multiple of this. */
 const LOT = 100;
@@ -42,25 +44,51 @@ const LOT = 100;
  * and the resulting record is a different experiment that must not be pooled
  * with the old one.
  */
+/**
+ * The RISK LAYER comes from modules/trade_policy.js, which exists to be the
+ * single source of truth for it.
+ *
+ * The previous version claimed to do this and did not: it re-declared
+ * maxHoldBars, riskAtrMult, fallbackRiskPct and targetR as literals that
+ * happened to match the POSITION profile. Matching by coincidence is not
+ * sharing — change the profile and the virtual portfolio would have kept sizing
+ * against the old one while the trade-plan engine moved, and nothing would have
+ * said so. The 2026-08-05 review caught it.
+ *
+ * `resolve()` reads the active profile fresh, so AWO_HORIZON=SWING really does
+ * produce a different contract — and the profile NAME is part of the config, so
+ * the execution policy hash moves with it instead of two profiles quietly
+ * sharing a track record.
+ */
+function riskLayer() {
+  const p = policy.active();
+  return {
+    profile: p.name,
+    maxHoldBars: p.maxHoldBars,
+    riskAtrMult: p.riskAtrMult,
+    fallbackRiskPct: p.fallbackRiskPct,
+    targetR: p.target1R,
+  };
+}
+
 const DEFAULT_CONFIG = {
-  version: 1,
+  // v2 (2026-08-05): the accounting and execution changes from the review —
+  // session calendar, opening-NAV sizing, gap-aware exits, aggregate per-name
+  // cap, strategy-hash isolation. v1 records must not be pooled with these.
+  version: 2,
   startingCash: 100_000_000,
   riskPerTrade: 0.005,          // 0.50% of NAV at risk per position
-  maxPositionNotional: 0.125,   // 12.5% of NAV in any one name
+  maxPositionNotional: 0.125,   // 12.5% of NAV in any one name, AGGREGATE
   maxPositions: 8,
   maxGrossExposure: 0.90,       // never more than 90% invested
   feeBuy: 0.0015,
   feeSell: 0.0025,
   slippage: 0.0010,
   lot: LOT,
-  // The RISK LAYER, taken from modules/trade_policy.js rather than invented
-  // here. Risk-based sizing is only as meaningful as its stop, so a made-up
-  // stop distance would make every position size arbitrary. These are hashed
-  // with the rest: changing the stop or the target starts a new record.
-  maxHoldBars: 40,              // POSITION only
-  riskAtrMult: 2.5,             // stop = entry - 2.5 x ATR14
-  fallbackRiskPct: 5,           // when ATR is not computable
-  targetR: 2,                   // take profit at 2R (target1R); 4R is the runner the policy allows
+  // Pyramiding is OFF: a name already held is not bought again. Explicit and
+  // hashed, because "top up the winners" is a different strategy, not a detail.
+  allowPyramiding: false,
+  ...riskLayer(),
 };
 
 /**
@@ -82,19 +110,22 @@ function tradeLevels(entryPrice, atr, config = DEFAULT_CONFIG) {
   };
 }
 
-/** Wilder ATR over the trailing `period` bars ending at the last element. */
+/**
+ * ATR over bars ending at the last element, via awo_technical.calcATR.
+ *
+ * This used to be a local loop with the docstring "Wilder ATR" over a plain
+ * mean of the last 14 true ranges. Wilder smoothing is recursive and gives a
+ * different number, so the label was simply false, and the virtual portfolio
+ * was sizing against an ATR the rest of the system does not use. Delegating
+ * removes the second implementation rather than correcting it in place — a
+ * corrected copy is still a copy, and the next divergence is a matter of time.
+ */
 function atrFrom(bars, period = 14) {
   if (!Array.isArray(bars) || bars.length < period + 1) return null;
-  const tr = [];
-  for (let i = 1; i < bars.length; i++) {
-    const b = bars[i], p = bars[i - 1];
-    if (!(b.high > 0) || !(b.low > 0) || !(p.close > 0)) continue;
-    tr.push(Math.max(b.high - b.low, Math.abs(b.high - p.close), Math.abs(b.low - p.close)));
-  }
-  if (tr.length < period) return null;
-  const window = tr.slice(-period);
-  return window.reduce((a, b) => a + b, 0) / period;
-};
+  const usable = bars.filter(b => b && b.high > 0 && b.low > 0 && b.close > 0);
+  if (usable.length < period + 1) return null;
+  return calcATR(usable.map(b => b.high), usable.map(b => b.low), usable.map(b => b.close), period);
+}
 
 const EXIT_POLICIES = { POSITION: 'POSITION', INTRADAY_EOD: 'INTRADAY_EOD' };
 
@@ -140,9 +171,23 @@ function sellProceeds(qty, price, config = DEFAULT_CONFIG) {
  *
  * @returns {{quantity:number, notional:number, riskBudget:number, rejectReason:string|null, cappedBy:string|null}}
  */
-function sizeOrder({ nav, cash, entryPrice, stopPrice, fillPrice = null, grossExposure = 0, openPositions = 0, config = DEFAULT_CONFIG }) {
+function sizeOrder({
+  nav, cash, entryPrice, stopPrice, fillPrice = null,
+  grossExposure = 0, openPositions = 0,
+  // Market value ALREADY held in this same name, at the opening price. The
+  // per-name cap is aggregate, not per order: the target book legitimately
+  // retains a name across rebalances, so without this a retained ticker was
+  // bought again every plan and one name could pass 12.5% three times over.
+  tickerExposure = 0,
+  config = DEFAULT_CONFIG,
+}) {
   const c = { ...DEFAULT_CONFIG, ...config };
   const no = (reason) => ({ quantity: 0, notional: 0, riskBudget: 0, rejectReason: reason, cappedBy: null });
+
+  // Pyramiding is a strategy choice, not a sizing detail. With it off, a name
+  // already held is simply not bought again — the position that exists is the
+  // position the plan wanted.
+  if (tickerExposure > 0 && !c.allowPyramiding) return no('ALREADY_HELD');
 
   // `fillPrice`, when given, is the price actually paid — slippage already in
   // it. Pass it and the whole calculation runs on one basis, so the recorded
@@ -161,7 +206,8 @@ function sizeOrder({ nav, cash, entryPrice, stopPrice, fillPrice = null, grossEx
   const perUnitCost = (fillPrice > 0 ? fillPrice : entryPrice * (1 + c.slippage)) * (1 + c.feeBuy);
   const caps = {
     RISK: riskBudget / riskPerShare,
-    POSITION_NOTIONAL: (nav * c.maxPositionNotional) / perUnitCost,
+    // Aggregate: what this name may hold in total, less what it already holds.
+    POSITION_NOTIONAL: Math.max(0, nav * c.maxPositionNotional - tickerExposure) / perUnitCost,
     CASH: cash / perUnitCost,
     GROSS_EXPOSURE: Math.max(0, nav * c.maxGrossExposure - grossExposure) / perUnitCost,
   };
@@ -183,34 +229,68 @@ function sizeOrder({ nav, cash, entryPrice, stopPrice, fillPrice = null, grossEx
  * What happened to an open position on one daily bar.
  *
  * PRIORITY, and the order is the whole point:
- *   1. no usable entry            -> NO_FILL
- *   2. stop AND target both hit   -> STOP
- *   3. stop hit                   -> STOP
- *   4. target hit                 -> TARGET
- *   5. neither, INTRADAY_EOD      -> EOD_CLOSE
- *   6. neither, POSITION          -> still open, or TIME_EXIT at maxHoldBars
+ *   1. no close                     -> unpriced, stays open
+ *   2. no high or no low            -> DATA_INCOMPLETE, stays open
+ *   3. open gapped through stop     -> STOP at the OPEN
+ *   4. open gapped through target   -> TARGET at the OPEN
+ *   5. stop AND target both touched -> STOP at the stop
+ *   6. stop touched                 -> STOP
+ *   7. target touched               -> TARGET
+ *   8. neither, INTRADAY_EOD        -> EOD_CLOSE
+ *   9. neither, POSITION            -> still open, or TIME_EXIT at maxHoldBars
  *
- * Rule 2 is a conservative assumption, not a fact. Daily OHLC records that the
+ * Rule 5 is a conservative assumption, not a fact. Daily OHLC records that the
  * low reached the stop and the high reached the target; it cannot say which came
  * first. Resolving to STOP is the same choice walkForwardResolve already makes.
  *
- * @param {{high:number,low:number,close:number}} bar
+ * Rules 3 and 4 exist because assuming otherwise flatters the simulation. A
+ * stock that gaps from 1000 to 800 through a 950 stop cannot be sold at 950 —
+ * the first available price is the open, and the loss is larger than the plan.
+ *
+ * @param {{open:number,high:number,low:number,close:number}} bar
  */
 function resolveBar({ bar, stopPrice, targetPrice, exitPolicy, barsHeld = 1, config = DEFAULT_CONFIG }) {
   const c = { ...DEFAULT_CONFIG, ...config };
   if (!bar || !(bar.close > 0)) return { exitReason: null, exitPrice: null, open: true, unpriced: true };
 
-  const hitStop = bar.low > 0 && bar.low <= stopPrice;
-  const hitTarget = bar.high > 0 && bar.high >= targetPrice;
+  // AN INCOMPLETE BAR IS NOT A QUIET BAR.
+  // Missing high/low used to fall through every touch test and land on
+  // EOD_CLOSE, which reads as "the level was never reached". It is not the same
+  // claim: one is an observation, the other is an absence of one. A data outage
+  // that looks like an execution outcome is the failure this project keeps
+  // repeating, so it gets its own answer and the position stays open.
+  if (!(bar.high > 0) || !(bar.low > 0)) {
+    return { exitReason: null, exitPrice: null, open: true, dataIncomplete: true };
+  }
 
-  if (hitStop) return { exitReason: 'STOP', exitPrice: stopPrice, open: false, ambiguous: hitTarget };
-  if (hitTarget) return { exitReason: 'TARGET', exitPrice: targetPrice, open: false, ambiguous: false };
+  // GAPS FIRST, and this is the correction that matters most for realism.
+  // The old code exited at exactly `stopPrice` whenever low <= stop, so a stock
+  // that closed at 1000 and opened at 800 through a 950 stop was recorded as
+  // selling at 950. Nobody could have. The first price at which the position
+  // could actually be exited is the open, so a gap through the level fills
+  // there and the loss is the real one.
+  const hasOpen = bar.open > 0;
+  if (hasOpen && bar.open <= stopPrice) {
+    return { exitReason: 'STOP', exitPrice: bar.open, open: false, ambiguous: false, gapped: true };
+  }
+  // Gapping up through the target is the mirror image, and the honest fill is
+  // also the open — better than the target, which is what actually happens to a
+  // resting sell order when the market opens above it.
+  if (hasOpen && bar.open >= targetPrice) {
+    return { exitReason: 'TARGET', exitPrice: bar.open, open: false, ambiguous: false, gapped: true };
+  }
+
+  const hitStop = bar.low <= stopPrice;
+  const hitTarget = bar.high >= targetPrice;
+
+  if (hitStop) return { exitReason: 'STOP', exitPrice: stopPrice, open: false, ambiguous: hitTarget, gapped: false };
+  if (hitTarget) return { exitReason: 'TARGET', exitPrice: targetPrice, open: false, ambiguous: false, gapped: false };
 
   if (exitPolicy === EXIT_POLICIES.INTRADAY_EOD) {
-    return { exitReason: 'EOD_CLOSE', exitPrice: bar.close, open: false, ambiguous: false };
+    return { exitReason: 'EOD_CLOSE', exitPrice: bar.close, open: false, ambiguous: false, gapped: false };
   }
   if (barsHeld >= c.maxHoldBars) {
-    return { exitReason: 'TIME_EXIT', exitPrice: bar.close, open: false, ambiguous: false };
+    return { exitReason: 'TIME_EXIT', exitPrice: bar.close, open: false, ambiguous: false, gapped: false };
   }
   return { exitReason: null, exitPrice: null, open: true, ambiguous: false };
 }
@@ -220,19 +300,40 @@ function resolveBar({ bar, stopPrice, targetPrice, exitPolicy, barsHeld = 1, con
  * and it must reconcile exactly. `unmarkable` names are carried at cost and
  * reported, never silently valued at zero.
  */
-function markToMarket({ cash, positions, priceOf }) {
+function markToMarket({ cash, positions, priceOf, lastCloseOf = null }) {
   let marketValue = 0;
-  const unmarkable = [];
+  const unmarkable = [];   // fell all the way back to cost — NAV is degraded
+  const stale = [];        // marked at a last-known close, not today's
+
   for (const p of positions) {
     const px = priceOf(p.ticker);
-    if (!(px > 0)) { unmarkable.push(p.ticker); marketValue += Number(p.cost_basis || 0); continue; }
-    marketValue += Number(p.quantity) * px;
+    if (px > 0) { marketValue += Number(p.quantity) * px; continue; }
+
+    // FALL BACK TO THE LAST KNOWN PRICE BEFORE FALLING BACK TO COST.
+    // Carrying an unpriced holding at cost is not neutral: a name that has
+    // doubled, or halved, snaps back to its entry value and the NAV jumps for
+    // reasons that have nothing to do with the market. One missing close should
+    // not erase months of P&L. Cost is the last resort, and when it is used the
+    // account is reported as degraded rather than merely annotated.
+    const last = lastCloseOf ? lastCloseOf(p.ticker) : null;
+    if (last > 0) {
+      marketValue += Number(p.quantity) * last;
+      stale.push(p.ticker);
+      continue;
+    }
+    unmarkable.push(p.ticker);
+    marketValue += Number(p.cost_basis || 0);
   }
-  return { cash, marketValue, totalNav: cash + marketValue, unmarkable };
+
+  return {
+    cash, marketValue, totalNav: cash + marketValue,
+    unmarkable, stale,
+    degraded: unmarkable.length > 0,
+  };
 }
 
 module.exports = {
-  LOT, DEFAULT_CONFIG, EXIT_POLICIES,
+  LOT, DEFAULT_CONFIG, EXIT_POLICIES, riskLayer,
   executionPolicyHash, floorToLot, buyCost, sellProceeds,
   sizeOrder, resolveBar, markToMarket, tradeLevels, atrFrom,
 };

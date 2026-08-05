@@ -1,371 +1,365 @@
-Virtual Broker & Portfolio Journal Engine
+P0 — wajib diperbaiki sebelum track record dianggap valid
+1. Account masih mencampur strategy hash berbeda
 
-Mulai dengan modal virtual Rp100 juta, order dari rekomendasi sistem, entry dan exit otomatis, seluruh transaksi dicatat seperti akun trading sungguhan.
+virtual_accounts hanya mempunyai:
 
-Jangan menempel langsung ke modul lama
+strategy_id
+execution_policy_hash
 
-FlowTracker sebenarnya sudah memiliki sebagian komponen yang dibutuhkan:
+Tidak mempunyai strategy_hash.
 
-rekomendasi hanya membuka posisi long untuk BUY dan STRONG BUY;
-entry disimulasikan pada open T+1;
-SL dan target dihitung setelah harga entry diketahui;
-jika SL dan target tersentuh pada candle yang sama, sistem memilih SL sebagai asumsi konservatif;
-fee round-trip sudah dimodelkan.
+Sedangkan order memang menyimpan strategy_hash, tetapi seluruh order lama dan baru tetap memakai cash dan NAV account yang sama. cmdSchedule() juga mengambil latest plan berdasarkan strategy_id saja.
 
-Tetapi paper_trading.js sekarang adalah validator kandidat model, bukan portfolio sungguhan. Setiap rekomendasi berdiri sendiri dalam satuan R; belum ada shared cash account, jumlah lot, buying power, portfolio NAV, atau batas modal Rp100 juta.
+Skenario:
 
-Jadi buat modul baru:
+Strategy hash A menghasilkan profit Rp10 juta
+Configuration berubah menjadi hash B
+Order B masuk account yang sama
+NAV B dimulai dari Rp110 juta
 
-modules/virtual_broker.js
-virtual_portfolio.js
-test_virtual_broker.js
-Catatan sangat penting soal closing market
+Track record B akhirnya membawa keuntungan A.
 
-Current active policy FlowTracker adalah POSITION, dengan batas holding 40 trading bars, risiko 2,5 ATR, dan target sampai 4R. Itu dirancang untuk horizon sekitar 2–8 minggu. Memaksa semua saham ditutup pada hari entry adalah strategi yang benar-benar berbeda.
+Perbaikan
 
-Artinya, jangan mengganti strategy existing. Jalankan dua akun paralel:
+Tambahkan ke account:
 
-Akun virtual	Exit policy
-POSITION_100M	SL, PT, atau maksimum 40 bars
-INTRADAY_EOD_100M	SL, PT, atau close hari entry
+strategy_hash VARCHAR(32) NOT NULL
 
-Dengan begini kita bisa menjawab pertanyaan penting:
+Unique identity:
 
-Edge sistem ini muncul secara intraday, atau memang membutuhkan holding beberapa minggu?
-
-Track record dua akun tidak boleh dicampur.
-
-Alur akun INTRADAY_EOD_100M
-Setelah market close hari T
-
-Sistem membekukan rekomendasi:
-
-BBCA BUY
-ASII BUY
-BMRI STRONG BUY
-
-Journal mencatat:
-
-status = SCHEDULED
-signal_date = T
-scheduled_entry_date = next trading day
-source_strategy_hash
-source_plan_id
-data_snapshot_hash
-code_commit
-
-Belum ada harga entry pada tahap ini.
-
-Hari T+1
-
-Karena data sekarang berbentuk daily OHLC, seluruh kejadian T+1 baru dapat diselesaikan setelah OHLC hari tersebut tersedia.
-
-Urutannya:
-
-Entry      = open T+1
-SL/PT      = dihitung dari actual entry
-SL hit     = low <= stop
-PT hit     = high >= target
-Tidak hit  = exit pada close T+1
-
-Prioritas resolusi:
-
-1. Entry tidak valid → NO_FILL
-2. SL dan PT sama-sama tersentuh → STOP
-3. SL tersentuh → STOP
-4. PT tersentuh → TARGET
-5. Tidak ada yang tersentuh → EOD_CLOSE
-
-Prioritas STOP ketika dua level tersentuh pada candle yang sama adalah asumsi konservatif yang sudah digunakan oleh paper-trading engine sekarang.
-
-Keterbatasan data
-
-Ini merupakan EOD paper simulation, bukan monitoring intraday real-time.
-
-Dengan daily OHLC, sistem mengetahui bahwa high atau low menyentuh level, tetapi tidak mengetahui urutan tick sebenarnya. Karena itu:
-
-SL dan PT bersamaan → STOP;
-exit close menggunakan official closing value setelah market selesai;
-sistem tidak berpura-pura pernah mengirim order sebelum market close.
-
-Untuk virtual order yang benar-benar berubah status selama jam perdagangan, kita membutuhkan intraday feed.
-
-Portfolio Rp100 juta
-
-Buat satu account:
-
-starting_cash = 100,000,000
-cash          = 100,000,000
-market_value  = 0
-total_nav     = 100,000,000
-currency      = IDR
-allow_margin  = false
-allow_short   = false
-Position sizing
-
-Untuk versi awal, gue sarankan memakai risk-based sizing dengan hard notional cap.
-
-Contoh konfigurasi paper-test:
-
-risk_per_trade       = 0.50% NAV
-max_position_notional = 12.50% NAV
-max_positions         = 8
-max_gross_exposure    = 90% NAV
-cash_buffer           = 10% NAV
-
-Pada NAV Rp100 juta:
-
-risk budget per trade = Rp500.000
-max nominal per saham = Rp12.500.000
-
-Formula:
-
-risk_per_share = entry_price - stop_price
-
-raw_quantity =
-    risk_budget / risk_per_share
-
-quantity =
-    floor_to_board_lot(raw_quantity)
-
-notional =
-    quantity × entry_price
-
-Kemudian:
-
-quantity = min(
-    risk-based quantity,
-    max-position quantity,
-    available-cash quantity
-)
-
-Jangan izinkan:
-
-cash < 0
-gross exposure > configured limit
-quantity bukan kelipatan lot
-
-Seluruh angka di atas harus berupa configuration version, bukan hardcoded di banyak file.
-
-Struktur database
-virtual_accounts
-id
-account_code
 strategy_id
 strategy_hash
+account_code
 execution_policy_hash
-starting_cash
-cash_balance
-total_nav
-status
-created_at
+
+cmdSchedule() harus mengambil plan untuk hash account tersebut. Plan tanpa hash tidak boleh dijadwalkan.
+
+Saat source strategy hash berubah, buat account baru dengan modal Rp100 juta dan archive account lama.
+
+2. Trading calendar memakai idx_stock_prices
+
+loadBars() membangun date axis dari:
+
+SELECT DISTINCT date
+FROM idx_stock_prices
+
+Padahal dokumentasi production sendiri mencatat bahwa idx_stock_prices pernah mempunyai puluhan tanggal phantom berupa weekend, public holiday, zero-volume flat bar, dan copied-forward bar.
+
+Dampaknya bisa sangat material:
+
+entry T+1 jatuh ke hari libur palsu;
+ATR menghitung phantom bars;
+holding_bars menghitung non-trading sessions;
+TIME_EXIT terjadi terlalu cepat;
+EOD account melakukan trade pada tanggal bursa tutup.
+Perbaikan
+
+Gunakan idx_ihsg_history sebagai authoritative session calendar:
+
+SELECT date
+FROM idx_ihsg_history
+ORDER BY date
+
+Kemudian hanya terima price bar yang tanggalnya berada dalam calendar tersebut.
+
+Tambahkan regression test:
+
+signal Jumat
+ada phantom row Sabtu
+entry wajib Senin, bukan Sabtu
+3. Superseded account bisa ditutup dengan posisi masih OPEN
+
+retireSupersededAccounts() langsung mengubah account lama menjadi:
+
+status = CLOSED
+
+walaupun account tersebut masih mempunyai position history—dan query hanya menghitung semua positions, bukan memastikan tidak ada posisi terbuka.
+
+Setelah status menjadi CLOSED, loadAccounts() tidak mengambil account itu lagi. Akibatnya posisi OPEN milik account lama:
+
+tidak dicek SL/PT;
+tidak pernah TIME_EXIT;
+tidak di-mark;
+tidak pernah mengembalikan cash;
+tidak ikut reconciliation.
+Perbaikan
+
+Gunakan lifecycle:
+
+ACTIVE
+RETIRING
+CLOSED
+
+RETIRING:
+
+tidak menerima order baru;
+tetap menjalankan exit dan mark;
+tetap direconcile;
+berubah menjadi CLOSED hanya ketika tidak ada scheduled order dan open position.
+
+Alternatifnya, force-close seluruh posisi dengan alasan eksplisit:
+
+POLICY_CHANGE_EXIT
+
+Jangan menutup account secara administratif sambil meninggalkan posisi terbuka.
+
+4. Position account bisa membeli ticker yang sama berulang kali
+
+cmdSchedule() menjadwalkan seluruh ticker di target_json pada setiap plan. Ia tidak memeriksa apakah account sudah memiliki ticker tersebut.
+
+Padahal target book memang mempertahankan current holdings yang masih berada dalam buffer. Jadi ticker yang sama secara normal dapat muncul lagi pada rebalance berikutnya.
+
+Skenario:
+
+Plan 1: BBCA
+→ membeli 12,5% NAV
+
+Plan 2: BBCA masih retained
+→ membeli BBCA lagi
+
+Plan 3: BBCA masih retained
+→ membeli lagi
+
+maxPositionNotional saat ini diterapkan per order, bukan aggregate per ticker. Satu ticker dapat melewati 12,5% account.
+
+Perbaikan
+
+Untuk POSITION_100M:
+
+target ticker sudah OPEN → jangan buat order baru
+
+atau implementasikan top-up berdasarkan aggregate position value, bukan posisi baru.
+
+Sebelum fill, hitung:
+
+SUM(current market value)
+WHERE account_id=?
+  AND ticker=?
+  AND status='OPEN'
+
+Lalu enforce maximum notional per ticker secara aggregate.
+
+Tambahkan unique/invariant bahwa satu account tidak boleh memiliki beberapa independent OPEN positions pada ticker yang sama kecuali pyramiding memang menjadi policy eksplisit dan masuk policy hash.
+
+5. Position sizing memakai NAV lama dan cost basis, bukan opening exposure
+
+Pada saat fill, code memakai:
+
+acc.total_nav
+SUM(open position cost_basis)
+
+untuk menghitung risk budget dan gross exposure.
+
+total_nav tersebut adalah NAV mark sebelumnya. SUM(cost_basis) juga bukan current market exposure.
 
 Contoh:
 
-INTRADAY_EOD_100M
-POSITION_100M
-virtual_orders
-id
-account_id
-source_plan_id
-source_signal_id
-ticker
-side
-signal_date
-scheduled_entry_date
-intended_notional
-quantity
-status
-reject_reason
-strategy_hash
-execution_policy_hash
-created_at
+NAV kemarin       Rp100 juta
+Existing holdings gap -20%
+Actual opening NAV Rp84 juta
 
-Status:
+Sizing masih memakai Rp100 juta
 
-SCHEDULED
-FILLED
-NO_FILL
-REJECTED
-CANCELLED
-virtual_positions
-id
-account_id
-order_id
-ticker
-quantity
-entry_date
-entry_price
-stop_price
-target_price
-cost_basis
-entry_fee
-status
-exit_date
-exit_price
-exit_reason
-exit_fee
-gross_pnl
-net_pnl
-return_pct
-holding_bars
+Risk 0,5% menjadi Rp500 ribu, padahal seharusnya sekitar Rp420 ribu.
 
-Exit reason:
+Sebaliknya, winner yang sudah naik besar dapat membuat exposure aktual melewati 90%, tetapi cost basis masih terlihat rendah.
 
-STOP
-TARGET
-EOD_CLOSE
-TIME_EXIT
-REGIME_EXIT
-MANUAL
-virtual_trade_events
+Perbaikan
 
-Gunakan append-only event journal:
+Di dalam account lock, sebelum setiap fill:
 
-RECOMMENDED
-ORDER_SCHEDULED
-ORDER_FILLED
-STOP_SET
-TARGET_SET
-STOP_TRIGGERED
-TARGET_TRIGGERED
-EOD_CLOSE
-NO_FILL
-REJECTED
+opening cash
++ current holdings × opening price
+= opening NAV
 
-Ini lebih aman daripada hanya menyimpan current status karena seluruh lifecycle dapat diaudit.
+Gross exposure:
 
-virtual_nav
-account_id
-mark_date
-cash_value
-market_value
-total_nav
-realized_pnl
-unrealized_pnl
-gross_exposure
-open_positions
-Jangan jadikan journal sumber accounting
+Σ current holdings × opening price
 
-Sumber kebenaran harus:
+Risk budget dan exposure cap harus menggunakan dua angka tersebut.
 
-orders
-+ fills
-+ positions
-+ cash ledger
+6. Gap stop masih dieksekusi terlalu bagus
 
-Journal merupakan tampilan dari event-event tersebut.
+resolveBar() hanya membaca high, low, dan close. Bila low melewati stop, exit selalu dianggap terjadi tepat pada stopPrice.
 
-Kalau journal bisa diedit langsung dan sekaligus menjadi sumber cash/NAV, cepat atau lambat akan terjadi kondisi:
+Contoh:
 
-journal bilang CLOSED
-position masih OPEN
-cash belum menerima proceeds
-NAV salah
+stop           950
+open berikutnya 800
 
-Gunakan transaction per order resolution:
+Code saat ini keluar dari 950 dikurangi slippage, padahal tidak ada kesempatan menjual di 950. Simulasi menjadi terlalu optimistis.
 
-BEGIN
+Perbaikan gap-aware
 
-update order
-insert/update position
-update cash ledger
-insert trade event
-insert NAV mark
+Untuk posisi long:
 
-COMMIT
+open <= stop
+→ exit quote = open
 
-Kalau salah satu gagal, rollback semuanya.
+open >= target
+→ exit quote = open atau target,
+  sesuai asumsi limit-order yang didokumentasikan
 
-Cron yang disarankan
+setelah itu baru cek intraday low/high
 
-Dengan data EOD sekarang:
+resolveBar() perlu menerima:
 
-19:30  Import OHLC dan broker data selesai
-20:00  Resolve scheduled virtual orders hari ini
-20:05  Apply STOP / TARGET / EOD_CLOSE
-20:10  Update cash dan portfolio NAV
-20:15  Generate/freeze rekomendasi untuk hari berikutnya
-20:20  Create SCHEDULED virtual orders
-20:25  Run reconciliation dan integrity checks
+open
+high
+low
+close
 
-Urutannya penting: selesaikan order hari ini sebelum membuat order baru.
+Data high atau low yang kosong juga jangan dianggap “tidak menyentuh level”. Itu harus menjadi DATA_INCOMPLETE, bukan otomatis EOD_CLOSE.
 
-Biaya yang harus dimasukkan
+P1 — perlu dibereskan untuk kualitas engineering
+ATR dan trade policy kembali mempunyai implementation kedua
 
-Minimal:
+trade_policy.js secara eksplisit dibuat sebagai single source of truth.
 
-buy fee
-sell fee
-slippage
-lot rounding
-cash limitation
-missing-open no-fill
-suspension/no-price handling
+Namun virtual broker kembali meng-hardcode:
 
-Untuk EOD_CLOSE, jangan selalu menganggap fill tepat di close tanpa friction. Gunakan:
+maxHoldBars = 40
+riskAtrMult = 2.5
+fallbackRiskPct = 5
+targetR = 2
 
-virtual sell fill =
-close × (1 - configured slippage)
+dan membuat atrFrom() sendiri.
 
-Biaya dan execution policy harus masuk ke:
+Lebih spesifik lagi, fungsi tersebut diberi label “Wilder ATR”, tetapi sebenarnya hanya menghitung simple average dari 14 true ranges terakhir. awo_technical.js menggunakan Wilder smoothing yang sesungguhnya.
 
-execution_policy_hash
+Akibatnya virtual portfolio dapat mempunyai SL, PT, dan quantity berbeda dari trade-plan engine existing.
 
-Supaya perubahan fee, slippage, SL/PT, atau EOD-close rule memulai track record baru dan tidak mencampur hasil lama.
+Gunakan kembali:
 
-Test wajib
+tradePolicy.resolve()
+calcATR()/calcTechnicalFactors()
+computeTradePlan()
 
-Sebelum dijalankan setiap hari, test minimal harus mencakup:
+atau beri nama policy baru secara eksplisit dan jangan mengklaim bahwa ia sama dengan trade policy existing.
 
-Modal awal tepat Rp100 juta.
-Tidak bisa membelanjakan uang lebih dari cash.
-Duplicate recommendation tidak membuat dua order.
-Entry memakai T+1 open, bukan signal-day close.
-SL dan PT satu candle menghasilkan STOP.
-Hanya SL menghasilkan STOP.
-Hanya PT menghasilkan TARGET.
-Keduanya tidak tercapai menghasilkan EOD_CLOSE.
-Missing open menghasilkan NO_FILL.
-Fee dan slippage mengurangi cash/P&L.
-Quantity dibulatkan sesuai lot.
-NAV selalu sama dengan cash + market value.
-Closed trade mengembalikan proceeds ke cash.
-Strategy hash berbeda tidak boleh berbagi portfolio.
-Restart job tidak menggandakan fill atau exit.
-Rekomendasi implementasi
+Urutan order menjadi alfabetis
 
-Gue akan membangunnya dalam dua tahap:
+Scheduled orders diproses dengan:
 
-Tahap 1 — EOD Virtual Broker
+ORDER BY signal_date, ticker
 
-Menggunakan OHLC daily yang sudah tersedia:
+Jika cash atau exposure habis, ticker alfabetis pertama mendapat prioritas. Hasil portfolio dapat bergantung pada nama kode saham.
 
-plan T
-→ entry T+1 open
-→ check T+1 high/low
-→ SL/PT/EOD close
-→ journal
-→ NAV Rp100 juta
+Simpan:
 
-Ini bisa dibuat sekarang dan hasilnya tetap auditable.
+target_rank
 
-Tahap 2 — Intraday Virtual Broker
+ketika scheduling, lalu execute berdasarkan rank target.
 
-Setelah tersedia intraday feed:
+Missing ticker row langsung dianggap NO_FILL
 
-scheduled order
-→ live simulated fill
-→ real-time SL/PT monitoring
-→ close-auction/EOD liquidation
+Jika global trading date ada tetapi ticker row tidak ada, order langsung menjadi:
 
-Jangan membuat simulasi daily-OHLC terlihat seperti eksekusi real-time.
+NO_FILL / NO_OPEN_PRICE
 
+Missing row bisa berarti:
+
+saham suspended;
+scraper gagal;
+ticker belum ter-ingest;
+data masih incomplete.
+
+Pisahkan:
+
+NO_FILL_CONFIRMED
+DATA_MISSING
+DATA_PENDING
+
+Data outage tidak boleh terlihat seperti execution outcome.
+
+Unmarkable position dibawa kembali ke cost basis
+
+markToMarket() menilai ticker tanpa harga memakai cost_basis.
+
+Setelah saham naik atau turun jauh, satu missing close dapat membuat NAV meloncat kembali ke entry value.
+
+Gunakan:
+
+last valid close;
+last successfully stored mark;
+baru fallback ke cost, dengan account ditandai NAV_DEGRADED.
+cmdMark() belum atomic
+
+NAV upsert dan update virtual_accounts.total_nav dilakukan dalam dua autocommit statement.
+
+Crash di antaranya dapat membuat:
+
+virtual_nav = benar
+account.total_nav = lama
+
+Fill berikutnya memakai account.total_nav lama untuk sizing. Reconciliation saat ini juga tidak membandingkan kedua angka tersebut.
+
+Bungkus mark + account update dalam transaction dan tambahkan invariant:
+
+account.total_nav = latest virtual_nav.total_nav
+Counter bertambah sebelum commit
+
+filled++, noFill++, rejected++, dan closed++ bertambah sebelum transaction selesai. Jika commit gagal, console summary dapat mengatakan berhasil walaupun database rollback.
+
+Pindahkan counter setelah commit() atau gunakan per-transaction local result.
+
+Scheduled event tidak menyimpan order_id
+
+Order dibuat dengan INSERT IGNORE, tetapi ORDER_SCHEDULED event tidak menerima r.insertId. Scheduling juga tidak transaction-wrapped.
+
+Journal timeline akan lebih kuat jika setiap event langsung terhubung ke order yang membuatnya.
+
+Test coverage
+
+Test suite-nya sudah termasuk kategori kuat:
+
+unit test virtual broker masuk npm test;
+MySQL lifecycle masuk npm run test:integration;
+integration test wajib database dan tidak silently skip;
+watchdog menjalankan reconciliation production.
+
+Regression test yang masih perlu ditambahkan:
+
+strategy hash A → B starts fresh account
+phantom weekend cannot become entry day
+retired account with open position keeps resolving
+retained ticker is not bought twice
+aggregate per-ticker cap
+overnight NAV gap changes sizing
+gap-through-stop exits at opening price
+missing high/low cannot become EOD_CLOSE
+rank order survives limited cash
+mark/account update rollback together
+Penilaian
+Area	Nilai
+Core architecture	9,0
+Cash accounting	8,8
+Idempotency	8,8
+Auditability/journal	8,7
+Testing	8,7
+Strategy-version isolation	5,5
+Trading-calendar integrity	5,0
+Execution realism	6,8
+Production evidence readiness	6,8
 Kesimpulan
 
-Gue setuju sistem virtual Rp100 juta dibuat sekarang. Namun jalankan sebagai dua eksperimen terpisah:
+Ini sudah pantas disebut:
 
-POSITION_100M
-INTRADAY_EOD_100M
+Virtual broker dengan real cash ledger dan auditable portfolio lifecycle.
 
-Current recommendation engine dibangun untuk horizon position, sehingga akun EOD harus diperlakukan sebagai challenger baru, bukan menggantikan track record existing. Sumber rekomendasinya boleh sama, tetapi execution policy, strategy identity, journal, cash, dan performance record harus benar-benar terisolasi.
+Bukan lagi paper trade sederhana.
+
+Tetapi track record-nya belum boleh dipakai untuk menilai kualitas strategi sampai minimal empat hal diselesaikan:
+
+account diisolasi berdasarkan strategy hash;
+trading calendar pindah ke IHSG session calendar;
+superseded account tidak meninggalkan open positions;
+retained ticker tidak dibeli berulang dan per-name cap berlaku aggregate.
+
+Setelah seluruh perubahan accounting/execution selesai, naikkan:
+
+DEFAULT_CONFIG.version = 2
+
+dan mulai account Rp100 juta yang baru. Jangan mencampur record versi sekarang dengan engine hasil revisi berikutnya.
+
+Review ini berdasarkan static source terbaru di GitHub. Gue belum menjalankan npm test dan npm run test:integration langsung terhadap MySQL/VPS production.

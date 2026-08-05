@@ -2977,10 +2977,12 @@ app.get('/api/ihsg', async (req, res) => {
 app.get('/api/virtual-portfolio', async (req, res) => {
   try {
     const includeClosed = req.query.all === '1';
+    // RETIRING accounts are always listed: they still hold positions and still
+    // mark, so hiding them would repeat the bug that made them necessary.
     const [accounts] = await pool.query(
-      `SELECT id, account_code, strategy_id, exit_policy, execution_policy_hash,
-              starting_cash, cash_balance, total_nav, status, created_at
-         FROM virtual_accounts ${includeClosed ? '' : "WHERE status='ACTIVE'"}
+      `SELECT id, account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash,
+              starting_cash, cash_balance, total_nav, status, retired_at, created_at
+         FROM virtual_accounts ${includeClosed ? '' : "WHERE status IN ('ACTIVE','RETIRING')"}
         ORDER BY status, account_code`);
     if (!accounts.length) return res.json({ accounts: [], note: 'no virtual accounts yet — virtual_portfolio.js has not run' });
 

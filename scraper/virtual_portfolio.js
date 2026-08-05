@@ -77,16 +77,50 @@ async function setup(pool, quiet = false) {
       id INT AUTO_INCREMENT PRIMARY KEY,
       account_code VARCHAR(32) NOT NULL,
       strategy_id VARCHAR(64) NOT NULL,
+      -- The STRATEGY's identity, not just the execution contract's. Without it
+      -- a configuration change produced orders under a new strategy hash that
+      -- landed in the same account, inheriting its cash: hash B would start
+      -- from Rp110 juta because hash A had made Rp10 juta, and B's track record
+      -- would carry A's profit. Found by the 2026-08-05 review.
+      strategy_hash VARCHAR(32) NOT NULL DEFAULT 'UNSET',
       exit_policy VARCHAR(16) NOT NULL,
       execution_policy_hash VARCHAR(32) NOT NULL,
       config_json TEXT NULL,
       starting_cash DECIMAL(20,2) NOT NULL,
       cash_balance DECIMAL(20,2) NOT NULL,
       total_nav DECIMAL(20,2) NOT NULL,
-      status ENUM('ACTIVE','CLOSED') NOT NULL DEFAULT 'ACTIVE',
+      -- RETIRING is not decoration. Flipping straight to CLOSED hid the account
+      -- from loadAccounts() while it still held OPEN positions, which then had
+      -- no stop checked, no time exit, no mark, and never returned their cash.
+      -- RETIRING takes no new orders but keeps resolving and marking until the
+      -- book is genuinely empty.
+      status ENUM('ACTIVE','RETIRING','CLOSED') NOT NULL DEFAULT 'ACTIVE',
+      retired_at TIMESTAMP NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_account (account_code, execution_policy_hash)
+      UNIQUE KEY uq_account (account_code, strategy_id, strategy_hash, execution_policy_hash)
     )`);
+
+  // Existing installations predate strategy_hash and the RETIRING state.
+  // Columns before keys, and the key rebuild after both — the ordering this
+  // codebase has now got wrong three times.
+  if (!await hasColumn(pool, 'virtual_accounts', 'strategy_hash')) {
+    await pool.query(`ALTER TABLE virtual_accounts ADD COLUMN strategy_hash VARCHAR(32) NOT NULL DEFAULT 'UNSET' AFTER strategy_id`);
+  }
+  if (!await hasColumn(pool, 'virtual_accounts', 'retired_at')) {
+    await pool.query('ALTER TABLE virtual_accounts ADD COLUMN retired_at TIMESTAMP NULL AFTER total_nav');
+  }
+  await pool.query(
+    `ALTER TABLE virtual_accounts MODIFY COLUMN status ENUM('ACTIVE','RETIRING','CLOSED') NOT NULL DEFAULT 'ACTIVE'`
+  ).catch(() => {});
+  const [[uq]] = await pool.query(
+    `SELECT COUNT(*) n FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_accounts'
+        AND INDEX_NAME='uq_account' AND COLUMN_NAME='strategy_hash'`);
+  if (!Number(uq.n)) {
+    await pool.query('ALTER TABLE virtual_accounts DROP INDEX uq_account').catch(() => {});
+    await pool.query(
+      'ALTER TABLE virtual_accounts ADD UNIQUE KEY uq_account (account_code, strategy_id, strategy_hash, execution_policy_hash)');
+  }
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS virtual_orders (
@@ -99,7 +133,11 @@ async function setup(pool, quiet = false) {
       scheduled_entry_date DATE NULL,
       intended_notional DECIMAL(20,2) NULL,
       quantity INT NULL,
-      status ENUM('SCHEDULED','FILLED','NO_FILL','REJECTED','CANCELLED') NOT NULL DEFAULT 'SCHEDULED',
+      -- Rank in the plan's target book. Execution used to be ORDER BY ticker,
+      -- so when cash ran out the alphabet decided the portfolio: AALI got
+      -- funded and WIKA did not, for no reason connected to the strategy.
+      target_rank INT NULL,
+      status ENUM('SCHEDULED','FILLED','NO_FILL','REJECTED','CANCELLED','DATA_MISSING','DATA_PENDING') NOT NULL DEFAULT 'SCHEDULED',
       reject_reason VARCHAR(48) NULL,
       strategy_hash VARCHAR(32) NULL,
       execution_policy_hash VARCHAR(32) NOT NULL,
@@ -111,6 +149,14 @@ async function setup(pool, quiet = false) {
       UNIQUE KEY uq_order (account_id, ticker, signal_date),
       KEY idx_status (account_id, status)
     )`);
+
+  if (!await hasColumn(pool, 'virtual_orders', 'target_rank')) {
+    await pool.query('ALTER TABLE virtual_orders ADD COLUMN target_rank INT NULL AFTER quantity');
+  }
+  await pool.query(
+    `ALTER TABLE virtual_orders MODIFY COLUMN status
+       ENUM('SCHEDULED','FILLED','NO_FILL','REJECTED','CANCELLED','DATA_MISSING','DATA_PENDING')
+       NOT NULL DEFAULT 'SCHEDULED'`).catch(() => {});
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS virtual_positions (
@@ -173,14 +219,15 @@ async function setup(pool, quiet = false) {
       UNIQUE KEY uq_mark (account_id, mark_date)
     )`);
 
+  const stratHash = await currentStrategyHash(pool, SOURCE_STRATEGY);
   for (const a of ACCOUNTS) {
     const hash = vb.executionPolicyHash({}, a.exitPolicy);
     await pool.query(
       `INSERT IGNORE INTO virtual_accounts
-         (account_code, strategy_id, exit_policy, execution_policy_hash, config_json,
+         (account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash, config_json,
           starting_cash, cash_balance, total_nav)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [a.code, SOURCE_STRATEGY, a.exitPolicy, hash, JSON.stringify(vb.DEFAULT_CONFIG),
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      [a.code, SOURCE_STRATEGY, stratHash, a.exitPolicy, hash, JSON.stringify(vb.DEFAULT_CONFIG),
        vb.DEFAULT_CONFIG.startingCash, vb.DEFAULT_CONFIG.startingCash, vb.DEFAULT_CONFIG.startingCash]);
   }
 
@@ -188,65 +235,158 @@ async function setup(pool, quiet = false) {
 }
 
 /**
- * Retire accounts running under an execution contract that no longer exists.
+ * The strategy identity accounts are keyed on.
  *
- * Changing a fee, the slippage or the risk layer changes execution_policy_hash,
- * which is the point — the new record is a different experiment. But the unique
- * key is (account_code, execution_policy_hash), so the new row lands BESIDE the
- * old one and both are ACTIVE. Caught live on 2026-08-04: every account ran
- * twice and the integrity check reported four accounts where there are two.
- *
- * The old row is CLOSED, never deleted: its orders, positions and NAV history
- * are the record of what that contract did, and a superseded contract must stop
- * accruing new trades without its past being erased. It is announced loudly
- * when it had any history, because that is a track record ending.
+ * `strategy_forward.STRATEGY_HASH` is the hash of the strategy configuration as
+ * currently coded, which is exactly the thing that must not change underneath a
+ * track record. Falling back to the latest LIVE plan's hash keeps this working
+ * on a box where the module cannot be loaded; falling back to 'UNSET' would be
+ * worse than failing, so it is only used when there is genuinely nothing to key
+ * on and no orders can be scheduled anyway.
  */
-async function retireSupersededAccounts(pool, strategyId, quiet = false) {
-  const current = new Set(ACCOUNTS.map(a => vb.executionPolicyHash({}, a.exitPolicy)));
-  const [rows] = await pool.query(
-    `SELECT a.id, a.account_code, a.execution_policy_hash,
-            (SELECT COUNT(*) FROM virtual_positions p WHERE p.account_id = a.id) positions
-       FROM virtual_accounts a WHERE a.strategy_id=? AND a.status='ACTIVE'`, [strategyId]);
+async function currentStrategyHash(pool, strategyId = SOURCE_STRATEGY) {
+  // PER STRATEGY, not one global answer. The first version returned
+  // strategy_forward's own hash whatever it was asked about, so every account
+  // belonging to any other strategy_id looked superseded — the integration
+  // suite's throwaway accounts were all marked stale on sight.
+  //
+  // The latest LIVE plan is the better authority anyway: an account exists to
+  // trade plans, and until a plan is written under a new hash there is nothing
+  // to trade under it. When that plan does appear, the hash moves, setup()
+  // opens a fresh Rp100 juta account and the old one retires.
+  const [[plan]] = await pool.query(
+    `SELECT strategy_hash FROM ft_strategy_plan WHERE strategy_id=? AND run_mode='LIVE' AND strategy_hash IS NOT NULL
+      ORDER BY as_of_date DESC LIMIT 1`, [strategyId]).catch(() => [[null]]);
+  if (plan?.strategy_hash) return plan.strategy_hash;
 
-  const stale = rows.filter(r => !current.has(r.execution_policy_hash));
-  for (const r of stale) {
-    await pool.query(`UPDATE virtual_accounts SET status='CLOSED' WHERE id=?`, [r.id]);
-    if (quiet) continue;
-    console.log(`SETUP  retired ${r.account_code} (policy ${r.execution_policy_hash}) — the execution contract changed`);
-    if (Number(r.positions) > 0) {
-      console.log(`       it holds ${r.positions} position(s) of history, kept and CLOSED, not deleted.`);
-      console.log('       Its track record ends here and must not be pooled with the new one.');
-    }
-  }
-  return stale;
+  // No plan yet. Only the live strategy can fall back to the coded hash;
+  // anything else has nothing to key on and must not retire accounts on a guess.
+  if (strategyId !== SOURCE_STRATEGY) return 'UNSET';
+  try {
+    const sf = require('./strategy_forward');
+    if (sf.STRATEGY_HASH) return sf.STRATEGY_HASH;
+  } catch { /* fall through */ }
+  return 'UNSET';
 }
 
 /**
-  * The active accounts for one strategy. `strategyId` is a parameter and not a
-  * constant so the integration test can drive the real functions against its own
-  * throwaway accounts instead of the live ledger.
-  */
+ * Retire accounts whose contract no longer exists — either the EXECUTION policy
+ * (fees, slippage, exit rule, risk layer) or the STRATEGY itself.
+ *
+ * Both matter, and the strategy half was missing until the 2026-08-05 review.
+ * The unique key puts a new account row BESIDE the old one, so without this both
+ * stay ACTIVE: on 2026-08-04 every stage ran twice against four accounts.
+ *
+ * RETIRING, NOT CLOSED, WHILE THE BOOK IS STILL OPEN.
+ * The previous version flipped straight to CLOSED, and loadAccounts() filtered
+ * on ACTIVE — so a retired account's OPEN positions had no stop checked, no time
+ * exit, no mark, never returned their cash and never appeared in reconciliation.
+ * They simply stopped existing, mid-trade. A RETIRING account takes no new
+ * orders but keeps resolving and marking, and becomes CLOSED only once nothing
+ * is scheduled and nothing is open.
+ *
+ * Nothing is ever deleted: the history is the record of what that contract did.
+ */
+async function retireSupersededAccounts(pool, strategyId, quiet = false) {
+  const currentPolicies = new Set(ACCOUNTS.map(a => vb.executionPolicyHash({}, a.exitPolicy)));
+  const stratHash = await currentStrategyHash(pool, strategyId);
+
+  const [rows] = await pool.query(
+    `SELECT a.id, a.account_code, a.status, a.strategy_hash, a.execution_policy_hash,
+            (SELECT COUNT(*) FROM virtual_positions p WHERE p.account_id=a.id AND p.status='OPEN') openPositions,
+            (SELECT COUNT(*) FROM virtual_orders o WHERE o.account_id=a.id AND o.status='SCHEDULED') scheduled,
+            (SELECT COUNT(*) FROM virtual_positions p WHERE p.account_id=a.id) positions
+       FROM virtual_accounts a WHERE a.strategy_id=? AND a.status IN ('ACTIVE','RETIRING')`, [strategyId]);
+
+  const superseded = rows.filter(r =>
+    !currentPolicies.has(r.execution_policy_hash) ||
+    (stratHash !== 'UNSET' && r.strategy_hash !== stratHash));
+
+  const changed = [];
+  for (const r of superseded) {
+    const busy = Number(r.openPositions) > 0 || Number(r.scheduled) > 0;
+    const next = busy ? 'RETIRING' : 'CLOSED';
+    if (r.status !== next) {
+      await pool.query('UPDATE virtual_accounts SET status=?, retired_at=COALESCE(retired_at, NOW()) WHERE id=?', [next, r.id]);
+      changed.push({ ...r, newStatus: next });
+    }
+    if (quiet) continue;
+    const why = !currentPolicies.has(r.execution_policy_hash) ? 'the execution contract changed' : 'the strategy hash changed';
+    console.log(`SETUP  ${r.account_code} -> ${next} (policy ${r.execution_policy_hash}, strategy ${r.strategy_hash}) — ${why}`);
+    if (busy) {
+      console.log(`       ${r.openPositions} position(s) still open, ${r.scheduled} order(s) scheduled.`);
+      console.log('       RETIRING: no new orders, but exits and marks keep running until the book is empty.');
+    } else if (Number(r.positions) > 0) {
+      console.log(`       ${r.positions} position(s) of history kept and CLOSED, not deleted.`);
+      console.log('       Its track record ends here and must not be pooled with the new one.');
+    }
+  }
+
+  // An account that finished emptying since the last run graduates to CLOSED.
+  for (const r of rows) {
+    if (r.status === 'RETIRING' && !Number(r.openPositions) && !Number(r.scheduled) &&
+        !changed.some(c => c.id === r.id)) {
+      await pool.query(`UPDATE virtual_accounts SET status='CLOSED' WHERE id=?`, [r.id]);
+      if (!quiet) console.log(`SETUP  ${r.account_code} RETIRING -> CLOSED — its book is empty`);
+      changed.push({ ...r, newStatus: 'CLOSED' });
+    }
+  }
+  return superseded;
+}
+
+/**
+ * Accounts that still need work done on them.
+ *
+ * RETIRING is included on purpose: it must keep resolving exits and marking NAV.
+ * `cmdSchedule` filters to ACTIVE separately, because taking a NEW order is the
+ * one thing a retiring account must not do.
+ */
 async function loadAccounts(pool, strategyId = SOURCE_STRATEGY) {
   const [rows] = await pool.query(
-    `SELECT * FROM virtual_accounts WHERE strategy_id=? AND status='ACTIVE' ORDER BY account_code`, [strategyId]);
+    `SELECT * FROM virtual_accounts WHERE strategy_id=? AND status IN ('ACTIVE','RETIRING') ORDER BY account_code`,
+    [strategyId]);
   return rows;
 }
 
-/** Daily bars, keyed ticker -> date -> {open,high,low,close}, plus the trading-date axis. */
+/**
+ * Daily bars keyed ticker -> date -> OHLC, on the AUTHORITATIVE SESSION CALENDAR.
+ *
+ * The axis is `idx_ihsg_history`, not `SELECT DISTINCT date FROM
+ * idx_stock_prices`. That distinction is not academic: on 2026-08-04 the price
+ * table was found holding 75 dates that were never trading sessions — weekends,
+ * public holidays written as open=high=low=close with zero volume, and bars
+ * copied forward from the previous day. Those rows have been purged, but the
+ * CODE that trusted them had not been fixed, and the next bad ingest would have
+ * put them straight back.
+ *
+ * What a phantom date does to this engine, specifically:
+ *   - a Friday signal fills on "Saturday" instead of Monday;
+ *   - the ATR window averages bars that never traded;
+ *   - holding_bars counts non-sessions, so TIME_EXIT fires early;
+ *   - the INTRADAY_EOD account books a round trip on a day the exchange was shut.
+ *
+ * ^JKSE is the exchange's own index, so it defines what a session is. Price bars
+ * dated outside that calendar are dropped and counted, never silently ignored.
+ */
 async function loadBars(pool, sinceDays = 120) {
   const [dateRows] = await pool.query(
-    'SELECT DISTINCT date FROM idx_stock_prices WHERE date >= DATE_SUB(CURDATE(), INTERVAL ? DAY) ORDER BY date', [sinceDays]);
+    'SELECT date FROM idx_ihsg_history WHERE date >= DATE_SUB(CURDATE(), INTERVAL ? DAY) ORDER BY date', [sinceDays]);
   const dates = dateRows.map(r => toDateStr(r.date));
+  const sessions = new Set(dates);
+
   const [rows] = await pool.query(
     `SELECT stock_code, date, open_price o, high_price h, low_price l, close_price c
        FROM idx_stock_prices WHERE date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)`, [sinceDays]);
   const bars = new Map();
+  let offCalendar = 0;
   for (const r of rows) {
+    const d = toDateStr(r.date);
+    if (!sessions.has(d)) { offCalendar++; continue; }
     const t = r.stock_code;
     if (!bars.has(t)) bars.set(t, new Map());
-    bars.get(t).set(toDateStr(r.date), { open: +r.o, high: +r.h, low: +r.l, close: +r.c });
+    bars.get(t).set(d, { open: +r.o, high: +r.h, low: +r.l, close: +r.c });
   }
-  return { bars, dates, dateIdx: new Map(dates.map((d, i) => [d, i])) };
+  return { bars, dates, dateIdx: new Map(dates.map((d, i) => [d, i])), offCalendar };
 }
 
 async function logEvent(conn, accountId, event, eventDate, { orderId = null, positionId = null, ticker = null, detail = null } = {}) {
@@ -265,37 +405,86 @@ async function logEvent(conn, accountId, event, eventDate, { orderId = null, pos
  * the entry and therefore the stop distance are known.
  */
 async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
-  const accounts = await loadAccounts(pool, strategyId);
+  // ACTIVE only. A RETIRING account keeps resolving and marking, but taking a
+  // new order is exactly the thing it must not do.
+  const all = await loadAccounts(pool, strategyId);
+  const accounts = all.filter(a => a.status === 'ACTIVE');
+  const retiring = all.length - accounts.length;
+
   const [[plan]] = await pool.query(
     `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode='LIVE' AND status IN ('PLANNED','PARTIALLY_FILLED','EXECUTED')
       ORDER BY as_of_date DESC LIMIT 1`, [strategyId]);
-  if (!plan) { if (!quiet) console.log('SCHEDULE  no plan to work from.'); return { scheduled: 0 }; }
+  if (!plan) { if (!quiet) console.log('SCHEDULE  no plan to work from.'); return { scheduled: 0, skipped: 0, held: 0, mismatched: 0 }; }
+
+  // A PLAN WITH NO HASH CANNOT BE SCHEDULED, and a plan from a DIFFERENT hash
+  // cannot be scheduled into this account. Without both checks a configuration
+  // change quietly poured orders from strategy B into the account that holds
+  // strategy A's profit, and B's track record started from A's NAV.
+  if (!plan.strategy_hash) {
+    if (!quiet) console.log('SCHEDULE  the latest plan carries no strategy_hash — refusing to schedule it.');
+    return { scheduled: 0, skipped: 0, held: 0, mismatched: 0, reason: 'PLAN_WITHOUT_HASH' };
+  }
 
   const target = JSON.parse(plan.target_json || '[]');
   const signalDate = toDateStr(plan.as_of_date);
-  let scheduled = 0, skipped = 0;
+  let scheduled = 0, skipped = 0, held = 0, mismatched = 0;
 
   for (const acct of accounts) {
-    for (const ticker of target) {
-      const [r] = await pool.query(
-        `INSERT IGNORE INTO virtual_orders
-           (account_id, source_plan_id, ticker, side, signal_date, status,
-            strategy_hash, execution_policy_hash, data_snapshot_hash, code_commit)
-         VALUES (?,?,?,'BUY',?, 'SCHEDULED', ?,?,?,?)`,
-        [acct.id, plan.id, ticker, signalDate,
-         plan.strategy_hash, acct.execution_policy_hash, plan.data_snapshot_hash, plan.code_commit]);
-      if (r.affectedRows === 1) {
-        scheduled++;
-        await logEvent(pool, acct.id, 'ORDER_SCHEDULED', signalDate, { ticker, detail: { planId: plan.id } });
-      } else skipped++;
+    if (acct.strategy_hash !== 'UNSET' && acct.strategy_hash !== plan.strategy_hash) {
+      mismatched++;
+      if (!quiet) {
+        console.log(`  ${acct.account_code}: plan hash ${plan.strategy_hash} != account hash ${acct.strategy_hash} — skipped.`);
+        console.log('    A new strategy hash gets a NEW account with fresh capital, never this one.');
+      }
+      continue;
+    }
+
+    // Names already held are not bought again. The target book legitimately
+    // RETAINS a holding across rebalances, so without this the same ticker was
+    // re-ordered on every plan and one name could stack past its 12.5% cap.
+    const [openRows] = await pool.query(
+      `SELECT ticker FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
+    const heldNames = new Set(openRows.map(r => r.ticker));
+
+    for (let rank = 0; rank < target.length; rank++) {
+      const ticker = target[rank];
+      if (heldNames.has(ticker)) { held++; continue; }
+
+      const conn = await pool.getConnection();
+      try {
+        await conn.beginTransaction();
+        const [r] = await conn.query(
+          `INSERT IGNORE INTO virtual_orders
+             (account_id, source_plan_id, ticker, side, signal_date, status, target_rank,
+              strategy_hash, execution_policy_hash, data_snapshot_hash, code_commit)
+           VALUES (?,?,?,'BUY',?, 'SCHEDULED', ?, ?,?,?,?)`,
+          [acct.id, plan.id, ticker, signalDate, rank,
+           plan.strategy_hash, acct.execution_policy_hash, plan.data_snapshot_hash, plan.code_commit]);
+        if (r.affectedRows === 1) {
+          // The event carries the order it created. Without insertId the journal
+          // timeline could not be walked back from a fill to its scheduling.
+          await logEvent(conn, acct.id, 'ORDER_SCHEDULED', signalDate,
+            { orderId: r.insertId, ticker, detail: { planId: plan.id, targetRank: rank } });
+          await conn.commit();
+          scheduled++;
+        } else {
+          await conn.commit();
+          skipped++;
+        }
+      } catch (e) {
+        await conn.rollback();
+        console.error(`SCHEDULE  ${ticker} rolled back: ${e.message}`);
+      } finally { conn.release(); }
     }
   }
+
   if (!quiet) {
     console.log(`SCHEDULE  ${signalDate}  ${plan.reason}`);
-    console.log(`  ${scheduled} order(s) scheduled, ${skipped} already existed (a duplicate recommendation is a no-op)`);
+    console.log(`  ${scheduled} scheduled, ${skipped} already existed, ${held} already held, ${mismatched} account(s) on a different strategy hash`);
+    if (retiring) console.log(`  ${retiring} retiring account(s) took no new orders, by design`);
     if (!target.length) console.log('  the book is empty, so there is nothing to schedule — that is a decision, not a failure');
   }
-  return { scheduled, skipped };
+  return { scheduled, skipped, held, mismatched };
 }
 
 /**
@@ -312,11 +501,16 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
 
   for (const acct of accounts) {
     const cfg = { ...vb.DEFAULT_CONFIG, ...(acct.config_json ? JSON.parse(acct.config_json) : {}) };
-    let filled = 0, noFill = 0, rejected = 0, closed = 0;
+    let filled = 0, noFill = 0, rejected = 0, closed = 0, dataMissing = 0, dataPending = 0;
 
     // ── fills ────────────────────────────────────────────────────────────
+    // BY TARGET RANK, not alphabetically. When cash or exposure runs out the
+    // last orders go unfunded, so `ORDER BY ticker` let the alphabet pick the
+    // portfolio: AALI funded, WIKA not, for no reason the strategy would
+    // recognise. Rank ties fall back to ticker only for determinism.
     const [orders] = await pool.query(
-      `SELECT * FROM virtual_orders WHERE account_id=? AND status='SCHEDULED' ORDER BY signal_date, ticker`, [acct.id]);
+      `SELECT * FROM virtual_orders WHERE account_id=? AND status IN ('SCHEDULED','DATA_PENDING')
+        ORDER BY signal_date, COALESCE(target_rank, 9999), ticker`, [acct.id]);
 
     for (const o of orders) {
       const sIdx = dateIdx.get(toDateStr(o.signal_date));
@@ -324,17 +518,55 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
       const entryDate = dates[sIdx + 1];
       const bar = bars.get(o.ticker)?.get(entryDate);
 
+      let outcome = null;   // set inside the transaction, counted only after commit
       const conn = await pool.getConnection();
       try {
         await conn.beginTransaction();
         const [[acc]] = await conn.query('SELECT cash_balance, total_nav FROM virtual_accounts WHERE id=? FOR UPDATE', [acct.id]);
-        const [[expo]] = await conn.query(
-          `SELECT COALESCE(SUM(cost_basis),0) gross, COUNT(*) n FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
 
-        if (!bar || !(bar.open > 0)) {
+        // OPENING NAV AND OPENING EXPOSURE, not last night's mark and cost basis.
+        // Sizing against yesterday's NAV over-risks after a gap down and
+        // under-counts exposure after a run-up: cost basis is what was paid, not
+        // what is held. Both are recomputed here at THIS MORNING's open prices,
+        // inside the account lock.
+        const [openPos] = await conn.query(
+          `SELECT ticker, quantity, cost_basis FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
+        let openingExposure = 0, tickerExposure = 0, unpricedHoldings = 0;
+        for (const p of openPos) {
+          const px = bars.get(p.ticker)?.get(entryDate)?.open;
+          // A holding with no opening print is carried at cost for exposure
+          // purposes and counted, so the caps stay conservative rather than
+          // silently treating it as worth nothing.
+          const value = px > 0 ? Number(p.quantity) * px : Number(p.cost_basis);
+          if (!(px > 0)) unpricedHoldings++;
+          openingExposure += value;
+          if (p.ticker === o.ticker) tickerExposure += value;
+        }
+        const openingNav = Number(acc.cash_balance) + openingExposure;
+
+        if (!bar) {
+          // NO ROW IS NOT A NO-FILL. It could be a suspension, a scraper
+          // failure, an un-ingested ticker, or data still arriving. Recording it
+          // as NO_FILL made a data outage indistinguishable from an execution
+          // outcome — the exact confusion that let this system report
+          // `success: true, stocks: 0` for 47 days.
+          //
+          // DATA_PENDING is retryable and stays in the resolve queue; it only
+          // hardens into DATA_MISSING once the session is old enough that the
+          // row is not coming.
+          const sessionsSince = dates.length - 1 - (sIdx + 1);
+          const status = sessionsSince >= 2 ? 'DATA_MISSING' : 'DATA_PENDING';
+          await conn.query('UPDATE virtual_orders SET status=?, reject_reason=? WHERE id=?',
+            [status, 'NO_PRICE_ROW', o.id]);
+          await logEvent(conn, acct.id, status, entryDate,
+            { orderId: o.id, ticker: o.ticker, detail: { sessionsSince } });
+          outcome = status === 'DATA_MISSING' ? 'dataMissing' : 'dataPending';
+        } else if (!(bar.open > 0)) {
+          // The row exists and says there was no opening price. That IS an
+          // execution outcome: the name was halted or never opened.
           await conn.query(`UPDATE virtual_orders SET status='NO_FILL', reject_reason='NO_OPEN_PRICE' WHERE id=?`, [o.id]);
           await logEvent(conn, acct.id, 'NO_FILL', entryDate, { orderId: o.id, ticker: o.ticker });
-          noFill++;
+          outcome = 'noFill';
         } else {
           const entry = bar.open;
           // Stop and target from the ACTIVE TRADE POLICY, not an invented
@@ -355,15 +587,19 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
           const lv = vb.tradeLevels(fillPrice, atr, cfg);
           const stop = lv.stopPrice, targetPx = lv.targetPrice;
           const size = vb.sizeOrder({
-            nav: Number(acc.total_nav), cash: Number(acc.cash_balance),
+            nav: openingNav, cash: Number(acc.cash_balance),
             entryPrice: entry, fillPrice, stopPrice: stop,
-            grossExposure: Number(expo.gross), openPositions: Number(expo.n), config: cfg,
+            grossExposure: openingExposure, openPositions: openPos.length,
+            tickerExposure, config: cfg,
           });
 
           if (size.quantity <= 0) {
             await conn.query(`UPDATE virtual_orders SET status='REJECTED', reject_reason=? WHERE id=?`, [size.rejectReason, o.id]);
-            await logEvent(conn, acct.id, 'REJECTED', entryDate, { orderId: o.id, ticker: o.ticker, detail: size });
-            rejected++;
+            await logEvent(conn, acct.id, 'REJECTED', entryDate, {
+              orderId: o.id, ticker: o.ticker,
+              detail: { ...size, openingNav, openingExposure, tickerExposure, unpricedHoldings },
+            });
+            outcome = 'rejected';
           } else {
             const cost = vb.buyCost(size.quantity, entry, cfg);
             await conn.query(
@@ -379,13 +615,22 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
             await logEvent(conn, acct.id, 'ORDER_FILLED', entryDate,
               { orderId: o.id, positionId: pos.insertId, ticker: o.ticker,
                 detail: { qty: size.quantity, price: cost.fillPrice, cappedBy: size.cappedBy,
-                          stop, target: targetPx, atr, atrFallback: lv.usedFallback } });
-            await logEvent(conn, acct.id, 'STOP_SET', entryDate, { positionId: pos.insertId, ticker: o.ticker, detail: { stop } });
-            await logEvent(conn, acct.id, 'TARGET_SET', entryDate, { positionId: pos.insertId, ticker: o.ticker, detail: { target: targetPx } });
-            filled++;
+                          stop, target: targetPx, atr, atrFallback: lv.usedFallback,
+                          openingNav, openingExposure } });
+            await logEvent(conn, acct.id, 'STOP_SET', entryDate, { orderId: o.id, positionId: pos.insertId, ticker: o.ticker, detail: { stop } });
+            await logEvent(conn, acct.id, 'TARGET_SET', entryDate, { orderId: o.id, positionId: pos.insertId, ticker: o.ticker, detail: { target: targetPx } });
+            outcome = 'filled';
           }
         }
         await conn.commit();
+        // COUNTED ONLY AFTER THE COMMIT. Incrementing inside the transaction
+        // meant a rollback still produced "filled 3" in the summary — the
+        // console reporting success for work the database had thrown away.
+        if (outcome === 'filled') filled++;
+        else if (outcome === 'noFill') noFill++;
+        else if (outcome === 'rejected') rejected++;
+        else if (outcome === 'dataMissing') dataMissing++;
+        else if (outcome === 'dataPending') dataPending++;
       } catch (e) {
         await conn.rollback();
         console.error(`RESOLVE  order ${o.id} rolled back: ${e.message}`);
@@ -436,11 +681,15 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
         break;
       }
     }
-    summary.push({ account: acct.account_code, filled, noFill, rejected, closed });
+    summary.push({ account: acct.account_code, status: acct.status, filled, noFill, rejected, closed, dataMissing, dataPending });
   }
 
   if (!quiet) for (const s of summary) {
-    console.log(`RESOLVE  ${s.account.padEnd(20)} filled ${s.filled}, no-fill ${s.noFill}, rejected ${s.rejected}, closed ${s.closed}`);
+    console.log(`RESOLVE  ${s.account.padEnd(20)} filled ${s.filled}, no-fill ${s.noFill}, rejected ${s.rejected}, closed ${s.closed}` +
+      (s.status === 'RETIRING' ? '   [RETIRING - exits only]' : ''));
+    if (s.dataMissing || s.dataPending) {
+      console.log(`         ${s.dataPending} awaiting data, ${s.dataMissing} with data confirmed missing — NOT counted as no-fills`);
+    }
   }
   return summary;
 }
@@ -459,33 +708,70 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
       `SELECT COALESCE(SUM(net_pnl),0) r FROM virtual_positions WHERE account_id=? AND status='CLOSED'`, [acct.id]);
     const [[acc]] = await pool.query('SELECT cash_balance, starting_cash FROM virtual_accounts WHERE id=?', [acct.id]);
 
+    // The last close this system actually has for a name, whatever its date.
+    // Used when today's close is missing, BEFORE falling back to cost: a name
+    // that has doubled should not snap back to its entry value because one
+    // print did not arrive.
+    const lastCloseOf = t => {
+      const series = bars.get(t);
+      if (!series) return null;
+      for (let i = dates.length - 1; i >= 0; i--) {
+        const c = series.get(dates[i])?.close;
+        if (c > 0) return c;
+      }
+      return null;
+    };
+
     const m = vb.markToMarket({
       cash: Number(acc.cash_balance), positions: open,
       priceOf: t => bars.get(t)?.get(today)?.close || 0,
+      lastCloseOf,
     });
     const openCost = open.reduce((a, p) => a + Number(p.cost_basis), 0);
     const unrealized = m.marketValue - openCost;
 
-    await pool.query(
-      `INSERT INTO virtual_nav (account_id, mark_date, cash_value, market_value, total_nav,
-                                realized_pnl, unrealized_pnl, gross_exposure, open_positions, unmarkable)
-       VALUES (?,?,?,?,?,?,?,?,?,?)
-       ON DUPLICATE KEY UPDATE cash_value=VALUES(cash_value), market_value=VALUES(market_value),
-         total_nav=VALUES(total_nav), realized_pnl=VALUES(realized_pnl), unrealized_pnl=VALUES(unrealized_pnl),
-         gross_exposure=VALUES(gross_exposure), open_positions=VALUES(open_positions), unmarkable=VALUES(unmarkable)`,
-      [acct.id, today, m.cash, m.marketValue, m.totalNav, Number(realized.r), unrealized,
-       m.totalNav > 0 ? m.marketValue / m.totalNav : 0, open.length, m.unmarkable.join(',') || null]);
-    await pool.query('UPDATE virtual_accounts SET total_nav=? WHERE id=?', [m.totalNav, acct.id]);
+    // ONE TRANSACTION. These used to be two autocommit statements, so a crash
+    // between them left virtual_nav correct and virtual_accounts.total_nav
+    // stale — and the next fill sized against the stale one. Reconciliation did
+    // not compare them either, so the disagreement was invisible.
+    const conn = await pool.getConnection();
+    try {
+      await conn.beginTransaction();
+      await conn.query(
+        `INSERT INTO virtual_nav (account_id, mark_date, cash_value, market_value, total_nav,
+                                  realized_pnl, unrealized_pnl, gross_exposure, open_positions, unmarkable)
+         VALUES (?,?,?,?,?,?,?,?,?,?)
+         ON DUPLICATE KEY UPDATE cash_value=VALUES(cash_value), market_value=VALUES(market_value),
+           total_nav=VALUES(total_nav), realized_pnl=VALUES(realized_pnl), unrealized_pnl=VALUES(unrealized_pnl),
+           gross_exposure=VALUES(gross_exposure), open_positions=VALUES(open_positions), unmarkable=VALUES(unmarkable)`,
+        [acct.id, today, m.cash, m.marketValue, m.totalNav, Number(realized.r), unrealized,
+         m.totalNav > 0 ? m.marketValue / m.totalNav : 0, open.length,
+         [...m.unmarkable, ...m.stale.map(t => `${t}(stale)`)].join(',') || null]);
+      await conn.query('UPDATE virtual_accounts SET total_nav=? WHERE id=?', [m.totalNav, acct.id]);
+      await conn.commit();
+    } catch (e) {
+      await conn.rollback();
+      console.error(`MARK  ${acct.account_code} rolled back: ${e.message}`);
+      conn.release();
+      continue;
+    }
+    conn.release();
 
-    out.push({ account: acct.account_code, ...m, realized: Number(realized.r), unrealized, startingCash: Number(acc.starting_cash) });
+    out.push({ account: acct.account_code, status: acct.status, ...m,
+               realized: Number(realized.r), unrealized, startingCash: Number(acc.starting_cash) });
   }
 
   if (!quiet) for (const o of out) {
     const ret = (o.totalNav / o.startingCash - 1) * 100;
-    console.log(`MARK  ${o.account.padEnd(20)} NAV ${rp(o.totalNav)}  (${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%)`);
+    console.log(`MARK  ${o.account.padEnd(20)} NAV ${rp(o.totalNav)}  (${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%)` +
+      (o.status === 'RETIRING' ? '   [RETIRING]' : ''));
     console.log(`      cash ${rp(o.cash)} + market ${rp(o.marketValue)}   realized ${rp(o.realized)}   unrealized ${rp(o.unrealized)}`);
     if (o.cash < -1e-6) console.log('      ** NEGATIVE CASH — the account borrowed, which must not happen');
-    if (o.unmarkable.length) console.log(`      carried at cost, no price: ${o.unmarkable.join(', ')}`);
+    if (o.stale.length) console.log(`      marked at last known close, not today's: ${o.stale.join(', ')}`);
+    if (o.degraded) {
+      console.log(`      ** NAV_DEGRADED — carried at COST, no price ever seen: ${o.unmarkable.join(', ')}`);
+      console.log('         This NAV is not a market value. Treat it as an estimate until the price returns.');
+    }
   }
   return out;
 }
@@ -545,7 +831,11 @@ async function cmdStatus(pool) {
  * success, and an integrity check that cannot fail would be another one.
  */
 async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
-  const accounts = await loadAccounts(pool, strategyId);
+  // CLOSED accounts are included here on purpose, unlike everywhere else: the
+  // invariant that a closed account holds nothing can only be checked by
+  // looking at closed accounts.
+  const [accounts] = await pool.query(
+    'SELECT * FROM virtual_accounts WHERE strategy_id=? ORDER BY status, account_code', [strategyId]);
   const problems = [];
   const check = (ok, msg) => { if (!ok) problems.push(msg); };
 
@@ -572,6 +862,46 @@ async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
         `${A}: the last NAV mark does not equal cash + market value`);
       check(Number(nav.gross_exposure) <= vb.DEFAULT_CONFIG.maxGrossExposure + 1e-6,
         `${A}: gross exposure ${(Number(nav.gross_exposure) * 100).toFixed(1)}% is over the ceiling`);
+      // The two NAV numbers must agree. They live in different rows and used to
+      // be written by two separate autocommit statements, so a crash between
+      // them left the account sizing its next fill against a stale figure — and
+      // nothing compared them.
+      check(Math.abs(Number(acct.total_nav) - Number(nav.total_nav)) < 1,
+        `${A}: account.total_nav ${rp(acct.total_nav)} != latest virtual_nav ${rp(nav.total_nav)} — a mark was written but the account was not`);
+    }
+
+    // One OPEN position per name, unless pyramiding is an explicit policy.
+    // Without this the retained-ticker bug stacked a name past its cap silently.
+    const [dupes] = await pool.query(
+      `SELECT ticker, COUNT(*) n FROM virtual_positions WHERE account_id=? AND status='OPEN'
+        GROUP BY ticker HAVING n > 1`, [acct.id]);
+    if (!vb.DEFAULT_CONFIG.allowPyramiding) {
+      check(!dupes.length,
+        `${A}: ${dupes.map(d => `${d.ticker} x${d.n}`).join(', ')} held as multiple independent OPEN positions, but pyramiding is off`);
+    }
+
+    // The per-name cap is aggregate. Checked at LAST MARK prices, so a winner
+    // drifting past the ceiling is visible even though nothing was bought.
+    if (nav && Number(nav.total_nav) > 0) {
+      const [byTicker] = await pool.query(
+        `SELECT ticker, SUM(quantity) q FROM virtual_positions WHERE account_id=? AND status='OPEN' GROUP BY ticker`, [acct.id]);
+      for (const t of byTicker) {
+        const [[px]] = await pool.query(
+          'SELECT close_price c FROM idx_stock_prices WHERE stock_code=? ORDER BY date DESC LIMIT 1', [t.ticker]);
+        if (!px?.c) continue;
+        const frac = (Number(t.q) * Number(px.c)) / Number(nav.total_nav);
+        // 1.5x the cap: drift from a winner is expected and is not a bug; this
+        // is looking for a name that was BOUGHT past the limit.
+        check(frac <= vb.DEFAULT_CONFIG.maxPositionNotional * 1.5,
+          `${A}: ${t.ticker} is ${(frac * 100).toFixed(1)}% of NAV, cap is ${(vb.DEFAULT_CONFIG.maxPositionNotional * 100).toFixed(1)}%`);
+      }
+    }
+
+    // A CLOSED account must not still hold anything. This is the failure the
+    // RETIRING state exists to prevent: administratively shut while positions
+    // stayed open, unmonitored and never returning their cash.
+    if (acct.status === 'CLOSED') {
+      check(!Number(led.nOpen), `${A}: status is CLOSED but ${led.nOpen} position(s) are still OPEN`);
     }
 
     const [[x]] = await pool.query(
@@ -591,7 +921,7 @@ async function cmdReconcile(pool, { strategyId = SOURCE_STRATEGY } = {}) {
     check(!Number(x.badLevels), `${A}: ${x.badLevels} open position(s) with a missing or impossible stop`);
   }
 
-  if (!accounts.length) problems.push('no active accounts — setup did not run, or they were all closed');
+  if (!accounts.length) problems.push('no accounts at all — setup did not run');
 
   if (problems.length) {
     console.log(`RECONCILE  ${problems.length} PROBLEM(S):`);

@@ -203,6 +203,154 @@ t('a bar with no price leaves the position open and says it could not be priced'
   assert.strictEqual(r.unpriced, true, 'a suspension must not be read as an exit at zero');
 });
 
+console.log('\nvirtual broker — the 2026-08-05 review');
+
+t('the risk layer comes FROM trade_policy, not from literals that happen to match', () => {
+  // The old config re-declared 40 / 2.5 / 5 / 2. They matched the POSITION
+  // profile by coincidence, so changing the profile would have moved the
+  // trade-plan engine and left the portfolio sizing against the old one.
+  const policy = require('./modules/trade_policy');
+  const p = policy.active();
+  assert.strictEqual(C.maxHoldBars, p.maxHoldBars);
+  assert.strictEqual(C.riskAtrMult, p.riskAtrMult);
+  assert.strictEqual(C.fallbackRiskPct, p.fallbackRiskPct);
+  assert.strictEqual(C.targetR, p.target1R);
+  assert.strictEqual(C.profile, p.name, 'the profile name must be IN the config, so the hash moves with it');
+});
+
+t('a different horizon profile is a different execution contract', () => {
+  const before = process.env.AWO_HORIZON;
+  try {
+    process.env.AWO_HORIZON = 'SWING';
+    const swing = vb.riskLayer();
+    assert.notStrictEqual(swing.maxHoldBars, C.maxHoldBars, 'sanity: SWING really differs');
+    assert.notStrictEqual(
+      vb.executionPolicyHash(swing, 'POSITION'),
+      vb.executionPolicyHash({}, 'POSITION'),
+      'two horizons must never share a track record');
+  } finally {
+    if (before === undefined) delete process.env.AWO_HORIZON; else process.env.AWO_HORIZON = before;
+  }
+});
+
+t('ATR is the SAME function the rest of the system uses', () => {
+  // It was labelled "Wilder ATR" and computed a plain mean of 14 true ranges.
+  // Wilder smoothing is recursive; the label was simply false.
+  const { calcATR } = require('./awo_technical');
+  const bars = Array.from({ length: 40 }, (_, i) => ({
+    high: 100 + (i % 7) * 3, low: 95 + (i % 5), close: 97 + (i % 6) * 2,
+  }));
+  const mine = vb.atrFrom(bars);
+  const theirs = calcATR(bars.map(b => b.high), bars.map(b => b.low), bars.map(b => b.close), 14);
+  assert.strictEqual(mine, theirs);
+
+  // And it is NOT the plain mean the old code returned, on data with any trend.
+  const tr = [];
+  for (let i = 1; i < bars.length; i++) {
+    const b = bars[i], p = bars[i - 1];
+    tr.push(Math.max(b.high - b.low, Math.abs(b.high - p.close), Math.abs(b.low - p.close)));
+  }
+  const plainMean = tr.slice(-14).reduce((a, b) => a + b, 0) / 14;
+  assert.notStrictEqual(Math.round(mine * 1e6), Math.round(plainMean * 1e6),
+    'if these are equal the delegation silently reverted to a simple average');
+});
+
+t('GAP THROUGH THE STOP exits at the OPEN, not at the stop', () => {
+  // Closed 1000, opens 800, stop at 950. Nobody could have sold at 950.
+  const r = vb.resolveBar({
+    bar: { open: 800, high: 830, low: 780, close: 810 },
+    stopPrice: 950, targetPrice: 1100, exitPolicy: 'POSITION',
+  });
+  assert.strictEqual(r.exitReason, 'STOP');
+  assert.strictEqual(r.exitPrice, 800, 'the first available price is the open');
+  assert.strictEqual(r.gapped, true);
+});
+
+t('gapping UP through the target fills at the open, which is better than the target', () => {
+  const r = vb.resolveBar({
+    bar: { open: 1200, high: 1250, low: 1190, close: 1230 },
+    stopPrice: 950, targetPrice: 1100, exitPolicy: 'POSITION',
+  });
+  assert.strictEqual(r.exitReason, 'TARGET');
+  assert.strictEqual(r.exitPrice, 1200);
+  assert.strictEqual(r.gapped, true);
+});
+
+t('an ordinary touch still fills AT the level, not at the open', () => {
+  const r = vb.resolveBar({
+    bar: { open: 1010, high: 1020, low: 940, close: 990 },
+    stopPrice: 950, targetPrice: 1100, exitPolicy: 'POSITION',
+  });
+  assert.strictEqual(r.exitPrice, 950);
+  assert.strictEqual(r.gapped, false);
+});
+
+t('MISSING HIGH OR LOW CANNOT BECOME AN EOD_CLOSE', () => {
+  // Absence of an observation is not an observation of absence. This used to
+  // fall through every touch test and close the trade as if the day had been
+  // quiet.
+  for (const bar of [{ open: 1000, high: 0, low: 990, close: 1000 },
+                     { open: 1000, high: 1010, low: 0, close: 1000 }]) {
+    const r = vb.resolveBar({ bar, stopPrice: 950, targetPrice: 1100, exitPolicy: 'INTRADAY_EOD' });
+    assert.strictEqual(r.exitReason, null, JSON.stringify(bar));
+    assert.strictEqual(r.open, true);
+    assert.strictEqual(r.dataIncomplete, true);
+  }
+});
+
+t('a name already held is NOT bought again', () => {
+  // The target book legitimately retains a holding across rebalances, so
+  // without this the same ticker was re-ordered every plan.
+  const r = vb.sizeOrder({ nav: NAV, cash: NAV, entryPrice: 1000, stopPrice: 950, tickerExposure: 8_000_000 });
+  assert.strictEqual(r.quantity, 0);
+  assert.strictEqual(r.rejectReason, 'ALREADY_HELD');
+});
+
+t('THE PER-NAME CAP IS AGGREGATE, counting what is already held', () => {
+  // With pyramiding switched on, a name holding 10% of a 12.5% cap may only
+  // add the remaining 2.5% — not another full 12.5%.
+  const cfg = { ...C, allowPyramiding: true };
+  const held = NAV * 0.10;
+  const r = vb.sizeOrder({ nav: NAV, cash: NAV, entryPrice: 1000, stopPrice: 999, tickerExposure: held, config: cfg });
+  assert.strictEqual(r.cappedBy, 'POSITION_NOTIONAL');
+  assert.ok(held + r.notional <= NAV * C.maxPositionNotional + 1,
+    `${held} + ${r.notional} exceeds the aggregate cap`);
+});
+
+t('a name at its cap cannot add even one lot', () => {
+  const cfg = { ...C, allowPyramiding: true };
+  const r = vb.sizeOrder({ nav: NAV, cash: NAV, entryPrice: 1000, stopPrice: 950,
+                           tickerExposure: NAV * C.maxPositionNotional, config: cfg });
+  assert.strictEqual(r.quantity, 0);
+  assert.ok(/POSITION_NOTIONAL/.test(r.rejectReason), r.rejectReason);
+});
+
+t('an unpriced holding falls back to its LAST CLOSE before falling back to cost', () => {
+  // Carrying at cost snaps a doubled position back to its entry value, so one
+  // missing print erases months of P&L from the NAV.
+  const m = vb.markToMarket({
+    cash: 10_000_000,
+    positions: [{ ticker: 'AAA', quantity: 10_000, cost_basis: 20_000_000 }],
+    priceOf: () => 0,
+    lastCloseOf: () => 4000,
+  });
+  assert.strictEqual(m.marketValue, 40_000_000, 'the last known close, not the 20jt cost');
+  assert.deepStrictEqual(m.stale, ['AAA']);
+  assert.strictEqual(m.degraded, false, 'a stale mark is not a degraded one');
+});
+
+t('with no last close either, it falls back to cost and the NAV is DEGRADED', () => {
+  const m = vb.markToMarket({
+    cash: 10_000_000,
+    positions: [{ ticker: 'GHOST', quantity: 1_000, cost_basis: 20_000_000 }],
+    priceOf: () => 0,
+    lastCloseOf: () => null,
+  });
+  assert.strictEqual(m.marketValue, 20_000_000);
+  assert.deepStrictEqual(m.unmarkable, ['GHOST']);
+  assert.strictEqual(m.degraded, true, 'a NAV built on cost must announce itself as an estimate');
+});
+
 console.log('\nvirtual broker — fees and slippage are real money');
 
 t('a buy costs more than the quoted price', () => {

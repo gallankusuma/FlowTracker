@@ -156,7 +156,11 @@ export default function VirtualPortfolioPage() {
         {accounts.map(a => {
           const up = a.returnPct >= 0;
           return (
-            <div key={a.id} style={{ ...card, opacity: a.status === 'CLOSED' ? 0.62 : 1 }}>
+            <div key={a.id} style={{
+              ...card,
+              opacity: a.status === 'CLOSED' ? 0.62 : 1,
+              borderColor: a.status === 'RETIRING' ? 'rgba(227,179,65,0.35)' : 'var(--border)',
+            }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
                 <span style={{ fontSize: 13, fontWeight: 900, color: 'var(--text-primary)' }}>{a.account_code}</span>
                 <span style={{
@@ -165,8 +169,17 @@ export default function VirtualPortfolioPage() {
                 }}>
                   exit {a.exit_policy}
                 </span>
+                {a.status === 'RETIRING' && (
+                  <span title="Kontraknya sudah berubah, tapi akun ini masih punya posisi terbuka. Dia tidak menerima order baru, namun stop, target, time-exit dan mark NAV-nya tetap jalan sampai bukunya benar-benar kosong — baru setelah itu ditutup."
+                    style={{
+                      fontSize: 9, fontWeight: 800, padding: '2px 7px', borderRadius: 4, cursor: 'help',
+                      background: 'rgba(227,179,65,0.16)', color: '#e3b341',
+                    }}>
+                    RETIRING — exit only
+                  </span>
+                )}
                 {a.status === 'CLOSED' && (
-                  <span title="Kontrak eksekusinya berubah (fee, slippage, atau lapisan risiko), jadi akun ini dipensiunkan. Riwayatnya tetap disimpan dan tidak boleh digabung dengan yang aktif."
+                  <span title="Kontrak eksekusi atau hash strateginya berubah, jadi akun ini dipensiunkan setelah bukunya kosong. Riwayatnya tetap disimpan dan tidak boleh digabung dengan yang aktif."
                     style={{
                       fontSize: 9, fontWeight: 800, padding: '2px 7px', borderRadius: 4, cursor: 'help',
                       background: 'rgba(163,113,247,0.14)', color: '#a371f7',
@@ -241,7 +254,7 @@ export default function VirtualPortfolioPage() {
               )}
 
               <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 10, fontFamily: 'monospace' }}>
-                policy {a.execution_policy_hash}
+                strategy {a.strategy_hash} · policy {a.execution_policy_hash}
               </div>
             </div>
           );
