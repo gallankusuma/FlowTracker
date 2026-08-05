@@ -139,6 +139,61 @@ export default function VirtualPortfolioPage() {
         </div>
       )}
 
+      {/* Operational status FIRST. A NAV shown without saying whether the engine
+          is clean is showing the flattering half. */}
+      {data?.burnIn && (
+        <div style={{
+          ...card, marginBottom: 16, padding: '12px 18px',
+          display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap',
+          borderColor: data.burnIn.latest?.passed ? 'rgba(63,185,80,0.35)' : 'rgba(248,81,73,0.35)',
+        }}>
+          <span style={{ fontSize: 11, fontWeight: 800, color: '#f7c948', letterSpacing: '0.08em' }}>🔧 BURN-IN</span>
+          <span style={{ fontSize: 15, fontWeight: 900, color: 'var(--text-primary)' }}>
+            {data.burnIn.streak} / {data.burnIn.target}
+          </span>
+          <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>sesi bursa bersih berturut-turut</span>
+          <div style={{ display: 'flex', gap: 3 }}>
+            {[...(data.burnIn.history || [])].reverse().slice(-10).map((h: any) => (
+              <span key={h.date} title={`${h.date}: ${h.passed ? 'bersih' : 'gagal'}`} style={{
+                width: 14, height: 14, borderRadius: 3, cursor: 'help',
+                background: h.passed ? '#3fb950' : '#f85149',
+              }} />
+            ))}
+          </div>
+          {data.burnIn.latest && !data.burnIn.latest.passed && (
+            <span style={{ fontSize: 11, color: '#f85149' }}>
+              {data.burnIn.latest.date} gagal: {data.burnIn.latest.failures.join(', ')} — hitungan diulang dari nol.
+            </span>
+          )}
+          {data.burnIn.streak >= 10 && (
+            <span style={{ fontSize: 11, color: '#3fb950' }}>
+              Stabil secara operasional. Ini <b>tidak</b> mengatakan apa pun soal apakah strateginya untung.
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* The two states the review said must not hide in a footnote. */}
+      {accounts.some(a => !a.performanceEligible) && (
+        <div style={{
+          ...card, marginBottom: 16, padding: '12px 18px',
+          background: 'rgba(248,81,73,0.10)', borderColor: 'rgba(248,81,73,0.45)',
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 900, color: '#f85149', marginBottom: 4 }}>
+            ⛔ ANGKA DI BAWAH BELUM BISA DIBANDINGKAN
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-primary)', lineHeight: 1.6 }}>
+            {accounts.filter(a => !a.performanceEligible).map(a => (
+              <div key={a.id}>
+                <b>{a.account_code}</b> — perjalanan exit-nya berhenti di sesi yang datanya tidak terbaca:{' '}
+                {(a.dataBlocked || []).map((b: any) => `${b.ticker} @ ${b.date} (${b.reason})`).join(', ') || 'lihat log'}.
+                Posisi menunggu, tidak dilompati.
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       {loading && <div style={{ ...card, color: 'var(--text-muted)', fontSize: 13 }}>Memuat ledger…</div>}
       {error && (
         <div style={{ ...card, borderColor: 'rgba(248,81,73,0.35)', color: '#f85149', fontSize: 13 }}>
@@ -253,8 +308,57 @@ export default function VirtualPortfolioPage() {
                 </div>
               )}
 
+              {a.orderQueue && Object.keys(a.orderQueue).length > 0 && (
+                <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', marginTop: 10 }}>
+                  {Object.entries(a.orderQueue).map(([k, v]) => {
+                    // DATA_* is a data outage, not an execution outcome. It gets
+                    // the loud colour precisely so it cannot read as "no signal".
+                    const loud = k.startsWith('DATA_');
+                    return (
+                      <span key={k} title={loud
+                        ? 'Ini kegagalan data, BUKAN hasil eksekusi. Order menunggu datanya, bukan ditolak pasar.'
+                        : undefined}
+                        style={{
+                          fontSize: 9, fontWeight: 800, padding: '2px 7px', borderRadius: 4,
+                          cursor: loud ? 'help' : undefined,
+                          background: loud ? 'rgba(248,81,73,0.16)' : 'rgba(139,148,158,0.14)',
+                          color: loud ? '#f85149' : 'var(--text-muted)',
+                          border: loud ? '1px solid rgba(248,81,73,0.4)' : '1px solid transparent',
+                        }}>
+                        {k} {String(v)}
+                      </span>
+                    );
+                  })}
+                </div>
+              )}
+
+              {a.charter && (
+                <div style={{
+                  marginTop: 10, padding: '8px 10px', borderRadius: 8,
+                  background: 'rgba(88,166,255,0.07)', border: '1px solid rgba(88,166,255,0.22)',
+                }}>
+                  <div style={{ fontSize: 9, fontWeight: 800, color: '#58a6ff', marginBottom: 4 }}>
+                    📜 CHARTER — dibekukan {String(a.charter.frozenAt).slice(0, 10)}, sebelum ada satu pun trade
+                  </div>
+                  <div style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.55 }}>
+                    Mulai {a.charter.officialStartDate} · commit <code>{a.charter.codeCommit}</code> · config v{a.charter.configVersion}
+                    <br />
+                    <b style={{ color: a.charter.gate.kind === 'CONTROL' ? '#e3b341' : '#3fb950' }}>
+                      {a.charter.gate.kind === 'CONTROL' ? 'KONTROL' : 'KANDIDAT'}
+                    </b>
+                    {' '}· min {a.charter.gate.minTradingDays} sesi, {a.charter.gate.minClosedTrades} trade selesai
+                    {a.charter.gate.minProfitFactor !== null && <> · PF ≥ {a.charter.gate.minProfitFactor}</>}
+                    {a.charter.gate.maxDrawdown !== null && <> · DD ≤ {(a.charter.gate.maxDrawdown * 100).toFixed(0)}%</>}
+                    <br />
+                    <span style={{ opacity: 0.85 }}>
+                      Kriteria ini tidak bisa diubah. Mengubahnya berarti identitas baru dan akun yang mulai lagi dari Rp100 juta.
+                    </span>
+                  </div>
+                </div>
+              )}
+
               <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 10, fontFamily: 'monospace' }}>
-                strategy {a.strategy_hash} · policy {a.execution_policy_hash}
+                strategy {a.strategy_hash} · policy {a.execution_policy_hash} · maxDD {a.maxDrawdown}%
               </div>
             </div>
           );

@@ -3034,9 +3034,32 @@ app.get('/api/virtual-portfolio', async (req, res) => {
     // mark, so hiding them would repeat the bug that made them necessary.
     const [accounts] = await pool.query(
       `SELECT id, account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash,
-              starting_cash, cash_balance, total_nav, status, retired_at, created_at
+              starting_cash, cash_balance, total_nav, status, retired_at, created_at,
+              performance_eligible, data_blocked_json
          FROM virtual_accounts ${includeClosed ? '' : "WHERE status IN ('ACTIVE','RETIRING')"}
         ORDER BY status, account_code`);
+
+    // The burn-in streak and the frozen charters travel with the payload. A
+    // dashboard that shows a NAV without showing whether the engine is
+    // operationally clean, and what this account agreed to be judged by before
+    // it had any results, is showing the flattering half.
+    const [burnRows] = await pool.query(
+      'SELECT session_date, passed, failures_json FROM virtual_burnin ORDER BY session_date DESC LIMIT 30')
+      .catch(() => [[]]);
+    let streak = 0;
+    for (const r of burnRows) { if (!Number(r.passed)) break; streak++; }
+    const burnIn = {
+      streak, target: 10,
+      latest: burnRows[0] ? {
+        date: toDateStr(burnRows[0].session_date), passed: !!Number(burnRows[0].passed),
+        failures: burnRows[0].failures_json ? JSON.parse(burnRows[0].failures_json) : [],
+      } : null,
+      history: burnRows.map(r => ({ date: toDateStr(r.session_date), passed: !!Number(r.passed) })),
+    };
+    const [charters] = await pool.query('SELECT * FROM virtual_charter').catch(() => [[]]);
+    const charterFor = c => charters.find(x =>
+      x.account_code === c.account_code && x.strategy_hash === c.strategy_hash &&
+      x.execution_policy_hash === c.execution_policy_hash) || null;
     if (!accounts.length) return res.json({ accounts: [], note: 'no virtual accounts yet — virtual_portfolio.js has not run' });
 
     const out = [];
@@ -3063,10 +3086,36 @@ app.get('/api/virtual-portfolio', async (req, res) => {
           WHERE account_id=? AND status IN ('SCHEDULED','REJECTED','NO_FILL')
           ORDER BY signal_date DESC, ticker LIMIT 60`, [a.id]);
 
+      // Order queue, broken out. "Pending" and "rejected" and "no fill" are
+      // three different facts and collapsing them hides a data outage inside
+      // what looks like an execution outcome.
+      const [queue] = await pool.query(
+        `SELECT status, COUNT(*) n FROM virtual_orders WHERE account_id=? GROUP BY status`, [a.id]);
+      const orderQueue = Object.fromEntries(queue.map(q => [q.status, Number(q.n)]));
+
+      // Maximum drawdown from the NAV curve this account actually recorded.
+      let peak = null, maxDD = 0;
+      for (const p of nav) {
+        const v = Number(p.total_nav);
+        if (peak === null || v > peak) peak = v;
+        if (peak > 0) maxDD = Math.max(maxDD, (peak - v) / peak);
+      }
+
       const n = Number(stats.n) || 0;
       const gl = Number(stats.grossLoss);
+      const ch = charterFor(a);
       out.push({
         ...a,
+        performanceEligible: Number(a.performance_eligible) !== 0,
+        dataBlocked: a.data_blocked_json ? JSON.parse(a.data_blocked_json) : null,
+        orderQueue,
+        maxDrawdown: Math.round(maxDD * 10000) / 100,
+        charter: ch ? {
+          officialStartDate: toDateStr(ch.official_start_date),
+          codeCommit: ch.code_commit, configVersion: ch.config_version,
+          startingCapital: Number(ch.starting_capital),
+          frozenAt: ch.frozen_at, gate: JSON.parse(ch.gate_json),
+        } : null,
         startingCash: Number(a.starting_cash),
         cash: Number(a.cash_balance),
         nav: Number(a.total_nav),
@@ -3097,7 +3146,8 @@ app.get('/api/virtual-portfolio', async (req, res) => {
           : null,
       });
     }
-    res.json({ accounts: out, simulated: true, note: 'Simulated accounts. No orders are placed anywhere.' });
+    res.json({ accounts: out, burnIn, simulated: true,
+                note: 'Simulated accounts. No orders are placed anywhere.' });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
