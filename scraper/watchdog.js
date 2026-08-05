@@ -419,7 +419,15 @@ async function recordBurnIn(pool) {
   const checks = {};
   const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
   checks.priceDataCurrent = iso(px?.d) === sessionDate;
-  checks.calendarCurrent = !(await sh.missingSessions(pool, { table: 'idx_ihsg_history', col: 'date' })).missing.length;
+  // Excluding the dates already proven not to be sessions, the same subtraction
+  // checkIhsgGaps makes. Without it this reported IDX public holidays as missing
+  // index bars and failed the burn-in every night, for a fault no refetch can fix.
+  const phantomDates = (await sh.phantomSessions(pool)).map(p => p.date);
+  checks.calendarCurrent = !(await sh.missingSessions(pool,
+    { table: 'idx_ihsg_history', col: 'date', exclude: phantomDates })).missing.length;
+  // A phantom row is itself a burn-in failure: the ingest produced a bar for a
+  // day the exchange was shut, which is the data-lifecycle fault this exists to catch.
+  checks.noPhantomSessions = phantomDates.length === 0;
 
   const [accts] = await pool.query(
     `SELECT id, account_code, cash_balance, total_nav, performance_eligible
@@ -428,8 +436,15 @@ async function recordBurnIn(pool) {
   checks.cashNonNegative = accts.every(a => Number(a.cash_balance) >= -1e-6);
   checks.performanceEligible = accts.every(a => Number(a.performance_eligible) === 1);
 
-  const [[marked]] = await pool.query(
-    `SELECT COUNT(DISTINCT account_id) n FROM virtual_nav WHERE mark_date = ?`, [sessionDate]);
+  // Scoped to the accounts that are actually live. Counting every marked
+  // account_id compared 4 marks (two of them retired earlier the same evening)
+  // against 2 live accounts, and failed for no real reason.
+  const liveIds = accts.map(a => a.id);
+  const [[marked]] = liveIds.length
+    ? await pool.query(
+        `SELECT COUNT(DISTINCT account_id) n FROM virtual_nav WHERE mark_date=? AND account_id IN (?)`,
+        [sessionDate, liveIds])
+    : [[{ n: 0 }]];
   checks.navMarkedToday = accts.length > 0 && Number(marked.n) === accts.length;
 
   const [[navOk]] = await pool.query(

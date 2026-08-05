@@ -404,15 +404,22 @@ async function retireSupersededAccounts(pool, strategyId, quiet = false) {
   // POSITION_100M to POSITION_100M_V2 left the old row with identical hashes, so
   // nothing retired it and both ran in parallel — the duplicate-account problem
   // again, wearing a different hat.
+  // The roster rule applies ONLY to the strategy the roster describes. ACCOUNTS
+  // lists the live accounts for SOURCE_STRATEGY; it says nothing about any other
+  // strategy_id, so applying it globally retired every account belonging to one —
+  // which is exactly what it did to the integration suite's throwaway accounts.
+  // Same shape as the currentStrategyHash bug a day earlier: a global assumption
+  // used inside a function that takes the scope as a parameter.
+  const rosterApplies = strategyId === SOURCE_STRATEGY;
   const currentCodes = new Set(ACCOUNTS.map(a => a.code));
   const superseded = rows.filter(r =>
-    !currentCodes.has(r.account_code) ||
+    (rosterApplies && !currentCodes.has(r.account_code)) ||
     !currentPolicies.has(r.execution_policy_hash) ||
     (stratHash !== 'UNSET' && r.strategy_hash !== stratHash));
 
   const changed = [];
   for (const r of superseded) {
-    const retired = !currentCodes.has(r.account_code);
+    const retired = rosterApplies && !currentCodes.has(r.account_code);
     const policyChanged = !currentPolicies.has(r.execution_policy_hash);
     const reason = (retired || policyChanged) ? 'POLICY_CHANGE' : 'STRATEGY_CHANGE';
 

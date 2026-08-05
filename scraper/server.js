@@ -851,8 +851,51 @@ async function fetchYahooPrice(ticker) {
   } catch { return null; }
 }
 
-async function fetchAndSaveStockPrices(tickers) {
+/**
+ * The session a price row may be stamped with, or null if today is not one.
+ *
+ * WHY THIS EXISTS (2026-08-05). `getTodayDate()` returns the calendar date and
+ * every price row was stamped with it, whether or not IDX traded that day. Run
+ * the pull on a Saturday — or restart PM2, which re-arms `scheduleDailyCron()`
+ * and fires the whole nightly pipeline again — and Yahoo happily returns
+ * Friday's last quote, which lands in the table dated Saturday.
+ *
+ * That is where the 75 phantom sessions came from. They were purged on
+ * 2026-08-04 and were BACK within hours, because deleting rows treats the
+ * symptom while the ingest keeps producing them. A burn-in that forbids manual
+ * database repair cannot start until this stops at the source.
+ *
+ * Weekends are refused outright. Beyond that the IHSG calendar decides, because
+ * ^JKSE is the exchange's own index: no bar, no session. If the calendar has not
+ * refreshed yet the weekday rule still applies, which is the conservative
+ * direction — a holiday slipping through is one bad row the watchdog will flag,
+ * where a wrong refusal loses a real session silently.
+ */
+async function tradingSessionForIngest() {
   const date = getTodayDate();
+  const dow = new Date(`${date}T00:00:00Z`).getUTCDay();
+  if (dow === 0 || dow === 6) return { date: null, reason: 'WEEKEND' };
+  try {
+    const [[cal]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+    const latest = cal?.d ? toDateStr(cal.d) : null;
+    // Only judge dates the calendar can actually speak for.
+    if (latest && date <= latest) {
+      const [rows] = await pool.query('SELECT 1 FROM idx_ihsg_history WHERE date=?', [date]);
+      if (!rows.length) return { date: null, reason: 'NOT_A_TRADING_SESSION' };
+    }
+  } catch { /* no calendar: the weekday rule already applied */ }
+  return { date, reason: null };
+}
+
+async function fetchAndSaveStockPrices(tickers) {
+  const session = await tradingSessionForIngest();
+  if (!session.date) {
+    console.log(`[prices] SKIPPED — ${getTodayDate()} is not a trading session (${session.reason}).`);
+    console.log('[prices] Writing it would create a phantom bar carrying the previous session\'s quotes,');
+    console.log('[prices] and every rolling window in this system counts bars.');
+    return { saved: 0, skipped: true, reason: session.reason };
+  }
+  const date = session.date;
   let saved = 0;
 
   for (const ticker of tickers) {
@@ -988,6 +1031,16 @@ app.get('/api/stock-prices', async (req, res) => {
   const missing = tickers.filter(t => !found.has(t));
 
   if (missing.length > 0) {
+    // Same guard as the nightly pull, and this path needs it just as much: it
+    // writes whenever a human opens a page, so visiting the dashboard on a
+    // Saturday was enough to mint a phantom session carrying Friday's quotes.
+    const session = await tradingSessionForIngest();
+    if (!session.date) {
+      console.log(`[stock-prices] not persisting ${date} — ${session.reason}. Serving what the DB already has.`);
+      return res.json({ date, data: rows.map(r => ({
+        ticker: r.stock_code, price: Number(r.close_price), changePct: Number(r.change_pct),
+      })), note: `${date} is not a trading session; nothing was written.` });
+    }
     console.log(`📡 Fetching ${missing.length} stock prices from Yahoo...`);
     for (const t of missing) {
       const p = await fetchYahooPrice(t);
