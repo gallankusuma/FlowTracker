@@ -639,14 +639,14 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY, force = 
   // resolve, so a non-zero exit there does not stop this one. Creating tomorrow's
   // orders against a book that was never settled is worse than doing nothing.
   const session = await currentSession(pool);
-  const gate = await stageOk(pool, session, 'resolve');
+  const gate = await stageOk(pool, session, 'resolve', strategyId);
   if (!gate.ok && !force) {
     if (!quiet) {
       console.log(`SCHEDULE  refusing — resolve did not complete for ${session || 'this session'} (${gate.reason}).`);
       console.log('  Freezing new orders over an unsettled book would record decisions the');
       console.log('  engine never actually acted on. Fix resolve and re-run the chain.');
     }
-    await recordStage(pool, session, 'schedule', 'BLOCKED', gate.reason);
+    await recordStage(pool, session, 'schedule', 'BLOCKED', gate.reason, strategyId);
     return { blocked: gate.reason, scheduled: 0, skipped: 0, held: 0, mismatched: 0 };
   }
 
@@ -729,7 +729,7 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY, force = 
     if (retiring) console.log(`  ${retiring} retiring account(s) took no new orders, by design`);
     if (!target.length) console.log('  the book is empty, so there is nothing to schedule — that is a decision, not a failure');
   }
-  await recordStage(pool, session, 'schedule', 'OK');
+  await recordStage(pool, session, 'schedule', 'OK', null, strategyId);
   return { scheduled, skipped, held, mismatched };
 }
 
@@ -814,32 +814,78 @@ async function ensureStageTable(pool) {
     CREATE TABLE IF NOT EXISTS virtual_cycle_stage (
       id INT AUTO_INCREMENT PRIMARY KEY,
       session_date DATE NOT NULL,
+      -- SCOPED TO AN IDENTITY, not just an engine version. Keyed on
+      -- (session, engine, stage) alone, a resolve run by the integration
+      -- suite's throwaway strategy satisfied the gate for the LIVE one — a test
+      -- opening the door for production.
+      strategy_id VARCHAR(64) NOT NULL DEFAULT '',
+      identity_hash VARCHAR(32) NOT NULL DEFAULT '',
       engine_version INT NOT NULL,
       stage VARCHAR(16) NOT NULL,
       status ENUM('OK','BLOCKED','FAILED') NOT NULL,
       reason VARCHAR(64) NULL,
       completed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_stage (session_date, engine_version, stage)
+      UNIQUE KEY uq_stage (session_date, identity_hash, stage)
     )`);
+
+  for (const [col, def] of [
+    ['strategy_id', `VARCHAR(64) NOT NULL DEFAULT '' AFTER session_date`],
+    ['identity_hash', `VARCHAR(32) NOT NULL DEFAULT '' AFTER strategy_id`],
+  ]) {
+    if (!await hasColumn(pool, 'virtual_cycle_stage', col)) {
+      await pool.query(`ALTER TABLE virtual_cycle_stage ADD COLUMN ${col} ${def}`);
+    }
+  }
+  const [[uq]] = await pool.query(
+    `SELECT COUNT(*) n FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_cycle_stage'
+        AND INDEX_NAME='uq_stage' AND COLUMN_NAME='identity_hash'`);
+  if (!Number(uq.n)) {
+    const [[has]] = await pool.query(
+      `SELECT COUNT(*) n FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_cycle_stage' AND INDEX_NAME='uq_stage'`);
+    if (Number(has.n)) await pool.query('ALTER TABLE virtual_cycle_stage DROP INDEX uq_stage');
+    await pool.query('ALTER TABLE virtual_cycle_stage ADD UNIQUE KEY uq_stage (session_date, identity_hash, stage)');
+  }
 }
 
-async function recordStage(pool, sessionDate, stage, status, reason = null) {
+/**
+ * Who a cycle belongs to: the strategy, the engine version, and the exact set of
+ * accounts that will act on it. Two strategies running the same session are two
+ * separate chains and must not unlock each other's stages.
+ */
+async function cycleIdentity(pool, strategyId) {
+  const [rows] = await pool.query(
+    `SELECT account_code, strategy_hash, execution_policy_hash, execution_engine_version
+       FROM virtual_accounts WHERE strategy_id=? AND status IN ('ACTIVE','RETIRING')
+      ORDER BY account_code`, [strategyId]);
+  return require('crypto').createHash('sha256')
+    .update(JSON.stringify({
+      strategyId, engine: vb.EXECUTION_ENGINE_VERSION,
+      accounts: rows.map(r => [r.account_code, r.strategy_hash, r.execution_policy_hash, r.execution_engine_version]),
+    }))
+    .digest('hex').slice(0, 16);
+}
+
+async function recordStage(pool, sessionDate, stage, status, reason = null, strategyId = SOURCE_STRATEGY) {
   if (!sessionDate) return;
   await ensureStageTable(pool);
+  const identity = await cycleIdentity(pool, strategyId);
   await pool.query(
-    `INSERT INTO virtual_cycle_stage (session_date, engine_version, stage, status, reason)
-     VALUES (?,?,?,?,?)
+    `INSERT INTO virtual_cycle_stage (session_date, strategy_id, identity_hash, engine_version, stage, status, reason)
+     VALUES (?,?,?,?,?,?,?)
      ON DUPLICATE KEY UPDATE status=VALUES(status), reason=VALUES(reason), completed_at=CURRENT_TIMESTAMP`,
-    [sessionDate, vb.EXECUTION_ENGINE_VERSION, stage, status, reason]);
+    [sessionDate, strategyId, identity, vb.EXECUTION_ENGINE_VERSION, stage, status, reason]);
 }
 
-async function stageOk(pool, sessionDate, stage) {
+async function stageOk(pool, sessionDate, stage, strategyId = SOURCE_STRATEGY) {
   if (!sessionDate) return { ok: false, reason: 'NO_SESSION' };
   await ensureStageTable(pool);
+  const identity = await cycleIdentity(pool, strategyId);
   const [[r]] = await pool.query(
     `SELECT status, reason FROM virtual_cycle_stage
-      WHERE session_date=? AND engine_version=? AND stage=?`,
-    [sessionDate, vb.EXECUTION_ENGINE_VERSION, stage]);
+      WHERE session_date=? AND identity_hash=? AND stage=?`,
+    [sessionDate, identity, stage]);
   if (!r) return { ok: false, reason: `${stage.toUpperCase()}_NOT_RUN` };
   if (r.status !== 'OK') return { ok: false, reason: `${stage.toUpperCase()}_${r.status}:${r.reason || ''}` };
   return { ok: true };
@@ -868,13 +914,17 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
       console.log(`  ${why}`);
       console.log('  Cron order is 19:30 prices, 20:05 IHSG, 20:10 resolve. Fix the upstream stage and re-run.');
     }
-    await recordStage(pool, cal.calendar || cal.prices, 'resolve', 'BLOCKED', cal.blocked);
+    await recordStage(pool, cal.calendar || cal.prices, 'resolve', 'BLOCKED', cal.blocked, strategyId);
     return { blocked: cal.blocked, calendar: cal.calendar, prices: cal.prices, summary: [] };
   }
 
   const accounts = await loadAccounts(pool, strategyId);
   const { bars, dates, dateIdx } = await loadBars(pool);
   const summary = [];
+  // A rolled-back transaction used to print to stderr and leave the stage OK,
+  // so the next stage ran as if the session had settled cleanly. A refusal that
+  // only reaches a log is the failure mode this whole checkpoint exists to end.
+  const rollbacks = [];
 
   for (const acct of accounts) {
     const cfg = { ...vb.DEFAULT_CONFIG, ...(acct.config_json ? JSON.parse(acct.config_json) : {}) };
@@ -942,6 +992,7 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
           if (upd.affectedRows === 1) closed++;
         } catch (e) {
           await conn.rollback();
+          rollbacks.push(`forced exit ${p.id}: ${e.message}`);
           console.error(`RESOLVE  forced exit ${p.id} rolled back: ${e.message}`);
         } finally { conn.release(); }
       }
@@ -1107,6 +1158,7 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
         else if (outcome === 'dataPending') dataPending++;
       } catch (e) {
         await conn.rollback();
+        rollbacks.push(`order ${o.id}: ${e.message}`);
         console.error(`RESOLVE  order ${o.id} rolled back: ${e.message}`);
       } finally { conn.release(); }
     }
@@ -1181,6 +1233,7 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
           await conn.commit();
         } catch (e) {
           await conn.rollback();
+          rollbacks.push(`exit ${p.id}: ${e.message}`);
           console.error(`RESOLVE  exit ${p.id} rolled back: ${e.message}`);
         } finally { conn.release(); }
         break;
@@ -1200,7 +1253,23 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
                    dataMissing, dataPending, blocked: blocked.length });
   }
 
-  await recordStage(pool, cal.calendar, 'resolve', 'OK');
+  // Any rollback, on any account, fails the whole stage. Partial settlement is
+  // not settlement: scheduling or marking over it would record decisions taken
+  // against a book that is missing whatever rolled back.
+  const anyBlocked = summary.some(x => x.blocked > 0);
+  if (rollbacks.length || anyBlocked) {
+    const why = rollbacks.length
+      ? `${rollbacks.length} transaction(s) rolled back`
+      : 'positions blocked on unreadable sessions';
+    await recordStage(pool, cal.calendar, 'resolve', 'FAILED', why.slice(0, 64), strategyId);
+    if (!quiet) {
+      console.log(`RESOLVE  stage FAILED — ${why}.`);
+      for (const r of rollbacks.slice(0, 5)) console.log(`  ${r}`);
+      console.log('  Schedule and mark will refuse until this session settles cleanly.');
+    }
+  } else {
+    await recordStage(pool, cal.calendar, 'resolve', 'OK', null, strategyId);
+  }
 
   if (!quiet) for (const s of summary) {
     console.log(`RESOLVE  ${s.account.padEnd(20)} filled ${s.filled}, no-fill ${s.noFill}, rejected ${s.rejected}, closed ${s.closed}` +
@@ -1222,14 +1291,14 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY, force = fals
   // Same checkpoint. A NAV marked over a book resolve refused to settle is a
   // number that looks ordinary and is not.
   const session = await currentSession(pool);
-  const gate = await stageOk(pool, session, 'resolve');
+  const gate = await stageOk(pool, session, 'resolve', strategyId);
   if (!gate.ok && !force) {
     if (!quiet) {
       console.log(`MARK  refusing — resolve did not complete for ${session || 'this session'} (${gate.reason}).`);
       console.log('  A NAV stamped on an unsettled book is worse than a missing one: it looks');
       console.log('  exactly like a real valuation.');
     }
-    await recordStage(pool, session, 'mark', 'BLOCKED', gate.reason);
+    await recordStage(pool, session, 'mark', 'BLOCKED', gate.reason, strategyId);
     return [];
   }
 
@@ -1301,7 +1370,7 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY, force = fals
                realized: realizedPnl, unrealized, startingCash });
   }
 
-  await recordStage(pool, session, 'mark', 'OK');
+  await recordStage(pool, session, 'mark', 'OK', null, strategyId);
 
   if (!quiet) for (const o of out) {
     const ret = (o.totalNav / o.startingCash - 1) * 100;
@@ -1553,7 +1622,7 @@ async function main() {
 module.exports = {
   setup, cmdSchedule, cmdResolve, cmdMark, cmdStatus, cmdReconcile,
   retireSupersededAccounts, loadAccounts, loadBars, sessionCalendarState, migrateEnum, migrateColumn,
-  recordStage, stageOk, currentSession,
+  recordStage, stageOk, currentSession, cycleIdentity, ensureStageTable,
   ACCOUNTS, SOURCE_STRATEGY,
 };
 

@@ -147,15 +147,25 @@ async function cashByAccount(pool) {
 
     console.log('\nvirtual portfolio — the stage checkpoint');
 
+    await t('a resolve from a DIFFERENT strategy does not unlock this one', async () => {
+      // The gate is keyed on strategy plus the live account set. Without that, a
+      // test run satisfying the checkpoint would open the door for production.
+      const mine = await vp.cycleIdentity(pool, STRATEGY);
+      const live = await vp.cycleIdentity(pool, vp.SOURCE_STRATEGY);
+      assert.notStrictEqual(mine, live, 'two strategies must not share a cycle identity');
+    });
+
     await t('SCHEDULE REFUSES UNTIL RESOLVE HAS COMPLETED FOR THIS SESSION', async () => {
       // Production runs resolve, schedule, mark and reconcile as FOUR separate
       // cron processes. A non-zero exit from resolve does not cancel the others,
       // so "the chain halts" was true only in the single-process mode nobody
       // runs. The checkpoint survives between processes.
       const session = await vp.currentSession(pool);
+      await vp.ensureStageTable(pool);
+      const identity = await vp.cycleIdentity(pool, STRATEGY);
       await pool.query(
-        'DELETE FROM virtual_cycle_stage WHERE session_date=? AND stage=?', [session, 'resolve'])
-        .catch(() => {});
+        'DELETE FROM virtual_cycle_stage WHERE session_date=? AND identity_hash=? AND stage=?',
+        [session, identity, 'resolve']);
       const blocked = await vp.cmdSchedule(pool, true, OPTS);
       assert.ok(blocked.blocked, `schedule ran without a completed resolve: ${JSON.stringify(blocked)}`);
       assert.strictEqual(blocked.scheduled, 0);
@@ -679,7 +689,9 @@ async function cashByAccount(pool) {
       try {
         const r = await vp.cmdResolve(pool, true, OPTS);
         assert.ok(r.blocked, 'expected a blocked resolve');
-        const gate = await vp.stageOk(pool, await vp.currentSession(pool), 'resolve');
+        // Scoped to THIS strategy: a test strategy's resolve must not satisfy
+        // the production gate, and vice versa.
+        const gate = await vp.stageOk(pool, await vp.currentSession(pool), 'resolve', STRATEGY);
         assert.strictEqual(gate.ok, false, 'the stage must record the refusal, not just return it');
         assert.ok(/BLOCKED/.test(gate.reason), gate.reason);
       } finally {

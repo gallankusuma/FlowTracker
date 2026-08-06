@@ -139,6 +139,83 @@ export default function VirtualPortfolioPage() {
         </div>
       )}
 
+      {/* TRUST CENTER — first, because it answers the only question that matters
+          before reading a number: can tonight's numbers be believed at all. */}
+      {data?.trust && (
+        <div style={{ ...card, marginBottom: 16 }}>
+          <div style={{ fontSize: 11, fontWeight: 800, color: '#f7c948', letterSpacing: '0.08em', marginBottom: 10 }}>
+            🛡 TRUST CENTER
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(230px, 1fr))', gap: 14 }}>
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 800, color: 'var(--text-muted)', marginBottom: 5 }}>DATA PASAR</div>
+              {[
+                ['Market data', data.trust.marketData, data.trust.marketData === 'HEALTHY'],
+                ['Session calendar', data.trust.sessionCalendar || '–', !!data.trust.sessionCalendar],
+                ['Latest price session', data.trust.latestPriceSession || '–', !!data.trust.latestPriceSession],
+                ['Coverage', data.trust.priceCoverage === null ? '–'
+                  : `${data.trust.priceCoverage} / ${data.trust.typicalCoverage} biasanya`,
+                  data.trust.priceCoverage !== null],
+              ].map(([k, v, ok]: any) => (
+                <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '2px 0' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>{k}</span>
+                  <span style={{ fontWeight: 700, color: ok ? 'var(--text-primary)' : '#f85149' }}>{v}</span>
+                </div>
+              ))}
+              {data.trust.blockedReason && (
+                <div style={{ fontSize: 10, color: '#f85149', marginTop: 6, lineHeight: 1.5 }}>
+                  ⛔ {data.trust.blockedReason} — engine menolak bekerja di atas data ini.
+                </div>
+              )}
+            </div>
+
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 800, color: 'var(--text-muted)', marginBottom: 5 }}>RANTAI MALAM INI</div>
+              {['resolve', 'schedule', 'mark'].map(st => {
+                const s = data.trust.stages?.[st] || { status: 'NOT_RUN' };
+                const colour = s.status === 'OK' ? '#3fb950'
+                  : s.status === 'NOT_RUN' ? 'var(--text-muted)' : '#f85149';
+                return (
+                  <div key={st} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '2px 0' }}>
+                    <span style={{ color: 'var(--text-muted)', textTransform: 'capitalize' }}>{st}</span>
+                    <span style={{ fontWeight: 800, color: colour }}>
+                      {s.status}{s.reason ? ` (${s.reason})` : ''}
+                    </span>
+                  </div>
+                );
+              })}
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '2px 0' }}>
+                <span style={{ color: 'var(--text-muted)' }}>Reconcile</span>
+                <span style={{ fontWeight: 800, color: data.trust.reconcile === 'CLEAN' ? '#3fb950' : '#f85149' }}>
+                  {data.trust.reconcile}
+                </span>
+              </div>
+              {!!data.trust.reconcileProblems?.length && (
+                <div style={{ fontSize: 10, color: '#f85149', marginTop: 5, lineHeight: 1.5 }}>
+                  {data.trust.reconcileProblems.slice(0, 3).map((p: string, i: number) => <div key={i}>• {p}</div>)}
+                </div>
+              )}
+            </div>
+
+            <div>
+              <div style={{ fontSize: 10, fontWeight: 800, color: 'var(--text-muted)', marginBottom: 5 }}>IDENTITAS EKSPERIMEN</div>
+              {[
+                ['Engine version', `v${data.trust.engineVersion}`],
+                ['Identity', data.trust.identity || '–'],
+                ['Strategy hash', accounts[0]?.strategy_hash || '–'],
+                ['Code commit', accounts[0]?.charter?.codeCommit || '–'],
+                ['Official start', accounts[0]?.charter?.officialStartDate || 'menunggu NAV mark pertama'],
+              ].map(([k, v]: any) => (
+                <div key={k} style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, padding: '2px 0', gap: 8 }}>
+                  <span style={{ color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>{k}</span>
+                  <span style={{ fontWeight: 700, fontFamily: 'monospace', fontSize: 10, textAlign: 'right' }}>{v}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Operational status FIRST. A NAV shown without saying whether the engine
           is clean is showing the flattering half. */}
       {data?.burnIn && (
@@ -250,8 +327,31 @@ export default function VirtualPortfolioPage() {
                   {pct(a.returnPct)}
                 </span>
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12 }}>
-                dari {rp(a.startingCash)} · kas {rp(a.cash)} · {a.openPositions?.length || 0} posisi terbuka
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10 }}>
+                dari {rp(a.startingCash)} · kas {rp(a.cash)}
+              </div>
+
+              {/* The operational facts the review asked to be visible per account,
+                  including the two that decide whether the number counts. */}
+              <div style={{ fontSize: 11, lineHeight: 1.7, marginBottom: 10 }}>
+                {[
+                  ['Market value', rp(a.nav - a.cash), null],
+                  ['Open positions', `${a.openPositions?.length || 0} / 8`, null],
+                  ['Gross exposure', a.navSeries?.length
+                    ? `${(Number(a.navSeries[a.navSeries.length - 1].exposure) * 100).toFixed(1)}% / 90%`
+                    : '–', null],
+                  ['Max drawdown', `${a.maxDrawdown}%`, null],
+                  ['Performance eligible', a.performanceEligible ? 'YES' : 'NO', a.performanceEligible],
+                  ['Status', a.status, a.status === 'ACTIVE'],
+                ].map(([k, v, ok]: any) => (
+                  <div key={k} style={{ display: 'flex', justifyContent: 'space-between' }}>
+                    <span style={{ color: 'var(--text-muted)' }}>{k}</span>
+                    <span style={{
+                      fontWeight: 700,
+                      color: ok === null ? 'var(--text-primary)' : ok ? '#3fb950' : '#f85149',
+                    }}>{v}</span>
+                  </div>
+                ))}
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginBottom: 10 }}>

@@ -3043,13 +3043,21 @@ app.get('/api/virtual-portfolio', async (req, res) => {
     // dashboard that shows a NAV without showing whether the engine is
     // operationally clean, and what this account agreed to be judged by before
     // it had any results, is showing the flattering half.
-    const [burnRows] = await pool.query(
-      'SELECT session_date, passed, failures_json FROM virtual_burnin ORDER BY session_date DESC LIMIT 30')
-      .catch(() => [[]]);
+    // THE ACTIVE IDENTITY ONLY. Reading every row would show a streak that
+    // includes sessions run by a different engine or a different account set —
+    // the same flattering arithmetic the identity column exists to prevent.
+    const vpMod = require('./virtual_portfolio');
+    let activeIdentity = null;
+    try { activeIdentity = await vpMod.cycleIdentity(pool, vpMod.SOURCE_STRATEGY); } catch { /* table may not exist yet */ }
+    const [burnRows] = activeIdentity
+      ? await pool.query(
+          `SELECT session_date, passed, failures_json FROM virtual_burnin
+            WHERE identity_hash=? ORDER BY session_date DESC LIMIT 30`, [activeIdentity]).catch(() => [[]])
+      : [[]];
     let streak = 0;
     for (const r of burnRows) { if (!Number(r.passed)) break; streak++; }
     const burnIn = {
-      streak, target: 10,
+      streak, target: 10, identity: activeIdentity,
       latest: burnRows[0] ? {
         date: toDateStr(burnRows[0].session_date), passed: !!Number(burnRows[0].passed),
         failures: burnRows[0].failures_json ? JSON.parse(burnRows[0].failures_json) : [],
@@ -3057,6 +3065,39 @@ app.get('/api/virtual-portfolio', async (req, res) => {
       history: burnRows.map(r => ({ date: toDateStr(r.session_date), passed: !!Number(r.passed) })),
     };
     const [charters] = await pool.query('SELECT * FROM virtual_charter').catch(() => [[]]);
+
+    // THE TRUST CENTER. Everything a reader needs to decide whether tonight's
+    // numbers can be believed, in one object: is the market data current, did
+    // each stage of the chain actually complete, and which experiment is this.
+    const calState = await vpMod.sessionCalendarState(pool).catch(() => null);
+    const session = calState?.calendar || null;
+    const [stageRows] = session && activeIdentity
+      ? await pool.query(
+          `SELECT stage, status, reason, completed_at FROM virtual_cycle_stage
+            WHERE session_date=? AND identity_hash=?`, [session, activeIdentity]).catch(() => [[]])
+      : [[]];
+    const stages = Object.fromEntries(
+      ['resolve', 'schedule', 'mark'].map(st => {
+        const r = stageRows.find(x => x.stage === st);
+        return [st, r ? { status: r.status, reason: r.reason, at: r.completed_at } : { status: 'NOT_RUN' }];
+      }));
+    let reconcileProblems = null;
+    try { reconcileProblems = await vpMod.cmdReconcile(pool, { strategyId: vpMod.SOURCE_STRATEGY }); } catch { /* leave null */ }
+
+    const trust = {
+      marketData: calState ? (calState.blocked ? 'BLOCKED' : 'HEALTHY') : 'UNKNOWN',
+      blockedReason: calState?.blocked || null,
+      sessionCalendar: calState?.calendar || null,
+      latestPriceSession: calState?.prices || null,
+      priceCoverage: calState?.coverage ?? null,
+      typicalCoverage: calState?.typical ?? null,
+      stages,
+      reconcile: reconcileProblems === null ? 'UNKNOWN'
+        : reconcileProblems.length ? 'PROBLEMS' : 'CLEAN',
+      reconcileProblems: reconcileProblems || [],
+      engineVersion: require('./modules/virtual_broker').EXECUTION_ENGINE_VERSION,
+      identity: activeIdentity,
+    };
     const charterFor = c => charters.find(x =>
       x.account_code === c.account_code && x.strategy_hash === c.strategy_hash &&
       x.execution_policy_hash === c.execution_policy_hash) || null;
@@ -3146,7 +3187,7 @@ app.get('/api/virtual-portfolio', async (req, res) => {
           : null,
       });
     }
-    res.json({ accounts: out, burnIn, simulated: true,
+    res.json({ accounts: out, burnIn, trust, simulated: true,
                 note: 'Simulated accounts. No orders are placed anywhere.' });
   } catch (err) {
     res.status(500).json({ error: err.message });

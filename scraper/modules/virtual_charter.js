@@ -266,14 +266,22 @@ async function evaluate(pool, charter, stats) {
  */
 async function resolveOfficialStart(pool) {
   const [rows] = await pool.query(
-    `SELECT c.id, c.account_code, c.frozen_at
+    `SELECT c.id, c.account_code, c.strategy_id, c.strategy_hash, c.execution_policy_hash,
+            c.execution_engine_version, c.frozen_at
        FROM virtual_charter c WHERE c.official_start_date IS NULL`);
   const resolved = [];
   for (const c of rows) {
+    // THE FULL IDENTITY, not just the account code. Matching on the name alone
+    // would let a retired account's marks — a different engine, a different
+    // policy — set the official start of the account that replaced it.
     const [[nav]] = await pool.query(
       `SELECT MIN(v.mark_date) d FROM virtual_nav v
          JOIN virtual_accounts a ON a.id = v.account_id
-        WHERE a.account_code = ? AND v.created_at >= ?`, [c.account_code, c.frozen_at]);
+        WHERE a.account_code = ? AND a.strategy_id = ? AND a.strategy_hash = ?
+          AND a.execution_policy_hash = ? AND a.execution_engine_version = ?
+          AND v.created_at >= ?`,
+      [c.account_code, c.strategy_id, c.strategy_hash, c.execution_policy_hash,
+       c.execution_engine_version, c.frozen_at]);
     if (!nav?.d) continue;
     const d = nav.d instanceof Date
       ? `${nav.d.getFullYear()}-${String(nav.d.getMonth() + 1).padStart(2, '0')}-${String(nav.d.getDate()).padStart(2, '0')}`

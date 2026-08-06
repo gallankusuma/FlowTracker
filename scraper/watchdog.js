@@ -492,15 +492,20 @@ async function recordBurnIn(pool) {
   // Without this, eight clean days under engine v2 plus two under a brand-new
   // v3 reported ten — and v3 had run for two.
   const vb = require('./modules/virtual_broker');
+  // THE OFFICIAL STRATEGY ONLY. Every account row used to be included, so while
+  // the integration suite was running its throwaway TEST_* accounts entered the
+  // identity hash and the checks — a test able to move, or break, the official
+  // streak. The burn-in measures the production chain and nothing else.
+  //
+  // ONE definition of identity, shared with the cycle checkpoint. Two similar
+  // hashes computed in two places is how they drift into disagreeing about
+  // whether the same run is the same experiment.
+  const vp0 = require('./virtual_portfolio');
+  const identityHash = await vp0.cycleIdentity(pool, vp0.SOURCE_STRATEGY);
   const [idRows] = await pool.query(
-    `SELECT account_code, strategy_hash, execution_policy_hash, execution_engine_version
-       FROM virtual_accounts WHERE status IN ('ACTIVE','RETIRING') ORDER BY account_code`);
-  const identityHash = require('crypto').createHash('sha256')
-    .update(JSON.stringify({
-      engine: vb.EXECUTION_ENGINE_VERSION,
-      accounts: idRows.map(r => [r.account_code, r.strategy_hash, r.execution_policy_hash, r.execution_engine_version]),
-    }))
-    .digest('hex').slice(0, 16);
+    `SELECT account_code FROM virtual_accounts
+      WHERE strategy_id=? AND status IN ('ACTIVE','RETIRING') ORDER BY account_code`,
+    [vp0.SOURCE_STRATEGY]);
 
   // The checklist the review specified, each answered from data rather than
   // from whether a job claimed success.
@@ -533,7 +538,8 @@ async function recordBurnIn(pool) {
 
   const [accts] = await pool.query(
     `SELECT id, account_code, cash_balance, total_nav, performance_eligible
-       FROM virtual_accounts WHERE status IN ('ACTIVE','RETIRING')`);
+       FROM virtual_accounts WHERE strategy_id=? AND status IN ('ACTIVE','RETIRING')`,
+    [vp0.SOURCE_STRATEGY]);
   checks.accountsExist = accts.length > 0;
   checks.cashNonNegative = accts.every(a => Number(a.cash_balance) >= -1e-6);
   checks.performanceEligible = accts.every(a => Number(a.performance_eligible) === 1);
@@ -554,19 +560,26 @@ async function recordBurnIn(pool) {
       WHERE mark_date = ? AND ABS(total_nav - (cash_value + market_value)) > 1`, [sessionDate]);
   checks.navIdentityHolds = Number(navOk.bad) === 0;
 
-  const [[dupes]] = await pool.query(
-    `SELECT COUNT(*) n FROM (
-       SELECT order_id FROM virtual_positions GROUP BY order_id HAVING COUNT(*) > 1) x`);
+  const officialIds = accts.map(a => a.id);
+  const [[dupes]] = officialIds.length
+    ? await pool.query(
+        `SELECT COUNT(*) n FROM (
+           SELECT order_id FROM virtual_positions WHERE account_id IN (?)
+            GROUP BY order_id HAVING COUNT(*) > 1) x`, [officialIds])
+    : [[{ n: 0 }]];
   checks.noDuplicateFills = Number(dupes.n) === 0;
 
-  const [[blockedRows]] = await pool.query(
-    `SELECT COUNT(*) n FROM virtual_trade_events WHERE event='DATA_BLOCKED' AND event_date=?`, [sessionDate]);
+  const [[blockedRows]] = officialIds.length
+    ? await pool.query(
+        `SELECT COUNT(*) n FROM virtual_trade_events
+          WHERE event='DATA_BLOCKED' AND event_date=? AND account_id IN (?)`, [sessionDate, officialIds])
+    : [[{ n: 0 }]];
   checks.noSkippedUnknownBar = Number(blockedRows.n) === 0;
 
   let reconcileProblems = [];
   try {
     const vp = require('./virtual_portfolio');
-    reconcileProblems = await vp.cmdReconcile(pool, {});
+    reconcileProblems = await vp.cmdReconcile(pool, { strategyId: vp.SOURCE_STRATEGY });
   } catch (e) { reconcileProblems = [`reconcile could not run: ${e.message}`]; }
   checks.reconcileClean = reconcileProblems.length === 0;
 
