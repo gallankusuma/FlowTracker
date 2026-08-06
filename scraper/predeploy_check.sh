@@ -29,6 +29,24 @@ run() {
   fi
 }
 
+# The deployed-commit stamp is what the charter records as the code that
+# produced a track record. It is written by hand at deploy time and has now been
+# forgotten twice, each time freezing a charter that named the wrong commit.
+# A stamp older than the newest source file means the code moved and the stamp
+# did not.
+if [ ! -f .deployed-commit ]; then
+  echo ""
+  echo "  ** .deployed-commit is MISSING. The charter cannot name the code it runs."
+  echo "     Write it before deploying:  git rev-parse --short HEAD > scraper/.deployed-commit"
+  fail=1
+elif [ -n "$(find . -maxdepth 2 -name '*.js' -newer .deployed-commit -not -path './node_modules/*' -print -quit)" ]; then
+  echo ""
+  echo "  ** .deployed-commit ($(cat .deployed-commit)) is OLDER than deployed source."
+  echo "     Newer than the stamp: $(find . -maxdepth 2 -name '*.js' -newer .deployed-commit -not -path './node_modules/*' -printf '%f ' 2>/dev/null | head -c 200)"
+  echo "     Re-stamp before freezing any charter, or it will record the wrong commit."
+  fail=1
+fi
+
 run "unit suite (no database)"            npm run --silent test:unit
 run "golden fixture (needs the database)" npm run --silent test:verify
 run "database integration"                npm run --silent test:integration
