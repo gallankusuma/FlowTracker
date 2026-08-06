@@ -202,11 +202,35 @@ async function checkPhantomSessions(pool) {
   line('                     previous date exactly — a carried-forward write.');
   line('  Every rolling window in this system counts BARS: ADV20, ATR14, the 252-day');
   line('  high, the 200-day SMA. A phantom bar shifts all of them.');
+  // RECENT phantoms mean the ingest is producing them NOW — that is a live
+  // fault. Old ones are data debt: real, worth fixing, but scoring them as a
+  // failure every night would hold the burn-in streak hostage to 2017 forever,
+  // and a check that can never be satisfied is a check people route around.
+  const [[sess]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+  const cutoff = (() => {
+    const base = iso(sess?.d) || new Date().toISOString().slice(0, 10);
+    const d = new Date(`${base}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - 30);
+    return d.toISOString().slice(0, 10);
+  })();
+  const recent = phantom.filter(p => p.date >= cutoff);
+  const historical = phantom.filter(p => p.date < cutoff);
+
+  if (historical.length) {
+    report({
+      level: 'WARN',
+      what: `${historical.length} historical phantom date(s) in idx_stock_prices (data debt)`,
+      detail: `oldest ${historical[0].date}, newest ${historical[historical.length - 1].date}. Not scored against the daily burn-in: the ingest guard stops new ones, and blocking the streak on years-old rows would make it unreachable. Purge or re-ingest deliberately with purge_phantom_sessions.js.`,
+    });
+    line(`  ${historical.length} of these are older than ${cutoff} — data debt, reported but not scored daily.`);
+  }
+  if (!recent.length) return phantom.map(p => p.date);
+
   const byYear = {};
-  for (const p of phantom) (byYear[p.date.slice(0, 4)] ||= []).push(p.date);
+  for (const p of recent) (byYear[p.date.slice(0, 4)] ||= []).push(p.date);
   report({
     level: 'FAIL',
-    what: `${phantom.length} phantom date(s) in idx_stock_prices`,
+    what: `${recent.length} phantom date(s) written since ${cutoff} — the ingest is producing them now`,
     // Summarised by year. The full list is printed above; repeating 72 dates in
     // the summary makes the one line a reader actually sees unreadable.
     detail: `${Object.entries(byYear).map(([y, d]) => `${y}: ${d.length}`).join(', ')}` +
@@ -299,9 +323,23 @@ async function checkVirtualPortfolio(pool) {
 
   const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
   const priceDate = iso(px.d);
+  const [[cal]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+  const sessionDate = iso(cal?.d);
   const [[nav]] = await pool.query('SELECT MAX(mark_date) d FROM virtual_nav');
   const navDate = iso(nav?.d);
-  line(`  latest NAV mark ${navDate || 'none'} · prices ${priceDate}`);
+  line(`  latest NAV mark ${navDate || 'none'} · prices ${priceDate} · session ${sessionDate}`);
+
+  // ALL THREE MUST AGREE, not merely "the NAV is not behind". `navDate >=
+  // priceDate` passes when the mark is dated a session the prices have not
+  // reached, which is the very state PRICE_DATA_STALE exists to catch.
+  if (navDate && priceDate && sessionDate && !(navDate === priceDate && priceDate === sessionDate)) {
+    report({
+      level: 'FAIL',
+      what: 'the NAV mark, the price series and the session calendar do not agree',
+      detail: `nav ${navDate}, prices ${priceDate}, session ${sessionDate}. A NAV dated to a session nothing is priced in looks exactly like a real valuation.`,
+    });
+    line('  ** these three dates must be identical; they are not');
+  }
 
   if (!navDate || navDate < priceDate) {
     await runRepair(pool, {
@@ -310,7 +348,13 @@ async function checkVirtualPortfolio(pool) {
       fix: async () => {
         const vp = require('./virtual_portfolio');
         await vp.setup(pool, true);
-        await vp.cmdResolve(pool, true);
+        const resolved = await vp.cmdResolve(pool, true);
+        // The repair must respect the resolver's own refusal. Marking straight
+        // after a blocked resolve would stamp a NAV on data the engine just
+        // declined to touch — the watchdog undoing a guard it exists to enforce.
+        if (resolved?.blocked) {
+          throw new Error(`virtual resolve is blocked (${resolved.blocked}); marking would value an unsettled book`);
+        }
         return vp.cmdMark(pool, true);
       },
       verify: async () => {
@@ -403,16 +447,60 @@ async function recordBurnIn(pool) {
     CREATE TABLE IF NOT EXISTS virtual_burnin (
       id INT AUTO_INCREMENT PRIMARY KEY,
       session_date DATE NOT NULL,
+      -- SCOPED TO AN IDENTITY. With a key on session_date alone the streak was
+      -- computed across the whole table, so eight clean days under engine v2
+      -- plus two under a brand-new v3 reported ten — and v3 had run for two.
+      -- A streak that survives the thing it measures is not a streak.
+      identity_hash VARCHAR(32) NOT NULL DEFAULT 'legacy',
+      engine_version INT NOT NULL DEFAULT 0,
       passed TINYINT(1) NOT NULL,
       checks_json TEXT NULL,
       failures_json TEXT NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_session (session_date)
+      UNIQUE KEY uq_session (identity_hash, session_date)
     )`);
+
+  // Existing installs predate the identity columns and the wider key.
+  for (const [col, def] of [
+    ['identity_hash', `VARCHAR(32) NOT NULL DEFAULT 'legacy' AFTER session_date`],
+    ['engine_version', 'INT NOT NULL DEFAULT 0 AFTER identity_hash'],
+  ]) {
+    const [[c]] = await pool.query(
+      `SELECT COUNT(*) n FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_burnin' AND COLUMN_NAME=?`, [col]);
+    if (!Number(c.n)) await pool.query(`ALTER TABLE virtual_burnin ADD COLUMN ${col} ${def}`);
+  }
+  const [[uq]] = await pool.query(
+    `SELECT COUNT(*) n FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_burnin'
+        AND INDEX_NAME='uq_session' AND COLUMN_NAME='identity_hash'`);
+  if (!Number(uq.n)) {
+    const [[has]] = await pool.query(
+      `SELECT COUNT(*) n FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_burnin' AND INDEX_NAME='uq_session'`);
+    if (Number(has.n)) await pool.query('ALTER TABLE virtual_burnin DROP INDEX uq_session');
+    await pool.query('ALTER TABLE virtual_burnin ADD UNIQUE KEY uq_session (identity_hash, session_date)');
+  }
 
   const [[sess]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
   const sessionDate = iso(sess?.d);
   if (!sessionDate) { line('\nBurn-in — no session calendar yet, nothing to record'); return null; }
+
+  // WHOSE streak this is. Strategy hash, engine version and the exact set of
+  // live accounts, hashed together: change any of them and the count starts
+  // again, because the thing being burned in is no longer the same thing.
+  // Without this, eight clean days under engine v2 plus two under a brand-new
+  // v3 reported ten — and v3 had run for two.
+  const vb = require('./modules/virtual_broker');
+  const [idRows] = await pool.query(
+    `SELECT account_code, strategy_hash, execution_policy_hash, execution_engine_version
+       FROM virtual_accounts WHERE status IN ('ACTIVE','RETIRING') ORDER BY account_code`);
+  const identityHash = require('crypto').createHash('sha256')
+    .update(JSON.stringify({
+      engine: vb.EXECUTION_ENGINE_VERSION,
+      accounts: idRows.map(r => [r.account_code, r.strategy_hash, r.execution_policy_hash, r.execution_engine_version]),
+    }))
+    .digest('hex').slice(0, 16);
 
   // The checklist the review specified, each answered from data rather than
   // from whether a job claimed success.
@@ -422,12 +510,26 @@ async function recordBurnIn(pool) {
   // Excluding the dates already proven not to be sessions, the same subtraction
   // checkIhsgGaps makes. Without it this reported IDX public holidays as missing
   // index bars and failed the burn-in every night, for a fault no refetch can fix.
-  const phantomDates = (await sh.phantomSessions(pool)).map(p => p.date);
+  const allPhantom = (await sh.phantomSessions(pool)).map(p => p.date);
   checks.calendarCurrent = !(await sh.missingSessions(pool,
-    { table: 'idx_ihsg_history', col: 'date', exclude: phantomDates })).missing.length;
-  // A phantom row is itself a burn-in failure: the ingest produced a bar for a
-  // day the exchange was shut, which is the data-lifecycle fault this exists to catch.
+    { table: 'idx_ihsg_history', col: 'date', exclude: allPhantom })).missing.length;
+  // A phantom row is a burn-in failure only when the INGEST produced one
+  // recently. Scoring the whole history here would have held the streak hostage
+  // to years-old data debt: the count could never reach ten while a single 2017
+  // holiday bar existed, no matter how clean the engine ran. Historical debt is
+  // real and reported separately by checkPhantomSessions; what the daily burn-in
+  // asks is whether TODAY's pipeline behaved.
+  const BURNIN_LOOKBACK_DAYS = 30;
+  const recentCutoff = (() => {
+    const d = new Date(`${sessionDate}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - BURNIN_LOOKBACK_DAYS);
+    return d.toISOString().slice(0, 10);
+  })();
+  const phantomDates = allPhantom.filter(d => d >= recentCutoff);
   checks.noPhantomSessions = phantomDates.length === 0;
+  if (allPhantom.length && !phantomDates.length) {
+    line(`  (${allPhantom.length} historical phantom date(s) outside the ${BURNIN_LOOKBACK_DAYS}-day window — reported separately, not counted here)`);
+  }
 
   const [accts] = await pool.query(
     `SELECT id, account_code, cash_balance, total_nav, performance_eligible
@@ -475,16 +577,18 @@ async function recordBurnIn(pool) {
   const passed = failures.length === 0;
 
   await pool.query(
-    `INSERT INTO virtual_burnin (session_date, passed, checks_json, failures_json)
-     VALUES (?,?,?,?)
+    `INSERT INTO virtual_burnin (session_date, identity_hash, engine_version, passed, checks_json, failures_json)
+     VALUES (?,?,?,?,?,?)
      ON DUPLICATE KEY UPDATE passed=VALUES(passed), checks_json=VALUES(checks_json), failures_json=VALUES(failures_json)`,
-    [sessionDate, passed ? 1 : 0, JSON.stringify(checks), failures.length ? JSON.stringify(failures) : null]);
+    [sessionDate, identityHash, vb.EXECUTION_ENGINE_VERSION, passed ? 1 : 0,
+     JSON.stringify(checks), failures.length ? JSON.stringify(failures) : null]);
 
   // Walk backwards. The streak is DERIVED, never stored — a stored counter can
   // drift from the rows it claims to summarise, and only in the flattering
   // direction.
   const [rows] = await pool.query(
-    'SELECT session_date, passed FROM virtual_burnin ORDER BY session_date DESC');
+    'SELECT session_date, passed FROM virtual_burnin WHERE identity_hash=? ORDER BY session_date DESC',
+    [identityHash]);
   let streak = 0;
   for (const r of rows) { if (!Number(r.passed)) break; streak++; }
 
@@ -500,7 +604,7 @@ async function recordBurnIn(pool) {
     line('  TEN CONSECUTIVE CLEAN SESSIONS. Operationally stable.');
     line('  This says nothing whatsoever about whether the strategy makes money.');
   }
-  return { sessionDate, passed, streak, checks, failures };
+  return { sessionDate, identityHash, passed, streak, checks, failures };
 }
 
 async function main() {

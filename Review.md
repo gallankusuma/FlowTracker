@@ -1,342 +1,228 @@
-Setelah empat poin ini ditutup, menurut gue virtual broker bisa dinyatakan engineering-ready untuk official shadow track record.
+P0.1 — Cron production masih tidak membentuk fail-fast chain
 
-Yang sudah berhasil ditutup
-Arahan sebelumnya	Status
-Cron IHSG sebelum resolve	✅
-SESSION_CALENDAR_STALE guard	✅ Sebagian
-Missing bar menghentikan exit walk	✅
-performance_eligible=0 saat data blocked	✅
-Pending order dibatalkan saat contract berubah	✅
-Retiring account tidak memakai natural resolver baru	✅
-Migration tidak swallow error	✅
-Migration dibuktikan melalui information_schema	✅
-Mark memakai consistent transaction snapshot	✅
-Reconcile memakai frozen account config	✅
-Official V2 accounts mulai Rp100 juta baru	✅
-Evaluation gate dibekukan sebelum hasil muncul	✅
-10-session burn-in tracking	✅
-Dashboard membawa charter dan burn-in status	✅
+Ini temuan terpenting.
 
-Cron sekarang sudah memiliki urutan yang benar:
+Perbaikan pada main() memang menghentikan proses ketika menjalankan:
 
-19:30  price data
-20:05  refresh IHSG
-20:10  virtual resolve
-20:15  forward fill
-20:20  forward plan
-20:25  forward mark
-20:30  virtual schedule
-20:35  virtual mark
-20:40  virtual reconcile
-20:50  watchdog
+node virtual_portfolio.js
 
-Missing atau incomplete exit bar sekarang benar-benar menghentikan perjalanan posisi. Account juga diberi performance_eligible=0 sampai datanya pulih. Ini solusi yang benar.
+tanpa subcommand.
 
-Official account juga sudah dipisahkan secara struktural:
+Namun production cron masih menjalankan empat proses independen:
 
-POSITION_100M_V2
-INTRADAY_EOD_100M_V2
+20:10 resolve
+20:30 schedule
+20:35 mark
+20:40 reconcile
 
-dan evaluation gate telah dibekukan melalui charter.
+Jadi bila resolve pukul 20:10 keluar dengan status 1:
 
-P0.1 — Fresh database setup sekarang gagal
+20:30 schedule tetap berjalan
+20:35 mark tetap berjalan
+20:40 reconcile tetap berjalan
 
-Urutan schema setup salah.
+Exit code proses sebelumnya tidak otomatis membatalkan entry cron berikutnya. Dengan demikian, komentar di mode default bahwa “nothing was scheduled or marked” belum berlaku pada jalur production sebenarnya.
 
-Code menjalankan:
+Perbaikan yang disarankan
 
-ALTER TABLE virtual_positions
-MODIFY COLUMN exit_reason VARCHAR(24) NULL
+Buat checkpoint:
 
-sebelum menjalankan:
+virtual_cycle_stage
+-------------------
+session_date
+engine_version
+stage
+status
+reason
+completed_at
 
-CREATE TABLE IF NOT EXISTS virtual_positions (...)
+UNIQUE(session_date, engine_version, stage)
 
-Pada production database existing, ini kemungkinan tidak terlihat karena tabel sudah ada. Tetapi pada:
+Lifecycle:
 
-fresh installation;
-temporary integration database;
-disaster recovery;
-deployment environment baru;
+resolve OK
+    ↓
+schedule boleh berjalan
+    ↓
+mark boleh berjalan
+    ↓
+reconcile boleh berjalan
 
-setup akan gagal dengan tabel virtual_positions belum ada.
+cmdSchedule() harus menolak ketika current-session resolve bukan OK. cmdMark() juga harus menolak ketika resolve belum sukses.
 
-Perbaikan
+Ini lebih aman daripada hanya mengandalkan waktu cron.
 
-Urutannya harus:
+P0.2 — Watchdog masih mengabaikan blocked resolve
 
-1. CREATE TABLE IF NOT EXISTS virtual_positions
-2. Periksa kolom exit_reason
-3. ALTER hanya jika panjangnya kurang dari 24
+Pada repair virtual portfolio, watchdog menjalankan:
 
-Contoh:
+await vp.cmdResolve(pool, true);
+return vp.cmdMark(pool, true);
 
-await pool.query(`CREATE TABLE IF NOT EXISTS virtual_positions (...)`);
+Ia tidak memeriksa apakah cmdResolve() mengembalikan:
 
-const [[col]] = await pool.query(`
-  SELECT CHARACTER_MAXIMUM_LENGTH len
-  FROM information_schema.COLUMNS
-  WHERE TABLE_SCHEMA=DATABASE()
-    AND TABLE_NAME='virtual_positions'
-    AND COLUMN_NAME='exit_reason'
-`);
+PRICE_DATA_STALE
+SESSION_CALENDAR_STALE
+PRICE_COVERAGE_THIN
 
-if (Number(col?.len) < 24) {
-  await pool.query(
-    'ALTER TABLE virtual_positions MODIFY COLUMN exit_reason VARCHAR(24) NULL'
-  );
-}
+Jadi watchdog dapat menjalankan mark tepat setelah resolver menolak data tersebut.
 
-Tambahkan fresh-schema integration test yang menjalankan setup() setelah seluruh virtual_* tables dihapus atau menggunakan temporary database.
+Perbaikannya:
 
-P0.2 — Calendar guard belum benar-benar fail-closed
+const resolved = await vp.cmdResolve(pool, true);
 
-Guard sekarang hanya menyatakan stale ketika:
-
-calendar < prices
-
-Ini menutup kasus IHSG tertinggal dari price data. Tetapi arah sebaliknya belum ditangani.
-
-Skenario:
-
-IHSG calendar  : 2026-08-05
-Price data     : 2026-08-04
-
-Ini dapat terjadi bila:
-
-price pull 19:30 gagal;
-refresh IHSG 20:05 berhasil;
-resolve 20:10 dijalankan.
-
-Karena calendar < prices false, resolve tetap berjalan. Mark kemudian dapat membuat NAV bertanggal 5 Agustus menggunakan last-known prices tanggal 4 Agustus.
-
-Guard yang dibutuhkan
-if (!calendar || !prices) {
-  return { blocked: 'MARKET_DATA_UNAVAILABLE' };
-}
-
-if (calendar < prices) {
-  return { blocked: 'SESSION_CALENDAR_STALE' };
-}
-
-if (prices < calendar) {
-  return { blocked: 'PRICE_DATA_STALE' };
-}
-
-Lebih kuat lagi, jangan hanya memeriksa MAX(date). Pastikan latest session mempunyai coverage saham minimum yang wajar.
-
-CLI masih keluar dengan status sukses
-
-Saat calendar stale, cmdResolve() mengembalikan object blocked. Tetapi main() melakukan:
-
-if (cmd === 'resolve') {
-  await cmdResolve(pool, false);
-  return;
-}
-
-Tidak ada process.exitCode = 1. Default pipeline juga tetap melanjutkan ke schedule dan mark setelah resolve blocked.
-
-Akibatnya cron dapat melihat command berhasil walaupun resolve secara eksplisit menolak bekerja.
-
-Perbaikan
-if (cmd === 'resolve') {
-  const result = await cmdResolve(pool, false);
-  if (result?.blocked) process.exitCode = 1;
-  return;
-}
-
-const resolved = await cmdResolve(pool, false);
 if (resolved?.blocked) {
-  process.exitCode = 1;
-  return;
+  throw new Error(`virtual resolve blocked: ${resolved.blocked}`);
 }
 
-Integration test saat ini hanya membuktikan cmdResolve() mengembalikan SESSION_CALENDAR_STALE; belum membuktikan CLI keluar non-zero atau default chain berhenti.
+return vp.cmdMark(pool, true);
 
-P0.3 — Code commit disebut bagian identity, tetapi belum benar-benar mengisolasi account
+Verify juga sebaiknya mensyaratkan:
 
-Dokumentasi charter mengatakan:
+NAV date = IHSG session date = price date
 
-Code commit merupakan bagian dari identity.
+bukan hanya NAV date >= price date.
 
-Alasannya benar: execution policy hash hanya menangkap configuration, bukan perubahan algorithm.
+P0.3 — Burn-in belum diisolasi berdasarkan engine/account identity
 
-Namun unique key charter saat ini hanya:
+Tabel burn-in masih hanya mempunyai:
 
-account_code
-strategy_id
-strategy_hash
-execution_policy_hash
+session_date
+passed
+checks_json
+failures_json
 
-code_commit tidak termasuk unique identity. virtual_accounts juga tidak memiliki implementation commit/hash.
-
-Skenario:
-
-Commit A:
-account berjalan dan charter dibekukan
-
-Commit B:
-algorithm execution berubah
-strategy hash tetap
-execution policy hash tetap
-account code tetap
-
-→ setup menemukan charter lama
-→ trade baru Commit B masuk account Commit A
-
-Charter tetap menampilkan commit A, padahal sebagian record dibuat oleh commit B.
-
-Solusi yang lebih baik
-
-Jangan memakai raw Git commit untuk memulai ulang account pada setiap perubahan dokumentasi. Buat identity eksplisit:
-
-execution_engine_version
-atau
-execution_engine_hash
-
-Hash tersebut mencakup perubahan material pada:
-
-fill rules;
-gap handling;
-missing-bar behavior;
-NAV sizing;
-order sequencing;
-retirement behavior;
-transaction lifecycle.
-
-Tambahkan ke:
-
-virtual_accounts
-virtual_charter
-unique account identity
-
-Ketika engine hash berubah:
-
-old account → RETIRING
-new account → fresh Rp100 juta
-
-Raw code_commit tetap disimpan untuk reproducibility, tetapi implementation identity sebaiknya berupa version/hash yang disengaja.
-
-P0.4 — Forced retirement exit memakai open yang sudah lewat
-
-Saat account menjadi RETIRING, code force-close posisi menggunakan:
-
-const today = dates[dates.length - 1];
-const px = bars.get(p.ticker)?.get(today)?.open;
-
-Masalahnya, detection dan deployment biasanya terjadi saat nightly process, sekitar pukul 20:10 WIB. Open hari tersebut terjadi sekitar pukul 09:00 WIB—lebih dari 11 jam sebelumnya.
+dengan unique key pada session_date. Streak kemudian dihitung dari seluruh tabel tanpa filter strategy hash, policy hash, atau engine version.
 
 Skenario:
 
-Rabu 20:00  code V3 dideploy
-Rabu 20:10  account V2 menjadi RETIRING
-Rabu 20:10  posisi dicatat exit pada open Rabu
+Engine v2 mempunyai 8 hari clean
+Engine berubah ke v3
+Account baru Rp100 juta dibuat
+Dua hari berikutnya clean
+→ sistem melaporkan 10 hari
 
-Sistem secara retroaktif menjual sebelum keputusan retirement ada.
-
-Ini bukan hanya asumsi konservatif; ini execution timestamp yang tidak mungkin.
+Padahal engine v3 baru menjalani dua hari.
 
 Perbaikan
 
-Simpan:
+Tambahkan:
 
-retired_at
-retirement_session
-retirement_reason
+burnin_identity_hash
+strategy_hash
+execution_engine_version
+active_account_set_hash
 
-Kemudian forced exit hanya pada:
+Unique key:
 
-first authoritative session strictly after retirement was detected
+UNIQUE(burnin_identity_hash, session_date)
 
-Contoh:
+Streak wajib dihitung hanya untuk identity aktif saat ini.
 
-const retirementDate = toDateStr(acct.retired_at);
+P0.4 — Historical phantom rows bisa membuat burn-in gagal selamanya
 
-const exitDate = dates.find(d => d > retirementDate);
-if (!exitDate) {
-  // next session belum tersedia
-  continue;
-}
+phantomSessions() memindai seluruh histori idx_stock_prices, bukan hanya current session.
 
-const px = bars.get(p.ticker)?.get(exitDate)?.open;
+Current documentation menyebut masih ada 72 tanggal phantom dan sengaja tidak dihapus otomatis.
 
-Alternatifnya gunakan same-day close hanya jika retirement decision memang direkam sebelum close. Dengan current nightly architecture, next-session open adalah asumsi paling bersih.
+Burn-in kemudian melakukan:
 
-Integration test sekarang justru mengharuskan account langsung kosong setelah satu cmdResolve() menggunakan bar terbaru, sehingga test tersebut mengunci perilaku retroaktif.
+noPhantomSessions = phantomDates.length === 0
+watchdogHealthy = tidak ada FAIL
 
-P1 yang disarankan
-Official start date belum benar-benar “next trading session”
+Karena checkPhantomSessions() melaporkan phantom sebagai FAIL, streak kemungkinan akan gagal setiap hari selama historical rows tersebut masih ada.
 
-Setup mencari:
+Ada dua opsi yang konsisten:
 
-SELECT MIN(date)
-FROM idx_ihsg_history
-WHERE date > CURDATE()
+backup, purge/reingest 72 historical dates tersebut; atau
+daily burn-in hanya memeriksa phantom pada current session dan relevant strategy lookback, sementara historical data debt dilaporkan sebagai item terpisah.
 
-Lalu bila tidak ada, menggunakan latest session.
+Kalau raw historical bars masih dipakai oleh strategy modules tanpa session-calendar filtering, opsi pertama lebih aman.
 
-Tabel historical biasanya tidak menyimpan future sessions, sehingga fallback hampir selalu dipakai. Official start dapat menjadi hari ini atau sesi sebelumnya, bukan sesi pertama account benar-benar dapat melakukan trade.
+P1 — Retirement edge case masih tersisa
+Deployment intraday masih dapat menghasilkan exit retroaktif
+
+retirement_session diisi dengan:
+
+SELECT MAX(date) FROM idx_ihsg_history
+
+Misalnya deployment dilakukan Kamis pukul 11:05 WIB, sementara IHSG table baru sampai Rabu:
+
+retirement_session = Rabu
+Kamis malam data masuk
+first session after Rabu = Kamis
+exit memakai Kamis open pukul 09:00
+
+Padahal retirement diputuskan pukul 11:05.
+
+Gunakan local decision date, bukan latest index session:
+
+retirement_not_before_date =
+tanggal retired_at dalam Asia/Jakarta
+
+Kemudian exit pada session yang tanggalnya lebih besar dari tanggal keputusan tersebut.
+
+Suspensi pada first retirement session dapat membuat posisi macet
+
+Code menentukan satu exitDate global, yaitu first session setelah keputusan. Bila suatu ticker tidak memiliki opening price pada sesi itu, code melakukan continue. Pada run berikutnya ia kembali mencoba sesi yang sama, sehingga tidak pernah maju ke sesi kedua.
+
+Cari first available session per ticker:
+
+const exitDate = dates.find(
+  d => d > decidedOn && bars.get(p.ticker)?.get(d)?.open > 0
+);
+P1 — Official start date masih belum benar
+
+Code mengambil:
+
+latestSession = MAX(date)
+
+nextSession =
+  MIN(date)
+  WHERE date > latestSession
+
+Query kedua secara definisi tidak akan menemukan row di historical table. Code kemudian fallback ke latestSession.
+
+Komentarnya mengatakan PENDING_FIRST_SESSION, tetapi state tersebut belum benar-benar diimplementasikan.
 
 Lebih akurat:
 
-official start = tanggal first official NAV mark
+official_start_date =
+first virtual NAV mark after charter.frozen_at
 
-atau session pertama setelah charter frozen.
+Atau buat nullable dan hanya izinkan transisi satu arah:
 
-DATA_BLOCKED event bisa tercatat berulang
+NULL → first official session
 
-Setiap nightly retry pada bar yang sama memasukkan event DATA_BLOCKED baru. Ini tidak merusak accounting, tetapi journal dapat penuh dengan event identik.
+Karena charter immutable, ini perlu diselesaikan sebelum official record pertama.
 
-Tambahkan unique logical key atau hanya insert ketika block state berubah:
-
-position_id + blocked_date + reason
-CRONTAB.md masih menyebut nama account lama
-
-Bagian jadwal masih mengatakan POSITION_100M dan INTRADAY_EOD_100M, sementara code sudah menggunakan suffix _V2.
-
-Tidak memengaruhi engine, tetapi dokumentasi official record harus presisi.
-
-Burn-in implementation
-
-Burn-in tracking sudah dibuat dengan pendekatan yang benar:
-
-satu row per session;
-streak dihitung dari historical rows;
-bukan mutable counter;
-reconciliation failures masuk ke failure list;
-dashboard menerima streak, target, dan failure history.
-
-Namun jangan mulai menghitung streak resmi sebelum empat P0 di atas ditutup. Account V2 memang belum tentu perlu diganti lagi bila benar-benar belum ada order/position, tetapi charter/identity harus diperbaiki sebelum first official trade.
-
-Penilaian terbaru
+Penilaian sekarang
 Area	Nilai
-Core accounting	9,3
-Data blocking	9,5
-Session-calendar design	9,0
-Cron orchestration	8,8
-Retirement lifecycle	7,5
-Schema migration safety	7,8
-Track-record identity	7,0
-Burn-in instrumentation	9,0
+Core accounting	9,4
+Fresh-schema safety	9,3
+Market-data validation	9,4
+Engine identity	9,2
+Retirement lifecycle	8,3
 Testing	9,2
-Official evidence readiness	8,4
+Cron failure propagation	6,5
+Burn-in identity	6,5
+Official evidence readiness	8,2
 Kesimpulan
 
-Revisi ini sudah membawa sistem ke tahap:
+Revisi ini memang substantif dan benar. Empat komentar utama sudah masuk.
 
-Operationally instrumented virtual broker with pre-registered evaluation and burn-in monitoring.
+Status sistem sekarang:
 
-Tim sudah menutup hampir semua masalah arithmetic, data blocking, dan accounting sebelumnya.
+Virtual broker core: engineering-ready.
+Official burn-in orchestration: belum fully fail-closed.
 
-Yang tersisa sekarang sangat spesifik:
+Sebelum mulai hitungan 10 hari resmi, tutup:
 
-pindahkan ALTER virtual_positions setelah CREATE TABLE;
-freshness guard harus dua arah dan CLI harus exit non-zero;
-implementation version/hash harus benar-benar masuk account identity;
-forced retirement exit harus memakai next available session, bukan open yang sudah lewat.
+stage checkpoint antara resolve → schedule → mark;
+watchdog harus berhenti ketika resolve blocked;
+burn-in harus di-scope ke engine/account identity;
+tentukan perlakuan terhadap 72 historical phantom sessions.
 
-Setelah empat poin tersebut selesai, menurut gue:
+Setelah itu, menurut gue tidak perlu menambah fitur lagi—langsung mulai official burn-in.
 
-Mulai official 10-session burn-in. Tidak perlu menambah fitur lain dulu.
-
-Review ini berdasarkan static source terbaru di GitHub. Gue belum menjalankan npm test, npm run test:integration, atau membaca live crontab/MySQL di VPS.
+Review ini berdasarkan source terbaru di GitHub. Gue belum menjalankan unit/integration test langsung karena runtime lokal tidak dapat me-resolve github.com, dan gue tidak memiliki akses ke MySQL atau live crontab VPS.

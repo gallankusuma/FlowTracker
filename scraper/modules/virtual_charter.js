@@ -106,7 +106,12 @@ async function ensureTable(pool) {
       config_version INT NOT NULL,
       code_commit VARCHAR(40) NULL,
       starting_capital DECIMAL(20,2) NOT NULL,
-      official_start_date DATE NOT NULL,
+      -- NULLABLE, and one-way. There is no way to know at freeze time which
+      -- session the account will first trade on: a historical table holds no
+      -- future dates, so every attempt to compute it fell back to today or
+      -- earlier -- a date the account provably could not have traded, because it
+      -- did not exist yet. It is resolved once, from the first official NAV mark.
+      official_start_date DATE NULL,
       gate_json TEXT NOT NULL,
       frozen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       -- One charter per identity, and the code below never updates a row. The
@@ -122,6 +127,20 @@ async function ensureTable(pool) {
     await pool.query(
       'ALTER TABLE virtual_charter ADD COLUMN execution_engine_version INT NOT NULL DEFAULT 1 AFTER execution_policy_hash');
   }
+  // official_start_date became nullable on 2026-08-05. Checked and altered
+  // explicitly rather than ALTER-and-swallow: a swallowed migration error is how
+  // this codebase has repeatedly reported a schema ready when it was not.
+  const [[nullable]] = await pool.query(
+    `SELECT IS_NULLABLE ok FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_charter' AND COLUMN_NAME='official_start_date'`);
+  if (nullable && nullable.ok === 'NO') {
+    await pool.query('ALTER TABLE virtual_charter MODIFY COLUMN official_start_date DATE NULL');
+    const [[after]] = await pool.query(
+      `SELECT IS_NULLABLE ok FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_charter' AND COLUMN_NAME='official_start_date'`);
+    if (after.ok !== 'YES') throw new Error('virtual_charter.official_start_date is still NOT NULL after the ALTER');
+  }
+
   const [[key]] = await pool.query(
     `SELECT COUNT(*) n FROM information_schema.STATISTICS
       WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_charter'
@@ -150,6 +169,7 @@ async function freezeCharter(pool, {
   await ensureTable(pool);
   const gate = GATES[exitPolicy];
   if (!gate) throw new Error(`no evaluation gate defined for exit policy ${exitPolicy}`);
+
 
   // NO COMMIT, NO CHARTER. The execution policy hash covers the configuration
   // and not the algorithm — gap handling and missing-bar rules both changed on
@@ -235,4 +255,34 @@ async function evaluate(pool, charter, stats) {
   return { kind: gate.kind, verdict, criteria, gate };
 }
 
-module.exports = { GATES, ensureTable, freezeCharter, evaluate, codeCommit };
+/**
+ * Resolve the official start ONCE, from the first NAV mark the account actually
+ * produced. One-way: NULL -> a real session, and never rewritten.
+ *
+ * Computing it at freeze time was impossible and the code pretended otherwise —
+ * a historical table holds no future sessions, so the "next session" query never
+ * matched and the fallback recorded today or earlier. That is a date on which
+ * the account could not have traded, because it did not exist yet.
+ */
+async function resolveOfficialStart(pool) {
+  const [rows] = await pool.query(
+    `SELECT c.id, c.account_code, c.frozen_at
+       FROM virtual_charter c WHERE c.official_start_date IS NULL`);
+  const resolved = [];
+  for (const c of rows) {
+    const [[nav]] = await pool.query(
+      `SELECT MIN(v.mark_date) d FROM virtual_nav v
+         JOIN virtual_accounts a ON a.id = v.account_id
+        WHERE a.account_code = ? AND v.created_at >= ?`, [c.account_code, c.frozen_at]);
+    if (!nav?.d) continue;
+    const d = nav.d instanceof Date
+      ? `${nav.d.getFullYear()}-${String(nav.d.getMonth() + 1).padStart(2, '0')}-${String(nav.d.getDate()).padStart(2, '0')}`
+      : String(nav.d).slice(0, 10);
+    await pool.query(
+      'UPDATE virtual_charter SET official_start_date=? WHERE id=? AND official_start_date IS NULL', [d, c.id]);
+    resolved.push({ accountCode: c.account_code, officialStartDate: d });
+  }
+  return resolved;
+}
+
+module.exports = { GATES, ensureTable, freezeCharter, evaluate, codeCommit, resolveOfficialStart };

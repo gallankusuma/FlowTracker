@@ -145,7 +145,30 @@ async function cashByAccount(pool) {
       [STRATEGY, signalDate, PLAN_HASH, 'testsnapshot0001', 'testcommit',
        TICKERS.length, JSON.stringify(TICKERS)]);
 
+    console.log('\nvirtual portfolio — the stage checkpoint');
+
+    await t('SCHEDULE REFUSES UNTIL RESOLVE HAS COMPLETED FOR THIS SESSION', async () => {
+      // Production runs resolve, schedule, mark and reconcile as FOUR separate
+      // cron processes. A non-zero exit from resolve does not cancel the others,
+      // so "the chain halts" was true only in the single-process mode nobody
+      // runs. The checkpoint survives between processes.
+      const session = await vp.currentSession(pool);
+      await pool.query(
+        'DELETE FROM virtual_cycle_stage WHERE session_date=? AND stage=?', [session, 'resolve'])
+        .catch(() => {});
+      const blocked = await vp.cmdSchedule(pool, true, OPTS);
+      assert.ok(blocked.blocked, `schedule ran without a completed resolve: ${JSON.stringify(blocked)}`);
+      assert.strictEqual(blocked.scheduled, 0);
+
+      const markBlocked = await vp.cmdMark(pool, true, OPTS);
+      assert.deepStrictEqual(markBlocked, [], 'mark ran without a completed resolve');
+    });
+
     console.log('\nvirtual portfolio — scheduling');
+
+    // Production order: resolve settles the previous session before anything is
+    // scheduled. Running it here both mirrors that and satisfies the checkpoint.
+    await vp.cmdResolve(pool, true, OPTS);
 
     const first = await vp.cmdSchedule(pool, true, OPTS);
     await t('every name in the plan becomes a scheduled order, on both accounts', () => {
@@ -640,6 +663,50 @@ async function cashByAccount(pool) {
           'UPDATE idx_stock_prices SET high_price=?, low_price=? WHERE stock_code=? AND date=?',
           [orig.h, orig.l, pos.ticker, last]);
         await vp.cmdResolve(pool, true, OPTS);
+      }
+    });
+
+    await t('a blocked resolve marks the stage BLOCKED, so later stages can see it', async () => {
+      const state = await vp.sessionCalendarState(pool);
+      const ahead = (() => {
+        const d = new Date(`${state.prices}T00:00:00Z`);
+        do { d.setUTCDate(d.getUTCDate() + 1); } while (d.getUTCDay() === 0 || d.getUTCDay() === 6);
+        return d.toISOString().slice(0, 10);
+      })();
+      await pool.query(
+        `INSERT INTO idx_stock_prices (stock_code, date, open_price, high_price, low_price, close_price)
+         VALUES ('ZZTFLAT',?,1000,1010,990,1000) ON DUPLICATE KEY UPDATE open_price=1000`, [ahead]);
+      try {
+        const r = await vp.cmdResolve(pool, true, OPTS);
+        assert.ok(r.blocked, 'expected a blocked resolve');
+        const gate = await vp.stageOk(pool, await vp.currentSession(pool), 'resolve');
+        assert.strictEqual(gate.ok, false, 'the stage must record the refusal, not just return it');
+        assert.ok(/BLOCKED/.test(gate.reason), gate.reason);
+      } finally {
+        await pool.query(`DELETE FROM idx_stock_prices WHERE stock_code='ZZTFLAT' AND date=?`, [ahead]);
+        await vp.cmdResolve(pool, true, OPTS);   // restore the OK stage
+      }
+    });
+
+    await t('the calendar guard fails closed when PRICES are behind, not only the calendar', async () => {
+      // The direction the first version missed: the 19:30 pull fails, the 20:05
+      // IHSG refresh succeeds, and the calendar is a session ahead of any price.
+      const state = await vp.sessionCalendarState(pool);
+      assert.strictEqual(state.blocked, null, 'sanity: healthy right now');
+      const ahead = (() => {
+        const d = new Date(`${state.calendar}T00:00:00Z`);
+        do { d.setUTCDate(d.getUTCDate() + 1); } while (d.getUTCDay() === 0 || d.getUTCDay() === 6);
+        return d.toISOString().slice(0, 10);
+      })();
+      await pool.query(
+        `INSERT INTO idx_ihsg_history (date, close_price) VALUES (?, 6000)
+         ON DUPLICATE KEY UPDATE close_price=6000`, [ahead]);
+      try {
+        const s = await vp.sessionCalendarState(pool);
+        assert.strictEqual(s.blocked, 'PRICE_DATA_STALE',
+          `expected PRICE_DATA_STALE, got ${s.blocked} (calendar ${s.calendar}, prices ${s.prices})`);
+      } finally {
+        await pool.query('DELETE FROM idx_ihsg_history WHERE date=?', [ahead]);
       }
     });
 

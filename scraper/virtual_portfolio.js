@@ -371,11 +371,13 @@ async function setup(pool, quiet = false) {
   // Recorded as PENDING_FIRST_SESSION instead, and resolved to the first real
   // session after the freeze once one lands. Honest while it is unknown rather
   // than confidently wrong.
-  const [[latestSession]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
-  const [[nextSession]] = await pool.query(
-    'SELECT MIN(date) d FROM idx_ihsg_history WHERE date > ?', [toDateStr(latestSession?.d)])
-    .catch(() => [[{ d: null }]]);
-  const officialStart = toDateStr(nextSession?.d) || toDateStr(latestSession?.d);
+  // LEFT NULL AT FREEZE TIME, on purpose. Which session an account first trades
+  // on is not knowable before it trades: the previous attempt asked for the
+  // first date after the latest one, a historical table has none, and the
+  // fallback recorded today -- a date the account could not have traded on.
+  // charter.resolveOfficialStart() fills it in once, from the first NAV mark the
+  // account actually produced after its charter was frozen.
+  const officialStart = null;
 
   for (const a of ACCOUNTS) {
     const r = await charter.freezeCharter(pool, {
@@ -388,7 +390,8 @@ async function setup(pool, quiet = false) {
     });
     if (quiet) continue;
     if (r.frozen) {
-      console.log(`CHARTER  ${a.code} frozen — start ${officialStart}, engine v${vb.EXECUTION_ENGINE_VERSION}, commit ${r.charter.code_commit}`);
+      console.log(`CHARTER  ${a.code} frozen — engine v${vb.EXECUTION_ENGINE_VERSION}, commit ${r.charter.code_commit}`);
+      console.log('         official start: pending its first NAV mark');
       console.log(`         gate: ${JSON.parse(r.charter.gate_json).kind}, ` +
         `${JSON.parse(r.charter.gate_json).minTradingDays} days / ${JSON.parse(r.charter.gate_json).minClosedTrades} trades minimum`);
     } else if (r.gateDrift) {
@@ -402,6 +405,12 @@ async function setup(pool, quiet = false) {
   }
 
   await retireSupersededAccounts(pool, SOURCE_STRATEGY, quiet);
+
+  // One-way, once: NULL -> the first session this account actually marked.
+  const started = await charter.resolveOfficialStart(pool);
+  if (!quiet) for (const r of started) {
+    console.log(`CHARTER  ${r.accountCode} official start resolved to ${r.officialStartDate} (its first NAV mark)`);
+  }
 }
 
 /**
@@ -514,14 +523,19 @@ async function retireSupersededAccounts(pool, strategyId, quiet = false) {
     if (r.status !== next) {
       // The session retirement was DECIDED on, recorded once. The forced exit
       // must land strictly after it — see the unwind in cmdResolve.
-      const [[sess]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+      // THE DECISION'S OWN DATE, in WIB — not the calendar's latest session.
+      // A deploy on Thursday 11:05 WIB while the index only reaches Wednesday
+      // would have recorded Wednesday, and Thursday's 09:00 open then counted
+      // as "after" the decision. It was two hours before it. The wall clock in
+      // Jakarta is what the decision actually happened on.
+      const decisionDate = new Date(Date.now() + 7 * 60 * 60 * 1000).toISOString().slice(0, 10);
       await pool.query(
         `UPDATE virtual_accounts
             SET status=?, retired_at=COALESCE(retired_at, NOW()),
                 retirement_session=COALESCE(retirement_session, ?),
                 retirement_reason=COALESCE(retirement_reason, ?)
           WHERE id=?`,
-        [next, toDateStr(sess?.d), reason, r.id]);
+        [next, decisionDate, reason, r.id]);
       changed.push({ ...r, newStatus: next });
     }
     if (quiet) continue;
@@ -620,7 +634,22 @@ async function logEvent(conn, accountId, event, eventDate, { orderId = null, pos
  * INTENDED notional is recorded; the quantity is computed at resolve time, once
  * the entry and therefore the stop distance are known.
  */
-async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
+async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY, force = false } = {}) {
+  // THE CHECKPOINT. Cron runs this as a separate process half an hour after
+  // resolve, so a non-zero exit there does not stop this one. Creating tomorrow's
+  // orders against a book that was never settled is worse than doing nothing.
+  const session = await currentSession(pool);
+  const gate = await stageOk(pool, session, 'resolve');
+  if (!gate.ok && !force) {
+    if (!quiet) {
+      console.log(`SCHEDULE  refusing — resolve did not complete for ${session || 'this session'} (${gate.reason}).`);
+      console.log('  Freezing new orders over an unsettled book would record decisions the');
+      console.log('  engine never actually acted on. Fix resolve and re-run the chain.');
+    }
+    await recordStage(pool, session, 'schedule', 'BLOCKED', gate.reason);
+    return { blocked: gate.reason, scheduled: 0, skipped: 0, held: 0, mismatched: 0 };
+  }
+
   // ACTIVE only. A RETIRING account keeps resolving and marking, but taking a
   // new order is exactly the thing it must not do.
   const all = await loadAccounts(pool, strategyId);
@@ -700,6 +729,7 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
     if (retiring) console.log(`  ${retiring} retiring account(s) took no new orders, by design`);
     if (!target.length) console.log('  the book is empty, so there is nothing to schedule — that is a decision, not a failure');
   }
+  await recordStage(pool, session, 'schedule', 'OK');
   return { scheduled, skipped, held, mismatched };
 }
 
@@ -761,6 +791,66 @@ async function sessionCalendarState(pool) {
   return { calendar, prices, blocked: null, stale: false, coverage: have, typical: usual };
 }
 
+/**
+ * THE NIGHTLY CHAIN'S CHECKPOINT.
+ *
+ * `main()` halts the chain when the whole cycle runs as one process. Production
+ * does not: cron fires four INDEPENDENT processes at 20:10, 20:30, 20:35 and
+ * 20:40, and a non-zero exit from the first does not cancel the other three. So
+ * the "nothing was scheduled or marked" guarantee held only in the mode nobody
+ * runs. Found by the 2026-08-05 review, and it is the difference between a
+ * refusal that protects the record and one that merely logs.
+ *
+ * The stage table makes the dependency explicit and survives between processes:
+ * schedule and mark refuse unless resolve is recorded OK for the SAME session
+ * and the SAME engine version.
+ *
+ * `reconcile` is deliberately NOT gated. It reads and checks; refusing to
+ * verify integrity because an upstream stage failed removes the reporting
+ * exactly when something has gone wrong.
+ */
+async function ensureStageTable(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS virtual_cycle_stage (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      session_date DATE NOT NULL,
+      engine_version INT NOT NULL,
+      stage VARCHAR(16) NOT NULL,
+      status ENUM('OK','BLOCKED','FAILED') NOT NULL,
+      reason VARCHAR(64) NULL,
+      completed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_stage (session_date, engine_version, stage)
+    )`);
+}
+
+async function recordStage(pool, sessionDate, stage, status, reason = null) {
+  if (!sessionDate) return;
+  await ensureStageTable(pool);
+  await pool.query(
+    `INSERT INTO virtual_cycle_stage (session_date, engine_version, stage, status, reason)
+     VALUES (?,?,?,?,?)
+     ON DUPLICATE KEY UPDATE status=VALUES(status), reason=VALUES(reason), completed_at=CURRENT_TIMESTAMP`,
+    [sessionDate, vb.EXECUTION_ENGINE_VERSION, stage, status, reason]);
+}
+
+async function stageOk(pool, sessionDate, stage) {
+  if (!sessionDate) return { ok: false, reason: 'NO_SESSION' };
+  await ensureStageTable(pool);
+  const [[r]] = await pool.query(
+    `SELECT status, reason FROM virtual_cycle_stage
+      WHERE session_date=? AND engine_version=? AND stage=?`,
+    [sessionDate, vb.EXECUTION_ENGINE_VERSION, stage]);
+  if (!r) return { ok: false, reason: `${stage.toUpperCase()}_NOT_RUN` };
+  if (r.status !== 'OK') return { ok: false, reason: `${stage.toUpperCase()}_${r.status}:${r.reason || ''}` };
+  return { ok: true };
+}
+
+/** The session the current cycle belongs to — the calendar's latest closed bar. */
+async function currentSession(pool) {
+  const [[r]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+  return toDateStr(r?.d);
+}
+
 async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
   const cal = await sessionCalendarState(pool);
   if (cal.blocked) {
@@ -778,6 +868,7 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
       console.log(`  ${why}`);
       console.log('  Cron order is 19:30 prices, 20:05 IHSG, 20:10 resolve. Fix the upstream stage and re-run.');
     }
+    await recordStage(pool, cal.calendar || cal.prices, 'resolve', 'BLOCKED', cal.blocked);
     return { blocked: cal.blocked, calendar: cal.calendar, prices: cal.prices, summary: [] };
   }
 
@@ -813,21 +904,18 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
       // order could genuinely have been placed. Until it exists, the positions
       // stay open and the account stays RETIRING, which is the honest state.
       const decidedOn = toDateStr(acct.retirement_session);
-      const exitDate = decidedOn ? dates.find(d => d > decidedOn) : null;
-      if (!exitDate) {
-        if (!quiet) {
-          console.log(`RESOLVE  ${acct.account_code} [RETIRING] waiting for the first session after ${decidedOn || 'retirement'}`);
-          console.log('         to unwind. Selling at an open that preceded the decision is not an exit.');
-        }
-        summary.push({ account: acct.account_code, status: acct.status, filled: 0, noFill: 0,
-                       rejected: 0, closed: 0, dataMissing: 0, dataPending: 0, blocked: 0,
-                       unwinding: true, awaitingSession: true });
-        continue;
-      }
+      let waiting = 0;
 
       for (const p of openRows) {
-        const px = bars.get(p.ticker)?.get(exitDate)?.open;
-        if (!(px > 0)) continue;
+        // PER TICKER, not one global exit session. A single shared exitDate meant
+        // that if one name was suspended on that session the code hit `continue`
+        // and, on every later run, tried the SAME session again — the position
+        // could never advance to the next one and would sit open forever.
+        const exitDate = decidedOn
+          ? dates.find(d => d > decidedOn && bars.get(p.ticker)?.get(d)?.open > 0)
+          : null;
+        if (!exitDate) { waiting++; continue; }
+        const px = bars.get(p.ticker).get(exitDate).open;
 
         const proceeds = vb.sellProceeds(p.quantity, px, cfg);
         const grossPnl = proceeds.gross - (Number(p.cost_basis) - Number(p.entry_fee));
@@ -858,8 +946,14 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
         } finally { conn.release(); }
       }
 
+      if (waiting && !quiet) {
+        console.log(`RESOLVE  ${acct.account_code} [RETIRING] ${waiting} position(s) waiting for a tradable`);
+        console.log(`         session after ${decidedOn || 'retirement'}. Selling at an open that preceded`);
+        console.log('         the decision is not an exit, and neither is a session with no price.');
+      }
       summary.push({ account: acct.account_code, status: acct.status, filled: 0, noFill: 0,
-                     rejected: 0, closed, dataMissing: 0, dataPending: 0, blocked: 0, unwinding: true });
+                     rejected: 0, closed, dataMissing: 0, dataPending: 0, blocked: 0,
+                     unwinding: true, awaiting: waiting });
       continue;
     }
 
@@ -1106,6 +1200,8 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
                    dataMissing, dataPending, blocked: blocked.length });
   }
 
+  await recordStage(pool, cal.calendar, 'resolve', 'OK');
+
   if (!quiet) for (const s of summary) {
     console.log(`RESOLVE  ${s.account.padEnd(20)} filled ${s.filled}, no-fill ${s.noFill}, rejected ${s.rejected}, closed ${s.closed}` +
       (s.status === 'RETIRING' ? '   [RETIRING - exits only]' : ''));
@@ -1122,7 +1218,21 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
 }
 
 /** MARK — cash plus market value, reconciled and stored. */
-async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
+async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY, force = false } = {}) {
+  // Same checkpoint. A NAV marked over a book resolve refused to settle is a
+  // number that looks ordinary and is not.
+  const session = await currentSession(pool);
+  const gate = await stageOk(pool, session, 'resolve');
+  if (!gate.ok && !force) {
+    if (!quiet) {
+      console.log(`MARK  refusing — resolve did not complete for ${session || 'this session'} (${gate.reason}).`);
+      console.log('  A NAV stamped on an unsettled book is worse than a missing one: it looks');
+      console.log('  exactly like a real valuation.');
+    }
+    await recordStage(pool, session, 'mark', 'BLOCKED', gate.reason);
+    return [];
+  }
+
   const accounts = await loadAccounts(pool, strategyId);
   const { bars, dates } = await loadBars(pool, 30);
   const today = dates[dates.length - 1];
@@ -1190,6 +1300,8 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
     out.push({ account: acct.account_code, status: acct.status, ...m,
                realized: realizedPnl, unrealized, startingCash });
   }
+
+  await recordStage(pool, session, 'mark', 'OK');
 
   if (!quiet) for (const o of out) {
     const ret = (o.totalNav / o.startingCash - 1) * 100;
@@ -1398,8 +1510,24 @@ async function main() {
       if (r?.blocked) process.exitCode = 1;
       return;
     }
-    if (cmd === 'schedule') { await cmdSchedule(pool, false); return; }
-    if (cmd === 'mark') { await cmdMark(pool, false); return; }
+    // Each of these is its own cron process, so each must report its own
+    // refusal. An exit code is the only thing a schedule entry can see.
+    if (cmd === 'schedule') {
+      const r = await cmdSchedule(pool, false);
+      if (r?.blocked) process.exitCode = 1;
+      return;
+    }
+    if (cmd === 'mark') {
+      const r = await cmdMark(pool, false);
+      if (!Array.isArray(r)) process.exitCode = 1;
+      else if (!r.length) {
+        // An empty result means either no accounts or a refusal; the refusal
+        // path already recorded BLOCKED, so ask the checkpoint which it was.
+        const g = await stageOk(pool, await currentSession(pool), 'mark');
+        if (!g.ok) process.exitCode = 1;
+      }
+      return;
+    }
     if (cmd === 'reconcile') {
       const problems = await cmdReconcile(pool);
       if (problems.length) process.exitCode = 1;
@@ -1425,6 +1553,7 @@ async function main() {
 module.exports = {
   setup, cmdSchedule, cmdResolve, cmdMark, cmdStatus, cmdReconcile,
   retireSupersededAccounts, loadAccounts, loadBars, sessionCalendarState, migrateEnum, migrateColumn,
+  recordStage, stageOk, currentSession,
   ACCOUNTS, SOURCE_STRATEGY,
 };
 
