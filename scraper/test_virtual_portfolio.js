@@ -668,6 +668,15 @@ async function cashByAccount(pool) {
         assert.strictEqual(Number(acct.performance_eligible), 0,
           'an account with a frozen exit walk cannot report a comparable number');
         assert.ok(acct.data_blocked_json && acct.data_blocked_json.includes(pos.ticker));
+
+        // ...AND THAT MUST STOP THE CHAIN. A blocked exit walk means the session
+        // did not settle, so the stage is FAILED and no new orders may be frozen
+        // over it. This is the review's "data exit rusak -> tidak ada order baru".
+        const gate = await vp.stageOk(pool, await vp.currentSession(pool), 'resolve', STRATEGY);
+        assert.strictEqual(gate.ok, false, 'a blocked position must fail the resolve stage');
+        const sched = await vp.cmdSchedule(pool, true, OPTS);
+        assert.ok(sched.blocked, `schedule ran despite a blocked exit walk: ${JSON.stringify(sched)}`);
+        assert.strictEqual(sched.scheduled, 0);
       } finally {
         await pool.query(
           'UPDATE idx_stock_prices SET high_price=?, low_price=? WHERE stock_code=? AND date=?',
