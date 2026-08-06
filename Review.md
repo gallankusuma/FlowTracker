@@ -1,147 +1,41 @@
-Dua blocker launch terakhir
+Satu temuan P1: migration backfill salah urutan
 
-Ini bukan masalah trading engine. Ini hardening khusus recorder burn-in.
+Ada satu bug migration yang tidak menghalangi burn-in production saat schema sekarang sudah lengkap, tetapi sebaiknya diperbaiki.
 
-P0 — Burn-in baru masih dapat mewarisi row development lama
+Backfill saat ini dijalankan di dalam blok penambahan ever_failed:
 
-experimentIdentity berubah ketika strategy hash, policy, engine, atau account roster berubah. Tetapi perubahan aturan burn-in sendiri tidak masuk ke identity.
+if (!await hasColumn(..., 'ever_failed')) {
+  await pool.query('ALTER TABLE ... ADD ever_failed ...');
 
-Sekarang aturan burn-in berubah material:
+  await pool.query(`
+    UPDATE virtual_cycle_stage
+    SET first_failure_reason = ...,
+        first_failed_at = ...
+  `);
+}
 
-versi lama:
-latest retry boleh menimpa hasil
-missing session tidak terlihat
+Masalahnya, pada database versi lama:
 
-versi baru:
-failure sticky
-attempt append-only
-missing session memutus streak
+ever_failed baru saja ditambahkan;
+first_failure_reason dan first_failed_at belum ditambahkan karena loop belum sampai ke sana;
+query backfill langsung menggunakan dua kolom tersebut;
+migration dapat gagal dengan Unknown column.
 
-Tetapi keduanya masih bisa memakai identity_hash yang sama.
+Sebaliknya, pada database yang kolomnya sudah ditambahkan oleh release sebelumnya, blok tersebut tidak masuk sehingga backfill lama tidak pernah dijalankan.
 
-Skenarionya:
+Bentuk fix yang benar
 
-5 development sessions tercatat CLEAN dengan aturan lama
-kode burn-in baru di-deploy
-besok CLEAN
+Tambahkan semua kolom dahulu:
 
-dashboard dapat menunjukkan 6/10
+for (const [column, definition] of columns) {
+  if (!await hasColumn(pool, 'virtual_cycle_stage', column)) {
+    await pool.query(
+      `ALTER TABLE virtual_cycle_stage ADD COLUMN ${column} ${definition}`
+    );
+  }
+}
 
-Padahal official burn-in seharusnya mulai:
-
-0/10
-Fix yang paling aman
-
-Tambahkan versi protokol burn-in:
-
-const BURNIN_PROTOCOL_VERSION = 2;
-
-Lalu buat burn-in identity terpisah:
-
-burninIdentity = hash({
-  experimentIdentity,
-  burninProtocolVersion: BURNIN_PROTOCOL_VERSION,
-});
-
-Gunakan burninIdentity untuk:
-
-virtual_burnin;
-virtual_burnin_attempt;
-computeStreak;
-dashboard.
-
-Tetap tampilkan experimentIdentity secara terpisah untuk identitas strategi.
-
-Dengan ini history lama tetap tersimpan dan tidak perlu dihapus manual, tetapi official protocol v2 otomatis dimulai dari 0/10.
-
-P0 — Attempt dan verdict belum benar-benar crash-safe
-
-Urutan recordAttempt() sekarang:
-
-1. INSERT append-only attempt
-2. SELECT worst attempt
-3. SELECT failure history
-4. UPSERT summary verdict
-
-Semua query masih dijalankan terpisah tanpa transaction. computeStreak() kemudian membaca summary virtual_burnin, bukan langsung membaca attempts.
-
-Crash window:
-
-failed attempt berhasil di-INSERT
-process mati sebelum summary di-update
-
-virtual_burnin_attempt = FAILED
-virtual_burnin         = masih CLEAN
-dashboard              = masih menghitung CLEAN
-
-Artinya bukti kegagalannya ada, tetapi streak belum menggunakannya.
-
-Fix
-
-computeStreak() sebaiknya mengambil verdict langsung dari sumber append-only:
-
-SELECT session_date, MIN(passed) AS passed
-FROM virtual_burnin_attempt
-WHERE identity_hash = ?
-GROUP BY session_date
-
-virtual_burnin boleh tetap digunakan sebagai cache/dashboard summary, tetapi bukan sumber kebenaran streak.
-
-recordAttempt() juga sebaiknya menggunakan satu transaction untuk insert attempt dan update summary. Kombinasi terbaik:
-
-virtual_burnin_attempt = source of truth
-virtual_burnin         = derived cache
-computeStreak          = membaca source of truth
-
-Dengan desain itu, bila summary tertinggal akibat crash, streak tetap melihat failed attempt.
-
-P1 — Fresh database belum dapat membuat seluruh schema burn-in
-
-burnin.ensureTables() sekarang hanya membuat:
-
-virtual_burnin_attempt
-
-Tetapi recordAttempt() juga menulis ke:
-
-virtual_burnin
-
-Tabel summary tersebut masih dibuat di dalam watchdog.recordBurnIn(), bukan oleh shared module.
-
-Pada database production lama tabelnya sudah ada. Namun pada fresh database atau disaster recovery:
-
-burnin.recordAttempt()
-→ virtual_burnin does not exist
-→ runtime failure
-
-Integration test juga menjalankan test_watchdog.js tanpa terlebih dahulu menjalankan watchdog main yang membuat tabel summary.
-
-Fix
-
-Pindahkan seluruh ownership schema ke:
-
-burnin.ensureTables()
-
-Fungsi itu harus membuat dan memigrasikan:
-
-virtual_burnin
-virtual_burnin_attempt
-
-Watchdog, server, dan test cukup memanggil shared helper tersebut.
-
-P1 — Migration perlu backfill row stage lama
-
-Saat kolom ever_failed ditambahkan ke existing table, default-nya 0.
-
-Jika sebelum migration sudah ada row:
-
-status = FAILED
-
-setelah migration ia dapat menjadi:
-
-status      = FAILED
-ever_failed = 0
-
-Tambahkan one-time backfill:
+Setelah loop selesai, jalankan backfill secara idempotent:
 
 UPDATE virtual_cycle_stage
 SET ever_failed = 1,
@@ -150,45 +44,64 @@ SET ever_failed = 1,
     first_failed_at =
       COALESCE(first_failed_at, completed_at)
 WHERE status <> 'OK'
-  AND ever_failed = 0;
-Acceptance test terakhir
+  AND (
+    ever_failed = 0
+    OR first_failure_reason IS NULL
+    OR first_failed_at IS NULL
+  );
 
-Tambahkan tiga test:
+Tambahkan test upgrade dari tabel stage lama yang belum mempunyai keempat kolom.
 
-Protocol v1 mempunyai 5 clean rows
-Protocol berubah menjadi v2
-→ v2 streak = 0
+Ini P1 migration compatibility, bukan blocker untuk protocol v2, selama production schema sekarang sudah mempunyai:
 
-Failed attempt tersedia tetapi summary sengaja tertinggal CLEAN
-→ computeStreak tetap membaca FAILED
+ever_failed
+attempt_count
+first_failure_reason
+first_failed_at
+Keputusan
 
-Fresh database hanya memanggil burnin.ensureTables()
-→ recordAttempt dan computeStreak berhasil
-Penilaian terbaru
+GREEN LIGHT untuk memulai official 10-session operational burn-in.
+
+Syarat sebelum hitungan pertama:
+
+npm run test:unit
+npm run test:integration
+
+Verifikasi schema:
+
+SELECT COLUMN_NAME
+FROM information_schema.COLUMNS
+WHERE TABLE_SCHEMA = DATABASE()
+  AND TABLE_NAME = 'virtual_cycle_stage'
+  AND COLUMN_NAME IN (
+    'ever_failed',
+    'attempt_count',
+    'first_failure_reason',
+    'first_failed_at'
+  );
+
+Pastikan hasilnya empat row.
+
+Lalu dashboard harus menunjukkan:
+
+Protocol Version  2
+Burn-in Identity  identity baru
+Streak            0 / 10
+Stopped By        NO_EVIDENCE_FOR_<latest-session>
+
+Mulai hitungan dari sesi bursa pertama setelah seluruh commit terbaru sudah ter-deploy sebelum resolve dijalankan. Jangan hitung sesi yang sebagian stage-nya masih memakai source lama.
+
+Nilai akhir
 Area	Nilai
 Trading ledger	9,5
 Execution realism	9,4
-Stage failure permanence	9,5
-Append-only attempts	9,3
-Consecutive-session logic	9,5
-Dashboard/watchdog parity	9,4
-Burn-in protocol isolation	7,0
-Crash consistency	7,2
-Fresh database readiness	7,5
-Overall burn-in readiness	9,1
-Verdict
+Stage failure evidence	9,5
+Protocol isolation	9,6
+Crash consistency	9,5
+Consecutive-session proof	9,6
+Dashboard/watchdog parity	9,5
+Fresh database readiness	9,3
+Upgrade migration	8,0
+Official burn-in readiness	9,6
 
-Dua revisi kemarin sudah benar dan trading engine sudah siap.
-
-Jangan revisi lagi sizing, execution, ledger, atau portfolio logic. Tutup tiga hal pada recorder:
-
-tambahkan BURNIN_PROTOCOL_VERSION agar official streak mulai struktural dari 0/10;
-hitung streak langsung dari append-only attempts;
-pindahkan seluruh schema burn-in ke burnin.ensureTables().
-
-Setelah itu sudah layak menekan tombol:
-
-OFFICIAL OPERATIONAL BURN-IN
-Session 0 / 10
-
-Review ini masih static source review; gue belum menjalankan integration test MySQL atau mengamati hasil cron live VPS
+Review ini masih static source review. Gue belum menjalankan integration test MySQL atau memeriksa deployment dan cron live di VPS.

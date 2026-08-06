@@ -778,6 +778,67 @@ async function cashByAccount(pool) {
       }
     });
 
+    await t('UPGRADING A PRE-STICKY STAGE TABLE BACKFILLS ever_failed', async () => {
+      // The shape of the old bug: the backfill ran inside the ever_failed branch
+      // and referenced first_failure_reason and first_failed_at, which the same
+      // loop had not added yet. Old database -> Unknown column. Already-migrated
+      // database -> the branch never ran and the backfill never happened.
+      const db = `zz_stageup_${Date.now().toString(36)}`;
+      await pool.query(`CREATE DATABASE \`${db}\``);
+      const old = mysql.createPool({
+        host: process.env.DB_HOST || 'localhost', user: process.env.DB_USER || 'erp_user',
+        password: process.env.DB_PASSWORD, database: db, waitForConnections: true, connectionLimit: 2,
+      });
+      try {
+        // The table exactly as it looked before any of the four columns existed.
+        await old.query(`CREATE TABLE virtual_cycle_stage (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          session_date DATE NOT NULL,
+          strategy_id VARCHAR(64) NOT NULL DEFAULT '',
+          identity_hash VARCHAR(32) NOT NULL DEFAULT '',
+          engine_version INT NOT NULL,
+          stage VARCHAR(16) NOT NULL,
+          status ENUM('OK','BLOCKED','FAILED') NOT NULL,
+          reason VARCHAR(64) NULL,
+          completed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_stage (session_date, identity_hash, stage))`);
+        await old.query(
+          `INSERT INTO virtual_cycle_stage (session_date, identity_hash, engine_version, stage, status, reason)
+           VALUES ('2026-08-04','oldident00000001',2,'schedule','FAILED','rolled back'),
+                  ('2026-08-04','oldident00000001',2,'resolve','OK',NULL)`);
+
+        await vp.ensureStageTable(old);   // must not throw
+
+        for (const c of ['ever_failed', 'attempt_count', 'first_failure_reason', 'first_failed_at']) {
+          const [[r]] = await old.query(
+            `SELECT COUNT(*) n FROM information_schema.COLUMNS
+              WHERE TABLE_SCHEMA=? AND TABLE_NAME='virtual_cycle_stage' AND COLUMN_NAME=?`, [db, c]);
+          assert.strictEqual(Number(r.n), 1, `${c} was not added`);
+        }
+
+        const [[failed]] = await old.query(
+          `SELECT ever_failed, first_failure_reason, first_failed_at FROM virtual_cycle_stage
+            WHERE stage='schedule'`);
+        assert.strictEqual(Number(failed.ever_failed), 1,
+          'a row already sitting at FAILED came out of the migration claiming it never failed');
+        assert.strictEqual(failed.first_failure_reason, 'rolled back');
+        assert.ok(failed.first_failed_at, 'the failure time must be carried over from completed_at');
+
+        const [[ok]] = await old.query(
+          `SELECT ever_failed FROM virtual_cycle_stage WHERE stage='resolve'`);
+        assert.strictEqual(Number(ok.ever_failed), 0, 'a healthy row must not be marked failed');
+
+        // Idempotent: running it again changes nothing.
+        await vp.ensureStageTable(old);
+        const [[again]] = await old.query(
+          `SELECT first_failure_reason FROM virtual_cycle_stage WHERE stage='schedule'`);
+        assert.strictEqual(again.first_failure_reason, 'rolled back');
+      } finally {
+        await old.end();
+        await pool.query(`DROP DATABASE \`${db}\``);
+      }
+    });
+
     await t('widening a column refuses to run before its table exists', async () => {
       await assert.rejects(
         () => vp.migrateColumn(pool, 'zz_no_such_table', 'x', { minLength: 24, definition: 'VARCHAR(24) NULL', why: 'test' }),

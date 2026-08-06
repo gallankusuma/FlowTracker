@@ -890,24 +890,32 @@ async function ensureStageTable(pool) {
   ]) {
     if (!await hasColumn(pool, 'virtual_cycle_stage', col)) {
       await pool.query(`ALTER TABLE virtual_cycle_stage ADD COLUMN ${col} ${def}`);
-      if (col === 'ever_failed') {
-        // ONE-TIME BACKFILL. The column defaults to 0, so a row already sitting
-        // at FAILED would have come out of the migration claiming it had never
-        // failed — the exact record the column exists to preserve, erased by the
-        // act of adding it.
-        const [r] = await pool.query(
-          `UPDATE virtual_cycle_stage
-              SET ever_failed = 1,
-                  first_failure_reason = COALESCE(first_failure_reason, reason, status),
-                  first_failed_at = COALESCE(first_failed_at, completed_at)
-            WHERE status <> 'OK' AND ever_failed = 0`);
-        // Always announced. ensureStageTable has no quiet flag, and a one-time
-        // repair of the audit record is worth a line whoever is watching.
-        if (r.affectedRows) {
-          console.log(`SETUP  backfilled ever_failed on ${r.affectedRows} pre-existing failed stage row(s)`);
-        }
-      }
     }
+  }
+
+  // BACKFILL AFTER EVERY COLUMN EXISTS, and idempotently.
+  //
+  // This ran inside the `ever_failed` branch, referencing first_failure_reason
+  // and first_failed_at — columns the same loop had not added yet. On an old
+  // database it would have died with Unknown column; on one where a previous
+  // release had already added them, the branch never ran and the backfill never
+  // happened at all. Wrong in both directions, which is what an ordering bug
+  // usually is.
+  //
+  // The column defaults to 0, so a row already sitting at FAILED would otherwise
+  // come out of the migration claiming it had never failed — the exact record
+  // the column exists to preserve, erased by the act of adding it.
+  const [bf] = await pool.query(
+    `UPDATE virtual_cycle_stage
+        SET ever_failed = 1,
+            first_failure_reason = COALESCE(first_failure_reason, reason, status),
+            first_failed_at = COALESCE(first_failed_at, completed_at)
+      WHERE status <> 'OK'
+        AND (ever_failed = 0 OR first_failure_reason IS NULL OR first_failed_at IS NULL)`);
+  // Always announced. ensureStageTable has no quiet flag, and a one-time repair
+  // of the audit record is worth a line to whoever is watching.
+  if (bf.affectedRows) {
+    console.log(`SETUP  backfilled ever_failed on ${bf.affectedRows} pre-existing failed stage row(s)`);
   }
 
   for (const [col, def] of [
