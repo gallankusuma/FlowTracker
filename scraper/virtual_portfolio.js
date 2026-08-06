@@ -890,6 +890,23 @@ async function ensureStageTable(pool) {
   ]) {
     if (!await hasColumn(pool, 'virtual_cycle_stage', col)) {
       await pool.query(`ALTER TABLE virtual_cycle_stage ADD COLUMN ${col} ${def}`);
+      if (col === 'ever_failed') {
+        // ONE-TIME BACKFILL. The column defaults to 0, so a row already sitting
+        // at FAILED would have come out of the migration claiming it had never
+        // failed — the exact record the column exists to preserve, erased by the
+        // act of adding it.
+        const [r] = await pool.query(
+          `UPDATE virtual_cycle_stage
+              SET ever_failed = 1,
+                  first_failure_reason = COALESCE(first_failure_reason, reason, status),
+                  first_failed_at = COALESCE(first_failed_at, completed_at)
+            WHERE status <> 'OK' AND ever_failed = 0`);
+        // Always announced. ensureStageTable has no quiet flag, and a one-time
+        // repair of the audit record is worth a line whoever is watching.
+        if (r.affectedRows) {
+          console.log(`SETUP  backfilled ever_failed on ${r.affectedRows} pre-existing failed stage row(s)`);
+        }
+      }
     }
   }
 

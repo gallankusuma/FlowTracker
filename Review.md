@@ -1,199 +1,194 @@
-Trading engine dan nightly failure chain sudah engineering-ready. Namun mekanisme pembuktian “10 sesi berturut-turut” masih mempunyai dua celah audit yang perlu ditutup sebelum streak disebut resmi.
+Dua blocker launch terakhir
 
-Ini bukan masalah baru pada kalkulasi transaksi. Dua poin berikut baru terlihat setelah burn-in, identity, dan stage evidence-nya sudah lengkap.
+Ini bukan masalah trading engine. Ini hardening khusus recorder burn-in.
 
-P0.1 — Kegagalan masih bisa ditimpa menjadi sukses
+P0 — Burn-in baru masih dapat mewarisi row development lama
 
-Stage checkpoint menggunakan satu row per sesi dan stage:
+experimentIdentity berubah ketika strategy hash, policy, engine, atau account roster berubah. Tetapi perubahan aturan burn-in sendiri tidak masuk ke identity.
 
-ON DUPLICATE KEY UPDATE
-    status = VALUES(status),
-    reason = VALUES(reason),
-    completed_at = CURRENT_TIMESTAMP
+Sekarang aturan burn-in berubah material:
+
+versi lama:
+latest retry boleh menimpa hasil
+missing session tidak terlihat
+
+versi baru:
+failure sticky
+attempt append-only
+missing session memutus streak
+
+Tetapi keduanya masih bisa memakai identity_hash yang sama.
 
 Skenarionya:
 
-20:30 schedule FAILED
-20:32 diperbaiki atau dijalankan ulang
-20:33 schedule OK
+5 development sessions tercatat CLEAN dengan aturan lama
+kode burn-in baru di-deploy
+besok CLEAN
 
-Database akhirnya hanya menyimpan OK
+dashboard dapat menunjukkan 6/10
 
-Bukti bahwa stage pernah gagal hilang.
+Padahal official burn-in seharusnya mulai:
 
-Hal yang sama terjadi pada virtual_burnin:
+0/10
+Fix yang paling aman
 
-ON DUPLICATE KEY UPDATE
-    passed = VALUES(passed),
-    checks_json = VALUES(checks_json),
-    failures_json = VALUES(failures_json)
+Tambahkan versi protokol burn-in:
 
-Jadi bisa terjadi:
+const BURNIN_PROTOCOL_VERSION = 2;
 
-Watchdog pertama  → session FAILED
-Masalah diperbaiki
-Watchdog kedua    → session diubah menjadi CLEAN
+Lalu buat burn-in identity terpisah:
 
-Padahal definisi burn-in kita:
+burninIdentity = hash({
+  experimentIdentity,
+  burninProtocolVersion: BURNIN_PROTOCOL_VERSION,
+});
 
-Satu kegagalan pada sesi tersebut memutus streak.
+Gunakan burninIdentity untuk:
 
-Perbaikan yang disarankan
+virtual_burnin;
+virtual_burnin_attempt;
+computeStreak;
+dashboard.
 
-Stage perlu menyimpan current status dan riwayat kegagalannya:
+Tetap tampilkan experimentIdentity secara terpisah untuk identitas strategi.
 
-status
-attempt_count
-ever_failed
-first_failure_reason
-first_failed_at
-last_completed_at
+Dengan ini history lama tetap tersimpan dan tidak perlu dihapus manual, tetapi official protocol v2 otomatis dimulai dari 0/10.
 
-Rerun yang berhasil boleh membuat status=OK agar pipeline dapat lanjut, tetapi:
+P0 — Attempt dan verdict belum benar-benar crash-safe
 
-ever_failed = 1
+Urutan recordAttempt() sekarang:
 
-harus tetap permanen.
+1. INSERT append-only attempt
+2. SELECT worst attempt
+3. SELECT failure history
+4. UPSERT summary verdict
 
-Burn-in menggunakan:
+Semua query masih dijalankan terpisah tanpa transaction. computeStreak() kemudian membaca summary virtual_burnin, bukan langsung membaca attempts.
 
-status = OK
-AND ever_failed = 0
+Crash window:
 
-Untuk virtual_burnin, row yang pernah passed=0 tidak boleh ditingkatkan menjadi 1. Pilihan terbaik adalah tabel append-only virtual_burnin_attempt, kemudian daily verdict menggunakan nilai terburuk dari seluruh attempt pada sesi tersebut.
+failed attempt berhasil di-INSERT
+process mati sebelum summary di-update
 
-P0.2 — Streak menghitung row, bukan sesi bursa yang benar-benar berurutan
+virtual_burnin_attempt = FAILED
+virtual_burnin         = masih CLEAN
+dashboard              = masih menghitung CLEAN
 
-Watchdog saat ini menghitung:
+Artinya bukti kegagalannya ada, tetapi streak belum menggunakannya.
 
-for (const row of rows) {
-  if (!row.passed) break;
-  streak++;
-}
+Fix
 
-dengan rows yang tersedia di virtual_burnin.
+computeStreak() sebaiknya mengambil verdict langsung dari sumber append-only:
 
-Dashboard melakukan perhitungan yang sama.
+SELECT session_date, MIN(passed) AS passed
+FROM virtual_burnin_attempt
+WHERE identity_hash = ?
+GROUP BY session_date
 
-Masalahnya, tidak ada pemeriksaan bahwa seluruh sesi IHSG di antara row tersebut mempunyai bukti burn-in.
+virtual_burnin boleh tetap digunakan sebagai cache/dashboard summary, tetapi bukan sumber kebenaran streak.
 
-Contoh:
+recordAttempt() juga sebaiknya menggunakan satu transaction untuk insert attempt dan update summary. Kombinasi terbaik:
 
-Senin   CLEAN
-Selasa  watchdog tidak berjalan → tidak ada row
-Rabu    CLEAN
-Kamis   CLEAN
+virtual_burnin_attempt = source of truth
+virtual_burnin         = derived cache
+computeStreak          = membaca source of truth
 
-Query akan membaca:
+Dengan desain itu, bila summary tertinggal akibat crash, streak tetap melihat failed attempt.
 
-Kamis, Rabu, Senin
+P1 — Fresh database belum dapat membuat seluruh schema burn-in
 
-lalu menghitung streak 3.
+burnin.ensureTables() sekarang hanya membuat:
 
-Padahal secara jujur streak-nya hanya:
+virtual_burnin_attempt
 
-Kamis + Rabu = 2
+Tetapi recordAttempt() juga menulis ke:
 
-Senin terputus karena tidak ada bukti untuk Selasa.
+virtual_burnin
 
-Ini bertentangan dengan prinsip yang sudah ditulis di kode:
+Tabel summary tersebut masih dibuat di dalam watchdog.recordBurnIn(), bukan oleh shared module.
 
-Silence is not evidence.
+Pada database production lama tabelnya sudah ada. Namun pada fresh database atau disaster recovery:
 
-Perbaikan yang disarankan
+burnin.recordAttempt()
+→ virtual_burnin does not exist
+→ runtime failure
 
-Hitung streak menggunakan kalender idx_ihsg_history:
+Integration test juga menjalankan test_watchdog.js tanpa terlebih dahulu menjalankan watchdog main yang membuat tabel summary.
 
-1. Ambil sesi IHSG terbaru.
-2. Mundur satu per satu berdasarkan calendar.
-3. Cari burn-in row untuk identity dan tanggal tersebut.
-4. Row tidak ada → streak berhenti.
-5. Row gagal → streak berhenti.
-6. Hanya row CLEAN yang berurutan yang dihitung.
+Fix
 
-Buat satu shared helper, misalnya:
+Pindahkan seluruh ownership schema ke:
 
-computeBurnInStreak(pool, identityHash, latestSession)
+burnin.ensureTables()
 
-Gunakan helper yang sama di:
+Fungsi itu harus membuat dan memigrasikan:
 
-watchdog.js;
-server.js;
-CLI/status bila nanti ditambahkan.
+virtual_burnin
+virtual_burnin_attempt
 
-Jangan menduplikasi perhitungan di watchdog dan dashboard karena keduanya bisa kembali berbeda.
+Watchdog, server, dan test cukup memanggil shared helper tersebut.
 
-P1 — Watchdog repair belum memeriksa resolved.failed
+P1 — Migration perlu backfill row stage lama
 
-Saat watchdog mencoba memperbaiki NAV tertinggal, ia memeriksa:
+Saat kolom ever_failed ditambahkan ke existing table, default-nya 0.
 
-if (resolved?.blocked) {
-  throw new Error(...);
-}
+Jika sebelum migration sudah ada row:
 
-tetapi belum memeriksa resolved.failed.
+status = FAILED
 
-Saat resolve gagal karena transaction rollback, cmdMark() tetap akan menolak karena resolve checkpoint bukan OK, jadi saat ini tidak menghasilkan NAV palsu. Namun flow dan error reporting-nya tidak konsisten.
+setelah migration ia dapat menjadi:
 
-Ubah menjadi:
+status      = FAILED
+ever_failed = 0
 
-if (resolved?.blocked || resolved?.failed) {
-  throw new Error(
-    `virtual resolve did not settle: ${
-      resolved.blocked || resolved.failures?.join('; ') || 'FAILED'
-    }`
-  );
-}
+Tambahkan one-time backfill:
 
-Ini P1 karena current mark gate sudah melindungi ledger.
+UPDATE virtual_cycle_stage
+SET ever_failed = 1,
+    first_failure_reason =
+      COALESCE(first_failure_reason, reason, status),
+    first_failed_at =
+      COALESCE(first_failed_at, completed_at)
+WHERE status <> 'OK'
+  AND ever_failed = 0;
+Acceptance test terakhir
 
-Test yang perlu ditambahkan
+Tambahkan tiga test:
 
-Test baru yang sudah ada sudah bagus:
+Protocol v1 mempunyai 5 clean rows
+Protocol berubah menjadi v2
+→ v2 streak = 0
 
-cycle identity dan experiment identity bergerak berbeda;
-no plan terblokir;
-schedule rollback menjadi failed;
-mark rollback menjadi failed;
-real IHSG gap tidak disembunyikan;
-delete production test dibungkus transaction dan rollback;
-strict SQL mode diverifikasi.
+Failed attempt tersedia tetapi summary sengaja tertinggal CLEAN
+→ computeStreak tetap membaca FAILED
 
-Empat regression test terakhir yang masih diperlukan:
-
-stage FAILED lalu retry OK
-→ current status boleh OK
-→ ever_failed tetap 1
-→ burn-in tetap gagal
-
-burn-in FAILED lalu watchdog dijalankan ulang dengan kondisi sehat
-→ session tidak boleh berubah menjadi CLEAN
-
-burn-in rows CLEAN pada Senin dan Rabu, Selasa tidak mempunyai row
-→ streak berhenti di Rabu
-
-dashboard streak dan watchdog streak
-→ selalu menghasilkan angka identik
-Penilaian
+Fresh database hanya memanggil burnin.ensureTables()
+→ recordAttempt dan computeStreak berhasil
+Penilaian terbaru
 Area	Nilai
-Core ledger	9,5
+Trading ledger	9,5
 Execution realism	9,4
-Fail-closed schedule	9,4
-Resolve/mark failure semantics	9,4
-Cycle identity	9,4
-Experiment identity	9,3
-Burn-in stage checks	9,2
-Burn-in failure permanence	6,5
-Consecutive-session proof	6,0
-Test safety	9,0
-Official burn-in readiness	8,8
-Kesimpulan
+Stage failure permanence	9,5
+Append-only attempts	9,3
+Consecutive-session logic	9,5
+Dashboard/watchdog parity	9,4
+Burn-in protocol isolation	7,0
+Crash consistency	7,2
+Fresh database readiness	7,5
+Overall burn-in readiness	9,1
+Verdict
 
-Tiga blocker dari review sebelumnya sudah selesai dengan benar. Mesin trading, checkpoint, refusal path, identity separation, dan dashboard API sudah jauh lebih solid.
+Dua revisi kemarin sudah benar dan trading engine sudah siap.
 
-Sebelum menekan tombol resmi 0/10, tutup dua hal:
+Jangan revisi lagi sizing, execution, ledger, atau portfolio logic. Tutup tiga hal pada recorder:
 
-kegagalan harus sticky dan tidak dapat tertimpa oleh retry sukses;
-streak harus mengikuti sesi IHSG berurutan, bukan sekadar menghitung row yang tersedia.
+tambahkan BURNIN_PROTOCOL_VERSION agar official streak mulai struktural dari 0/10;
+hitung streak langsung dari append-only attempts;
+pindahkan seluruh schema burn-in ke burnin.ensureTables().
 
-Setelah dua itu selesai, menurut gue kita sudah bisa berhenti menambah revisi fondasi dan benar-benar memulai official 10-session operational burn-in. Review ini static source review; gue belum menjalankan integration test MySQL maupun mengamati cron live di VPS.
+Setelah itu sudah layak menekan tombol:
+
+OFFICIAL OPERATIONAL BURN-IN
+Session 0 / 10
+
+Review ini masih static source review; gue belum menjalankan integration test MySQL atau mengamati hasil cron live VPS

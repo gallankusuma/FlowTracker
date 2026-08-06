@@ -302,18 +302,108 @@ async function build(pool, seriesDates) {
       assert.strictEqual(sess.length, 4, 'need four sessions to build the gap');
       const [d0, d1, d2, d3] = sess.map(r => burnin.iso(r.date));   // newest first
 
+      await burnin.ensureTables(pool);
+      await pool.query('DELETE FROM virtual_burnin_attempt WHERE identity_hash=?', [ID]);
       await pool.query('DELETE FROM virtual_burnin WHERE identity_hash=?', [ID]);
       try {
+        // Written as ATTEMPTS, because that is what computeStreak reads. The
+        // summary is a cache; seeding it would test the cache, not the rule.
         for (const d of [d0, d1, d3]) {          // d2 deliberately has no row
           await pool.query(
-            `INSERT INTO virtual_burnin (session_date, identity_hash, engine_version, passed)
+            `INSERT INTO virtual_burnin_attempt (session_date, identity_hash, engine_version, passed)
              VALUES (?,?,?,1)`, [d, ID, 9]);
         }
         const r = await burnin.computeStreak(pool, ID, d0);
         assert.strictEqual(r.streak, 2, `expected 2 (${d0}, ${d1}), got ${r.streak}`);
         assert.ok(r.stoppedBy.includes(d2), `must stop at the unobserved session: ${r.stoppedBy}`);
       } finally {
+        await pool.query('DELETE FROM virtual_burnin_attempt WHERE identity_hash=?', [ID]);
         await pool.query('DELETE FROM virtual_burnin WHERE identity_hash=?', [ID]);
+      }
+    });
+
+    await t('A LAGGING SUMMARY CANNOT HIDE A FAILED ATTEMPT', async () => {
+      // The crash window: the attempt INSERT commits, the process dies before
+      // the summary UPSERT. If the streak read the summary it would count a
+      // session clean whose failure is sitting in the attempt table.
+      const [[s]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+      const day = burnin.iso(s.d);
+      await burnin.ensureTables(pool);
+      await pool.query('DELETE FROM virtual_burnin_attempt WHERE identity_hash=?', [ID]);
+      await pool.query('DELETE FROM virtual_burnin WHERE identity_hash=?', [ID]);
+      try {
+        // A summary deliberately left saying CLEAN...
+        await pool.query(
+          `INSERT INTO virtual_burnin (session_date, identity_hash, engine_version, passed)
+           VALUES (?,?,?,1)`, [day, ID, 9]);
+        // ...while the append-only source records a failure.
+        await pool.query(
+          `INSERT INTO virtual_burnin_attempt (session_date, identity_hash, engine_version, passed, failures_json)
+           VALUES (?,?,?,0,?)`, [day, ID, 9, JSON.stringify(['crash window'])]);
+
+        const r = await burnin.computeStreak(pool, ID, day);
+        assert.strictEqual(r.streak, 0, 'the streak trusted the stale summary over the attempt');
+        assert.ok(r.stoppedBy.includes(day), r.stoppedBy);
+      } finally {
+        await pool.query('DELETE FROM virtual_burnin_attempt WHERE identity_hash=?', [ID]);
+        await pool.query('DELETE FROM virtual_burnin WHERE identity_hash=?', [ID]);
+      }
+    });
+
+    await t('CHANGING THE BURN-IN PROTOCOL RESTARTS THE OFFICIAL COUNT', async () => {
+      // The rules used to judge a session are part of what its verdict MEANS.
+      // Five sessions marked clean under the loose protocol must not count
+      // toward a streak the strict one defines.
+      const experiment = 'zzexperiment0001';
+      const v2key = burnin.burninIdentity(experiment);
+      // What the v1 key would have been: the experiment identity used directly.
+      const v1key = experiment;
+      assert.notStrictEqual(v2key, v1key, 'the protocol must change the key');
+
+      const [sess] = await pool.query('SELECT date FROM idx_ihsg_history ORDER BY date DESC LIMIT 5');
+      await burnin.ensureTables(pool);
+      await pool.query('DELETE FROM virtual_burnin_attempt WHERE identity_hash IN (?,?)', [v1key, v2key]);
+      try {
+        for (const row of sess) {
+          await pool.query(
+            `INSERT INTO virtual_burnin_attempt (session_date, identity_hash, engine_version, passed)
+             VALUES (?,?,?,1)`, [burnin.iso(row.date), v1key, 9]);
+        }
+        const old = await burnin.computeStreak(pool, v1key);
+        assert.strictEqual(old.streak, 5, 'sanity: the old protocol really does have five clean sessions');
+
+        const now = await burnin.computeStreak(pool, v2key);
+        assert.strictEqual(now.streak, 0,
+          'the official count must start at 0 when the protocol changes, not inherit v1 rows');
+      } finally {
+        await pool.query('DELETE FROM virtual_burnin_attempt WHERE identity_hash IN (?,?)', [v1key, v2key]);
+      }
+    });
+
+    await t('a FRESH database can build the whole burn-in schema from the shared helper', async () => {
+      // burnin.ensureTables created only the attempt table while the summary was
+      // created inside watchdog.recordBurnIn — so recordAttempt on a new
+      // environment wrote to a table that did not exist.
+      const db = `zz_burnin_${Date.now().toString(36)}`;
+      await pool.query(`CREATE DATABASE \`${db}\``);
+      const fresh = mysql.createPool({
+        host: process.env.DB_HOST || 'localhost', user: process.env.DB_USER || 'erp_user',
+        password: process.env.DB_PASSWORD, database: db, waitForConnections: true, connectionLimit: 2,
+      });
+      try {
+        await fresh.query('CREATE TABLE idx_ihsg_history (date DATE PRIMARY KEY, close_price DECIMAL(12,2))');
+        await fresh.query(`INSERT INTO idx_ihsg_history VALUES ('2026-08-06', 6300)`);
+        await burnin.ensureTables(fresh);   // the ONLY schema call
+        const rec = await burnin.recordAttempt(fresh, {
+          sessionDate: '2026-08-06', identityHash: 'zzfresh000000001', engineVersion: 2,
+          passed: true, checks: { ok: true }, failures: [],
+        });
+        assert.strictEqual(rec.verdict, true);
+        const r = await burnin.computeStreak(fresh, 'zzfresh000000001');
+        assert.strictEqual(r.streak, 1);
+      } finally {
+        await fresh.end();
+        await pool.query(`DROP DATABASE \`${db}\``);
       }
     });
 

@@ -3065,15 +3065,19 @@ app.get('/api/virtual-portfolio', async (req, res) => {
     // THE EXPERIMENT identity for the burn-in: it must move when the strategy
     // hash changes, or two strategies share one streak. The CYCLE identity is a
     // different value with a different job and is used only for stage lookups.
-    let activeIdentity = null, cycleId = null;
+    const burninMod0 = require('./modules/burnin');
+    let activeIdentity = null, cycleId = null, burninKey = null;
     try {
       activeIdentity = await vpMod.experimentIdentity(pool, vpMod.SOURCE_STRATEGY);
       cycleId = await vpMod.cycleIdentity(pool, vpMod.SOURCE_STRATEGY);
+      // The burn-in rows are keyed on experiment AND protocol version, so the
+      // dashboard must ask with the same key the watchdog writes with.
+      burninKey = burninMod0.burninIdentity(activeIdentity);
     } catch { /* tables may not exist yet */ }
-    const [burnRows] = activeIdentity
+    const [burnRows] = burninKey
       ? await pool.query(
           `SELECT session_date, passed, failures_json FROM virtual_burnin
-            WHERE identity_hash=? ORDER BY session_date DESC LIMIT 30`, [activeIdentity]).catch(() => [[]])
+            WHERE identity_hash=? ORDER BY session_date DESC LIMIT 30`, [burninKey]).catch(() => [[]])
       : [[]];
     // THE SHARED HELPER, not a second loop. The dashboard and the watchdog
     // computing the same number independently is how they end up disagreeing
@@ -3081,14 +3085,16 @@ app.get('/api/virtual-portfolio', async (req, res) => {
     // calendar, so a session nobody observed stops the count.
     const burninMod = require('./modules/burnin');
     let streak = 0, stoppedBy = null;
-    if (activeIdentity) {
+    if (burninKey) {
       try {
-        const r = await burninMod.computeStreak(pool, activeIdentity);
+        const r = await burninMod.computeStreak(pool, burninKey);
         streak = r.streak; stoppedBy = r.stoppedBy;
       } catch { /* leave 0 */ }
     }
     const burnIn = {
-      streak, target: 10, stoppedBy, identity: activeIdentity,
+      streak, target: 10, stoppedBy,
+      identity: burninKey, experimentIdentity: activeIdentity,
+      protocolVersion: burninMod0.BURNIN_PROTOCOL_VERSION,
       latest: burnRows[0] ? {
         date: toDateStr(burnRows[0].session_date), passed: !!Number(burnRows[0].passed),
         failures: burnRows[0].failures_json ? JSON.parse(burnRows[0].failures_json) : [],

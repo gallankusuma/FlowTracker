@@ -476,44 +476,8 @@ async function checkJobRegistry(pool) {
  * A day with no data at all does not count as clean. Silence is not evidence.
  */
 async function recordBurnIn(pool) {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS virtual_burnin (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      session_date DATE NOT NULL,
-      -- SCOPED TO AN IDENTITY. With a key on session_date alone the streak was
-      -- computed across the whole table, so eight clean days under engine v2
-      -- plus two under a brand-new v3 reported ten — and v3 had run for two.
-      -- A streak that survives the thing it measures is not a streak.
-      identity_hash VARCHAR(32) NOT NULL DEFAULT 'legacy',
-      engine_version INT NOT NULL DEFAULT 0,
-      passed TINYINT(1) NOT NULL,
-      checks_json TEXT NULL,
-      failures_json TEXT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE KEY uq_session (identity_hash, session_date)
-    )`);
-
-  // Existing installs predate the identity columns and the wider key.
-  for (const [col, def] of [
-    ['identity_hash', `VARCHAR(32) NOT NULL DEFAULT 'legacy' AFTER session_date`],
-    ['engine_version', 'INT NOT NULL DEFAULT 0 AFTER identity_hash'],
-  ]) {
-    const [[c]] = await pool.query(
-      `SELECT COUNT(*) n FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_burnin' AND COLUMN_NAME=?`, [col]);
-    if (!Number(c.n)) await pool.query(`ALTER TABLE virtual_burnin ADD COLUMN ${col} ${def}`);
-  }
-  const [[uq]] = await pool.query(
-    `SELECT COUNT(*) n FROM information_schema.STATISTICS
-      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_burnin'
-        AND INDEX_NAME='uq_session' AND COLUMN_NAME='identity_hash'`);
-  if (!Number(uq.n)) {
-    const [[has]] = await pool.query(
-      `SELECT COUNT(*) n FROM information_schema.STATISTICS
-        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_burnin' AND INDEX_NAME='uq_session'`);
-    if (Number(has.n)) await pool.query('ALTER TABLE virtual_burnin DROP INDEX uq_session');
-    await pool.query('ALTER TABLE virtual_burnin ADD UNIQUE KEY uq_session (identity_hash, session_date)');
-  }
+  // Schema is owned by modules/burnin.js so a fresh database gets both tables.
+  await require('./modules/burnin').ensureTables(pool);
 
   const [[sess]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
   const sessionDate = iso(sess?.d);
@@ -538,7 +502,13 @@ async function recordBurnIn(pool) {
   // the strategy hash so the four nightly processes can find each other's
   // checkpoints; using it here would let strategy A's eight clean sessions and
   // strategy B's two add up to ten.
-  const identityHash = await vp0.experimentIdentity(pool, vp0.SOURCE_STRATEGY);
+  const burnin = require('./modules/burnin');
+  const experimentHash = await vp0.experimentIdentity(pool, vp0.SOURCE_STRATEGY);
+  // The rules used to judge a session are part of what a session's verdict
+  // MEANS, so they belong in the key. Without this, five sessions marked clean
+  // under the old loose protocol would have counted toward a streak the strict
+  // one defines — 6/10 on the official record's first real night.
+  const identityHash = burnin.burninIdentity(experimentHash);
   const [idRows] = await pool.query(
     `SELECT account_code FROM virtual_accounts
       WHERE strategy_id=? AND status IN ('ACTIVE','RETIRING') ORDER BY account_code`,
@@ -669,7 +639,6 @@ async function recordBurnIn(pool) {
 
   // Append-only attempt, then the session's verdict as the WORST attempt. A
   // repaired re-run can no longer promote a failed session to clean.
-  const burnin = require('./modules/burnin');
   const rec = await burnin.recordAttempt(pool, {
     sessionDate, identityHash, engineVersion: vb.EXECUTION_ENGINE_VERSION,
     passed, checks, failures,
