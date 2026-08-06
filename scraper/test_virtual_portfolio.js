@@ -900,6 +900,81 @@ async function cashByAccount(pool) {
 
     console.log('\nvirtual portfolio — every failure must surface as a FAILED stage');
 
+    await t('CYCLE identity and EXPERIMENT identity answer different questions', async () => {
+      // cycleIdentity must hold still across a night so four cron processes find
+      // each other's checkpoints, which is why the strategy hash is not in it.
+      // experimentIdentity must MOVE when the strategy hash changes, or eight
+      // clean sessions under hash A plus two under hash B report ten.
+      const cycleBefore = await vp.cycleIdentity(pool, STRATEGY);
+      const expBefore = await vp.experimentIdentity(pool, STRATEGY);
+
+      await pool.query(
+        'UPDATE virtual_accounts SET strategy_hash=? WHERE strategy_id=?', ['CHANGEDHASH0001', STRATEGY]);
+      try {
+        const cycleAfter = await vp.cycleIdentity(pool, STRATEGY);
+        const expAfter = await vp.experimentIdentity(pool, STRATEGY);
+        assert.strictEqual(cycleAfter, cycleBefore,
+          'the cycle identity must NOT move on a strategy-hash change, or the nightly chain breaks mid-flight');
+        assert.notStrictEqual(expAfter, expBefore,
+          'the experiment identity MUST move, or two strategies share one streak');
+      } finally {
+        await pool.query(
+          'UPDATE virtual_accounts SET strategy_hash=? WHERE strategy_id=?', [PLAN_HASH, STRATEGY]);
+      }
+    });
+
+    await t('NO LIVE PLAN is a BLOCKED schedule, not a quiet zero', async () => {
+      await vp.cmdResolve(pool, true, OPTS);
+      const [plans] = await pool.query(
+        'SELECT * FROM ft_strategy_plan WHERE strategy_id=?', [STRATEGY]);
+      await pool.query('DELETE FROM ft_strategy_plan WHERE strategy_id=?', [STRATEGY]);
+      try {
+        const r = await vp.cmdSchedule(pool, true, OPTS);
+        assert.strictEqual(r.blocked, 'NO_LIVE_PLAN', JSON.stringify(r));
+        const gate = await vp.stageOk(pool, await vp.currentSession(pool), 'schedule', STRATEGY);
+        assert.strictEqual(gate.ok, false, 'the stage must record the block');
+      } finally {
+        for (const p of plans) {
+          await pool.query(
+            `INSERT INTO ft_strategy_plan (strategy_id, as_of_date, run_mode, generated_at, strategy_hash,
+                                           data_snapshot_hash, code_commit, exposure, reason, regime_label,
+                                           eligible, vetoed, target_json, status)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            [p.strategy_id, p.as_of_date, p.run_mode, p.generated_at, p.strategy_hash, p.data_snapshot_hash,
+             p.code_commit, p.exposure, p.reason, p.regime_label, p.eligible, p.vetoed, p.target_json, p.status]);
+        }
+      }
+    });
+
+    await t('AN ACCOUNT ON A DIFFERENT HASH FROM THE PLAN FAILS THE STAGE', async () => {
+      // Skipping it and recording OK meant the night looked complete while an
+      // account sat out for a reason nobody was told about.
+      await vp.cmdResolve(pool, true, OPTS);
+      await pool.query(
+        'UPDATE virtual_accounts SET strategy_hash=? WHERE strategy_id=?', ['DRIFTEDHASH0001', STRATEGY]);
+      try {
+        const r = await vp.cmdSchedule(pool, true, OPTS);
+        assert.strictEqual(r.failed, true, `expected a failed schedule, got ${JSON.stringify(r)}`);
+        assert.ok(r.mismatched >= 1);
+        const gate = await vp.stageOk(pool, await vp.currentSession(pool), 'schedule', STRATEGY);
+        assert.strictEqual(gate.ok, false);
+        assert.ok(/different strategy hash/.test(gate.reason), gate.reason);
+      } finally {
+        await pool.query(
+          'UPDATE virtual_accounts SET strategy_hash=? WHERE strategy_id=?', [PLAN_HASH, STRATEGY]);
+      }
+    });
+
+    await t('the database is in STRICT mode, or the rollback tests prove nothing', async () => {
+      // The two tests below force a rollback with over-long / out-of-range data.
+      // Outside strict mode MySQL truncates and warns instead of throwing, so the
+      // failure path would never execute and both would pass without testing
+      // anything. Assert the precondition rather than assume it.
+      const [m] = await q(pool, 'SELECT @@SESSION.sql_mode AS mode');
+      assert.ok(/STRICT_TRANS_TABLES|STRICT_ALL_TABLES/.test(m.mode),
+        `sql_mode is "${m.mode}" — without STRICT_TRANS_TABLES the rollback tests are vacuous`);
+    });
+
     await t('A SCHEDULE ROLLBACK MAKES THE STAGE FAILED, not OK', async () => {
       // Eight of ten orders frozen and a stage reading OK means the portfolio
       // received part of its target book while the checkpoint said the session

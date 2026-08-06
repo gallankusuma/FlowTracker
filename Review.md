@@ -1,120 +1,271 @@
-1. Tutup blocker backend terakhir
+Yang sudah benar
+Perbaikan	Status
+Schedule rollback → stage FAILED	✅
+Mark satu account gagal → stage FAILED	✅
+Resolve gagal → exit code non-zero	✅
+Default chain berhenti saat resolve gagal	✅
+Circular NO_INDEX_BAR classification	✅
+Watchdog scoped ke official strategy	✅
+Burn-in NAV checks scoped ke official accounts	✅
+API default hanya menampilkan official accounts	✅
+Cycle identity stabil ketika retirement selesai	✅
+Regression tests untuk rollback dan phantom gap	✅
 
-Prioritas pertama:
+Schedule sekarang menyimpan rollback, menulis stage FAILED, dan mengembalikan failed: true. Mark juga mensyaratkan seluruh account berhasil ditandai. Resolve sekarang mempunyai properti failed yang dibaca oleh CLI dan default chain.
 
-checkpoint resolve → schedule → mark dipisahkan berdasarkan strategy dan account identity;
-transaction rollback membuat stage FAILED, bukan tetap OK;
-posisi DATA_BLOCKED memblokir schedule baru;
-burn-in dashboard hanya membaca identity aktif;
-official start memakai full account identity;
-account eksperimen/test tidak ikut memengaruhi burn-in resmi.
+Circular phantom classification juga sudah ditangani dengan benar: hard signatures diperiksa lebih dahulu, IHSG gap diberi kesempatan diperbaiki, kemudian NO_INDEX_BAR baru diklasifikasikan. Regression test-nya benar-benar membuktikan real IHSG gap tidak ikut dikecualikan.
 
-Acceptance criteria:
+P0.1 — Burn-in tidak lagi berubah ketika strategy hash berubah
 
-Resolve gagal       → schedule ditolak
-Satu account gagal  → stage FAILED
-Data exit rusak     → tidak ada order baru
-Engine berubah      → burn-in kembali 0
-Test account muncul → official streak tidak berubah
-2. Bikin “Trust Center” di dashboard
+Ini blocker paling penting yang tersisa.
 
-Tambahkan satu bagian baru:
+cycleIdentity() sekarang sengaja tidak memasukkan strategy_hash. Hash yang dibuat hanya berdasarkan:
 
-System Status
-Market Data          HEALTHY
-Session Calendar     CURRENT
-Latest Price Session 2026-08-06
-Resolve              COMPLETED
-Schedule             COMPLETED
-Mark                 COMPLETED
-Reconcile            CLEAN
-Experiment Identity
-Engine Version       v2
-Strategy Hash        ab12cd34
-Policy Hash          ef56gh78
-Code Commit          9192424
-Official Start       Pending / tanggal aktual
-Burn-in
-Operational Burn-in  3 / 10 sessions
-Current Streak       3
-Latest Session       CLEAN
-Official Identity    84ab2f...
+{
+  strategyId,
+  engine: EXECUTION_ENGINE_VERSION,
+  roster
+}
 
-Visual progress:
+Namun identity yang sama dipakai oleh:
 
-● ● ● ○ ○ ○ ○ ○ ○ ○
-3 dari 10 sesi bersih
+stage checkpoint;
+burn-in;
+Trust Center;
+dashboard burn-in history.
 
-Kalau gagal:
+Skenarionya:
 
-Burn-in restarted
-Reason: PRICE_DATA_STALE
-3. Upgrade tampilan account
+Strategy hash A → 8 hari clean
+Strategy berubah menjadi hash B
+Engine, policy, dan account code tetap sama
+Strategy B → 2 hari clean
 
-Setiap account card menampilkan:
+Dashboard dapat membaca 10 hari clean
 
-POSITION_100M_V2
-NAV                  Rp101.250.000
-Cash                 Rp42.300.000
-Market Value         Rp58.950.000
-Return               +1,25%
-Open Positions       5 / 8
-Gross Exposure       58,2% / 90%
-Performance Eligible YES
-Status               ACTIVE
+Padahal strategy B baru berjalan dua hari.
 
-Akun intraday tetap ditandai sebagai CONTROL, bukan strategi kandidat.
+Komentar di watchdog masih mengatakan strategy hash merupakan bagian identity, tetapi implementasinya sudah tidak memasukkannya.
 
-4. Buat order dan trade timeline
+Solusi
 
-Contoh:
+Pisahkan dua jenis identity:
 
-BBCA
-06 Aug 20:30  ORDER SCHEDULED
-07 Aug 09:00  FILLED @ 9.425
-07 Aug        Stop 9.180 · Target 9.915
-12 Aug        TARGET HIT
-12 Aug        SOLD @ 9.905
-Net P&L       +Rp462.500
-Fees          Rp83.200
+cycleIdentity
+Digunakan untuk resolve → schedule → mark
+Harus stabil sepanjang satu nightly cycle
 
-Kalau gagal:
+experimentIdentity
+Digunakan untuk burn-in dan dashboard
+Harus berubah ketika strategy hash, policy, atau engine berubah
 
-ORDER REJECTED
-Reason: MAX_GROSS_EXPOSURE
+Contoh experiment identity:
 
-atau:
+experimentIdentity = hash({
+  strategyId,
+  accounts: officialAccounts.map(a => ({
+    accountCode: a.account_code,
+    strategyHash: a.strategy_hash,
+    policyHash: a.execution_policy_hash,
+    engineVersion: a.execution_engine_version,
+  })),
+});
 
-DATA BLOCKED
-High/low untuk sesi 2026-08-07 tidak lengkap
-Exit evaluation dihentikan
-5. Setelah deploy
+Burn-in dan dashboard harus menggunakan experimentIdentity, bukan cycleIdentity.
 
-Urutan go-live:
+P0.2 — Burn-in belum mensyaratkan semua stage OK
 
-1. npm run test:unit
-2. npm run test:integration
-3. Verifikasi live crontab
-4. Verifikasi .deployed-commit
-5. Bersihkan checkpoint/burn-in development
-6. Freeze identity resmi
-7. Jalankan satu dry operational cycle
-8. Mulai official 10-session burn-in
+recordBurnIn() sekarang memeriksa:
 
-Selama burn-in, jangan ubah execution rule, sizing, fee, slippage, atau exit logic. Perubahan material berarti engine version baru dan streak dimulai ulang.
+data harga;
+kalender;
+phantom sessions;
+cash;
+performance eligibility;
+NAV;
+duplicate fills;
+blocked bars;
+reconcile;
+watchdog health.
 
-Definition of done
+Namun belum ada pemeriksaan terhadap:
 
-Sprint selesai ketika:
+resolve stage  = OK
+schedule stage = OK
+mark stage     = OK
 
-seluruh test lulus;
-semua cron stage mempunyai identity-scoped checkpoint;
-dashboard menampilkan data health dan stage status;
-burn-in dashboard sesuai identity aktif;
-satu simulasi failure terbukti memblokir downstream;
-official burn-in mulai dari 0/10;
-tidak ada manual database correction.
+Artinya schedule dapat tercatat FAILED, tetapi burn-in masih mungkin menghitung hari tersebut sebagai bersih apabila NAV dan reconcile tetap benar.
 
-Setelah sprint ini, baru kita masuk ke fase berikutnya:
+Ini sangat mungkin karena schedule membuat order untuk sesi berikutnya; kegagalan schedule tidak selalu merusak NAV hari ini.
 
-Portfolio Intelligence — sector exposure, correlation control, dynamic ranking, regime attribution, dan decision-quality analytics.
+Solusi
+
+Tambahkan:
+
+const cycleHash = await vp.cycleIdentity(pool, vp.SOURCE_STRATEGY);
+
+const [stages] = await pool.query(
+  `SELECT stage, status
+     FROM virtual_cycle_stage
+    WHERE session_date=? AND identity_hash=?`,
+  [sessionDate, cycleHash]
+);
+
+const stageMap = Object.fromEntries(
+  stages.map(s => [s.stage, s.status])
+);
+
+checks.resolveStageOk = stageMap.resolve === 'OK';
+checks.scheduleStageOk = stageMap.schedule === 'OK';
+checks.markStageOk = stageMap.mark === 'OK';
+
+Dengan begitu:
+
+FAILED
+BLOCKED
+NOT_RUN
+
+semuanya otomatis memutus streak.
+
+P0.3 — Beberapa penolakan schedule masih exit sukses
+
+Tiga kondisi belum menghasilkan blocked atau failed.
+
+Tidak ada LIVE plan
+
+Sekarang hanya:
+
+return {
+  scheduled: 0,
+  skipped: 0,
+  held: 0,
+  mismatched: 0
+};
+
+Cron akan keluar dengan status 0.
+
+Plan tidak mempunyai strategy hash
+
+Sekarang mengembalikan:
+
+{
+  reason: 'PLAN_WITHOUT_HASH',
+  scheduled: 0
+}
+
+Tetapi tidak mempunyai failed: true atau blocked. Cron juga keluar 0.
+
+Account dan plan berbeda strategy hash
+
+Account dilewati dan mismatched bertambah, tetapi bila tidak ada transaction rollback, stage tetap dicatat OK.
+
+Padahal active account yang tidak cocok dengan plan adalah kondisi tidak normal.
+
+Solusi
+NO_LIVE_PLAN       → BLOCKED
+PLAN_WITHOUT_HASH  → FAILED
+ACCOUNT_HASH_DRIFT → FAILED
+
+Semua kondisi tersebut harus:
+
+mencatat stage;
+mengembalikan blocked atau failed;
+membuat CLI keluar dengan status 1;
+menggagalkan burn-in.
+
+Empty target book tetap boleh OK, karena itu keputusan strategi yang valid.
+
+P1 — Watchdog masih bisa melewatkan partial mark
+
+Watchdog sekarang sudah scoped ke official account IDs, tetapi freshness mark masih menggunakan:
+
+SELECT MAX(mark_date)
+FROM virtual_nav
+WHERE account_id IN (?)
+
+Kalau:
+
+POSITION marked hari ini
+INTRADAY terakhir marked kemarin
+
+MAX(mark_date) tetap menunjukkan hari ini.
+
+Burn-in memang memiliki count per account dan akan menangkapnya, tetapi output watchdog dapat mengatakan “sudah current” sementara burn-in mengatakan gagal.
+
+Gunakan count:
+
+SELECT COUNT(DISTINCT account_id)
+FROM virtual_nav
+WHERE account_id IN (?)
+  AND mark_date = ?
+
+Jumlahnya harus sama dengan seluruh account ACTIVE dan RETIRING.
+
+P1 — Regression test menghapus data IHSG production
+
+Test circular-classification melakukan:
+
+DELETE FROM idx_ihsg_history WHERE date=?
+
+kemudian memasukkan row kembali di finally.
+
+Secara logika test-nya bagus, tetapi secara operasional berbahaya. Kalau proses:
+
+dihentikan;
+server mati;
+koneksi hilang;
+test runner di-kill;
+
+sebelum finally, production IHSG series kehilangan satu sesi nyata.
+
+Lebih aman:
+
+gunakan temporary tables; atau
+jalankan deletion dalam satu transaction menggunakan dedicated connection, kemudian selalu ROLLBACK.
+
+Jangan mengandalkan delete lalu insert kembali pada tabel market-data production.
+
+P1 — Failure test schedule bergantung pada MySQL strict mode
+
+Test memicu rollback menggunakan ticker yang lebih panjang daripada VARCHAR(10).
+
+Pada MySQL strict mode ini melempar error. Pada konfigurasi non-strict, nilainya bisa dipotong menjadi warning sehingga failure path tidak benar-benar diuji.
+
+Minimal test harus memastikan:
+
+SELECT @@SESSION.sql_mode
+
+mengandung:
+
+STRICT_TRANS_TABLES
+
+atau gunakan deterministic test failpoint pada test database.
+
+Penilaian terbaru
+Area	Nilai
+Core ledger	9,5
+Resolve failure semantics	9,4
+Schedule failure semantics	9,0
+Mark failure semantics	9,2
+Phantom handling	9,3
+Checkpoint isolation	9,1
+Burn-in identity	6,8
+Burn-in stage evidence	6,5
+Watchdog consistency	8,5
+Test safety	7,5
+Official burn-in readiness	8,5
+Kesimpulan
+
+Empat revisi yang terakhir diminta sudah benar-benar selesai. Tidak ada masalah besar lagi pada transaksi virtual broker-nya.
+
+Yang tersisa sekarang adalah validitas bukti operasional:
+
+Apakah streak benar-benar milik strategi yang sama, dan apakah satu hari boleh disebut clean ketika salah satu stage gagal?
+
+Sebelum mulai hitungan resmi 0/10, tutup tiga P0:
+
+pisahkan cycleIdentity dan experimentIdentity;
+burn-in wajib memeriksa resolve, schedule, dan mark berstatus OK;
+no plan, no strategy hash, dan account hash mismatch harus gagal secara eksplisit.
+
+Setelah tiga itu selesai, menurut gue backend sudah layak memulai official 10-session burn-in. Review ini berdasarkan static source terbaru di GitHub; integration test MySQL dan kondisi live VPS belum gue jalankan langsung.

@@ -1096,6 +1096,15 @@
    "book": [],
    "opened": [],
    "closed": []
+  },
+  {
+   "date": "2026-08-05",
+   "exposure": 0,
+   "eligible": 83,
+   "vetoed": 16,
+   "book": [],
+   "opened": [],
+   "closed": []
   }
  ],
  "equity": [
@@ -1153,6 +1162,7 @@
   1.508661,
   1.508661,
   1.508661,
+  1.508661,
   1.508661
  ],
  "trades": 272,
@@ -1161,6 +1171,7 @@
  "costPaid": 0.10409,
  "finalEquity": 1.508661,
  "maxDrawdown": 0.13448,
- "cagr": 0.202644,
- "hash": "d03a23f80e33aebfd7d878f8719c2d7e"
+ "cagr": 0.201032,
+ "hash": "8bb4972cd5b41c93df92445ca37f93d3",
+ "windowEnd": "2026-08-05"
 }

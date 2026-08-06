@@ -332,9 +332,25 @@ async function checkVirtualPortfolio(pool) {
   const priceDate = iso(px.d);
   const [[cal]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
   const sessionDate = iso(cal?.d);
+  // COUNT, not MAX. With POSITION marked today and INTRADAY still on yesterday,
+  // MAX(mark_date) reads "today" and the watchdog reports current while the
+  // burn-in reports a failure — two monitors contradicting each other about the
+  // same night.
   const [[nav]] = await pool.query(
     'SELECT MAX(mark_date) d FROM virtual_nav WHERE account_id IN (?)', [acctIds]);
   const navDate = iso(nav?.d);
+  const [[markedToday]] = await pool.query(
+    `SELECT COUNT(DISTINCT account_id) n FROM virtual_nav WHERE account_id IN (?) AND mark_date=?`,
+    [acctIds, navDate]);
+  const partial = navDate && Number(markedToday.n) !== acctIds.length;
+  if (partial) {
+    report({
+      level: 'FAIL',
+      what: `only ${markedToday.n} of ${acctIds.length} official accounts are marked for ${navDate}`,
+      detail: 'MAX(mark_date) hides this: one account current and one behind still reads as current.',
+    });
+    line(`  ** partial mark: ${markedToday.n} of ${acctIds.length} accounts have a ${navDate} NAV`);
+  }
   line(`  latest NAV mark ${navDate || 'none'} · prices ${priceDate} · session ${sessionDate}`);
 
   // ALL THREE MUST AGREE, not merely "the NAV is not behind". `navDate >=
@@ -349,7 +365,7 @@ async function checkVirtualPortfolio(pool) {
     line('  ** these three dates must be identical; they are not');
   }
 
-  if (!navDate || navDate < priceDate) {
+  if (!navDate || navDate < priceDate || partial) {
     await runRepair(pool, {
       job: 'watchdog:vp_mark',
       what: `virtual NAV not marked for ${priceDate} (last mark ${navDate || 'none'})`,
@@ -367,8 +383,11 @@ async function checkVirtualPortfolio(pool) {
       },
       verify: async () => {
         const [[n]] = await pool.query(
-          'SELECT MAX(mark_date) d FROM virtual_nav WHERE account_id IN (?)', [acctIds]);
-        return !(iso(n.d) >= priceDate);
+          `SELECT COUNT(DISTINCT account_id) n FROM virtual_nav
+            WHERE account_id IN (?) AND mark_date = ?`, [acctIds, priceDate]);
+        // EVERY official account, on the price date. Not "the newest mark is not
+        // behind" — that is the check that let a partial mark pass.
+        return Number(n.n) !== acctIds.length;
       },
     });
   } else {
@@ -510,7 +529,11 @@ async function recordBurnIn(pool) {
   // hashes computed in two places is how they drift into disagreeing about
   // whether the same run is the same experiment.
   const vp0 = require('./virtual_portfolio');
-  const identityHash = await vp0.cycleIdentity(pool, vp0.SOURCE_STRATEGY);
+  // The EXPERIMENT identity, not the cycle one. cycleIdentity deliberately omits
+  // the strategy hash so the four nightly processes can find each other's
+  // checkpoints; using it here would let strategy A's eight clean sessions and
+  // strategy B's two add up to ten.
+  const identityHash = await vp0.experimentIdentity(pool, vp0.SOURCE_STRATEGY);
   const [idRows] = await pool.query(
     `SELECT account_code FROM virtual_accounts
       WHERE strategy_id=? AND status IN ('ACTIVE','RETIRING') ORDER BY account_code`,
@@ -598,6 +621,20 @@ async function recordBurnIn(pool) {
     : [[{ n: 0 }]];
   checks.noSkippedUnknownBar = Number(blockedRows.n) === 0;
 
+  // EVERY STAGE MUST HAVE COMPLETED. Without this a schedule recorded FAILED
+  // still produced a "clean" session, because schedule creates orders for the
+  // NEXT session and its failure does not disturb tonight's NAV or reconcile.
+  // A day is clean when the whole chain ran, not when the numbers happen to
+  // survive one part of it not running.
+  const cycleHash = await vp0.cycleIdentity(pool, vp0.SOURCE_STRATEGY);
+  const [stageRows] = await pool.query(
+    `SELECT stage, status FROM virtual_cycle_stage WHERE session_date=? AND identity_hash=?`,
+    [sessionDate, cycleHash]).catch(() => [[]]);
+  const stageMap = Object.fromEntries(stageRows.map(r => [r.stage, r.status]));
+  checks.resolveStageOk = stageMap.resolve === 'OK';
+  checks.scheduleStageOk = stageMap.schedule === 'OK';
+  checks.markStageOk = stageMap.mark === 'OK';
+
   let reconcileProblems = [];
   try {
     const vp = require('./virtual_portfolio');
@@ -608,6 +645,11 @@ async function recordBurnIn(pool) {
   checks.watchdogHealthy = !findings.some(f => f.level === 'FAIL' || f.level === 'RECURRING');
 
   const failures = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);
+  // Name the actual stage status, not just which check failed: "scheduleStageOk"
+  // alone does not say whether it was BLOCKED, FAILED or never run.
+  for (const st of ['resolve', 'schedule', 'mark']) {
+    if (stageMap[st] !== 'OK') failures.push(`${st} stage ${stageMap[st] || 'NOT_RUN'}`);
+  }
   if (reconcileProblems.length) failures.push(...reconcileProblems.map(p => `reconcile: ${p}`));
   const passed = failures.length === 0;
 

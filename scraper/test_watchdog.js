@@ -218,10 +218,21 @@ async function build(pool, seriesDates) {
         'SELECT COUNT(*) n FROM idx_stock_prices WHERE date=?', [victim]);
       assert.ok(Number(px.n) > 0, `need prices on ${victim} for this to be a real session`);
 
-      await pool.query('DELETE FROM idx_ihsg_history WHERE date=?', [victim]);
+      // INSIDE A TRANSACTION THAT IS ALWAYS ROLLED BACK, on its own connection.
+      // The first version did DELETE ... then re-INSERT in `finally`, which is
+      // fine right up until the process is killed between the two — and then the
+      // production index series has permanently lost a real session to a test.
+      // A transaction cannot leave that state behind: if this process dies, the
+      // uncommitted delete dies with it.
+      const conn = await pool.getConnection();
       try {
-        const hard = await sh.phantomSessions(pool, { useIndexCalendar: false });
-        const soft = await sh.phantomSessions(pool);
+        await conn.beginTransaction();
+        await conn.query('DELETE FROM idx_ihsg_history WHERE date=?', [victim]);
+
+        // The checks must run on the SAME connection to see the uncommitted
+        // delete, so they take `conn` rather than the pool.
+        const hard = await sh.phantomSessions(conn, { useIndexCalendar: false });
+        const soft = await sh.phantomSessions(conn);
 
         assert.ok(!hard.some(p => p.date === victim),
           `${victim} was called a phantom by a HARD signature; the exclusion list would hide it`);
@@ -229,18 +240,17 @@ async function build(pool, seriesDates) {
           'sanity: with the index calendar on, it IS labelled NO_INDEX_BAR');
 
         // And with the hard-only exclusion, the gap detector still sees it.
-        const gaps = await sh.missingSessions(pool, {
+        const gaps = await sh.missingSessions(conn, {
           table: 'idx_ihsg_history', col: 'date', exclude: hard.map(p => p.date) });
         assert.ok(gaps.missing.includes(victim),
           'the real gap must remain visible to the repair path');
       } finally {
-        await pool.query(
-          `INSERT INTO idx_ihsg_history (date, open_price, high_price, low_price, close_price, volume, change_pct)
-           VALUES (?,?,?,?,?,?,?)`,
-          [victim, row.open_price, row.high_price, row.low_price, row.close_price, row.volume, row.change_pct]);
-        const [[back]] = await pool.query('SELECT COUNT(*) n FROM idx_ihsg_history WHERE date=?', [victim]);
-        assert.strictEqual(Number(back.n), 1, `FAILED TO RESTORE the index bar for ${victim}`);
+        // ALWAYS. There is no committing path out of this block.
+        await conn.rollback();
+        conn.release();
       }
+      const [[back]] = await pool.query('SELECT COUNT(*) n FROM idx_ihsg_history WHERE date=?', [victim]);
+      assert.strictEqual(Number(back.n), 1, `the index bar for ${victim} did not survive the rollback`);
     });
 
   } catch (e) {

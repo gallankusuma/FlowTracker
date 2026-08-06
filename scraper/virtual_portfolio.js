@@ -659,15 +659,31 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY, force = 
   const [[plan]] = await pool.query(
     `SELECT * FROM ft_strategy_plan WHERE strategy_id=? AND run_mode='LIVE' AND status IN ('PLANNED','PARTIALLY_FILLED','EXECUTED')
       ORDER BY as_of_date DESC LIMIT 1`, [strategyId]);
-  if (!plan) { if (!quiet) console.log('SCHEDULE  no plan to work from.'); return { scheduled: 0, skipped: 0, held: 0, mismatched: 0 }; }
+  if (!plan) {
+    // NO PLAN IS NOT A QUIET SUCCESS. The strategy deciding to hold nothing is
+    // an empty target book, which is fine; no plan AT ALL means the stage that
+    // writes plans did not run, and scheduling nothing over that is indistinct
+    // from a healthy standing-aside night unless it is said out loud.
+    if (!quiet) {
+      console.log('SCHEDULE  BLOCKED — there is no LIVE plan for this strategy.');
+      console.log('  strategy_forward.js plan runs at 20:20; check whether it completed.');
+    }
+    await recordStage(pool, session, 'schedule', 'BLOCKED', 'NO_LIVE_PLAN', strategyId);
+    return { blocked: 'NO_LIVE_PLAN', scheduled: 0, skipped: 0, held: 0, mismatched: 0 };
+  }
 
   // A PLAN WITH NO HASH CANNOT BE SCHEDULED, and a plan from a DIFFERENT hash
   // cannot be scheduled into this account. Without both checks a configuration
   // change quietly poured orders from strategy B into the account that holds
   // strategy A's profit, and B's track record started from A's NAV.
   if (!plan.strategy_hash) {
-    if (!quiet) console.log('SCHEDULE  the latest plan carries no strategy_hash — refusing to schedule it.');
-    return { scheduled: 0, skipped: 0, held: 0, mismatched: 0, reason: 'PLAN_WITHOUT_HASH' };
+    if (!quiet) {
+      console.log('SCHEDULE  FAILED — the latest plan carries no strategy_hash.');
+      console.log('  A plan with no identity cannot be attributed to any track record.');
+    }
+    await recordStage(pool, session, 'schedule', 'FAILED', 'PLAN_WITHOUT_HASH', strategyId);
+    return { failed: true, failures: ['PLAN_WITHOUT_HASH'], scheduled: 0, skipped: 0, held: 0, mismatched: 0,
+             reason: 'PLAN_WITHOUT_HASH' };
   }
 
   const target = JSON.parse(plan.target_json || '[]');
@@ -733,6 +749,21 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY, force = 
     if (retiring) console.log(`  ${retiring} retiring account(s) took no new orders, by design`);
     if (!target.length) console.log('  the book is empty, so there is nothing to schedule — that is a decision, not a failure');
   }
+  // AN ACTIVE ACCOUNT THAT DOES NOT MATCH THE PLAN IS NOT NORMAL. Skipping it and
+  // recording OK meant the night looked complete while an account sat out for a
+  // reason nobody was told about. (An EMPTY target book is different, and stays
+  // OK: standing aside is a decision the strategy is entitled to make.)
+  if (mismatched > 0 && !rollbacks.length) {
+    await recordStage(pool, session, 'schedule', 'FAILED',
+      `${mismatched} account(s) on a different strategy hash`, strategyId);
+    if (!quiet) {
+      console.log(`SCHEDULE  FAILED — ${mismatched} active account(s) do not match the plan's strategy hash.`);
+      console.log('  Either the plan or the account is from an identity that should have retired.');
+    }
+    return { failed: true, failures: [`ACCOUNT_HASH_DRIFT: ${mismatched}`],
+             scheduled, skipped, held, mismatched };
+  }
+
   if (rollbacks.length) {
     await recordStage(pool, session, 'schedule', 'FAILED',
       `${rollbacks.length} transaction(s) rolled back`, strategyId);
@@ -902,6 +933,42 @@ async function cycleIdentity(pool, strategyId) {
   }
   return require('crypto').createHash('sha256')
     .update(JSON.stringify({ strategyId, engine: vb.EXECUTION_ENGINE_VERSION, roster }))
+    .digest('hex').slice(0, 16);
+}
+
+/**
+ * WHOSE RECORD this is — a different question from which cycle is running.
+ *
+ * `cycleIdentity` must hold still for one night so the four cron processes can
+ * find each other's checkpoints; that is why the strategy hash is deliberately
+ * not in it. But the burn-in and the dashboard were using the same value, and
+ * for them that omission is a lie: strategy A could accrue eight clean sessions,
+ * the strategy hash change to B with the engine, policy and account codes
+ * untouched, and B's second night would report a ten-session streak.
+ *
+ * So there are two identities, and they answer two questions:
+ *   cycleIdentity       stable within a night   -> which chain is running
+ *   experimentIdentity  moves with the record   -> whose streak this is
+ *
+ * This one is read from the accounts themselves, so a change to any of the four
+ * things that make a record incomparable — strategy hash, policy hash, engine
+ * version, or the roster — starts the count again.
+ */
+async function experimentIdentity(pool, strategyId) {
+  const [rows] = await pool.query(
+    `SELECT account_code, strategy_hash, execution_policy_hash, execution_engine_version
+       FROM virtual_accounts WHERE strategy_id=? AND status IN ('ACTIVE','RETIRING')
+      ORDER BY account_code`, [strategyId]);
+  return require('crypto').createHash('sha256')
+    .update(JSON.stringify({
+      strategyId,
+      accounts: rows.map(r => ({
+        accountCode: r.account_code,
+        strategyHash: r.strategy_hash,
+        policyHash: r.execution_policy_hash,
+        engineVersion: r.execution_engine_version,
+      })),
+    }))
     .digest('hex').slice(0, 16);
 }
 
@@ -1688,7 +1755,7 @@ async function main() {
 module.exports = {
   setup, cmdSchedule, cmdResolve, cmdMark, cmdStatus, cmdReconcile,
   retireSupersededAccounts, loadAccounts, loadBars, sessionCalendarState, migrateEnum, migrateColumn,
-  recordStage, stageOk, currentSession, cycleIdentity, ensureStageTable,
+  recordStage, stageOk, currentSession, cycleIdentity, experimentIdentity, ensureStageTable,
   ACCOUNTS, SOURCE_STRATEGY,
 };
 

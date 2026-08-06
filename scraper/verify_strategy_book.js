@@ -191,7 +191,32 @@ function replay(ctx, firstI, lastI, params) {
   const ctx = await load(pool);
 
   const firstI = Math.max(ctx.concStart + sb.DEFAULTS.posfracWindow, sb.DEFAULTS.hiBars, sb.DEFAULTS.regimeSma);
-  const lastI = ctx.tradingDates.length - 2;
+
+  // THE WINDOW IS PINNED TO THE FIXTURE, not to "wherever the data ends today".
+  //
+  // This was `tradingDates.length - 2`, so every new trading session added a
+  // decision and the golden hash changed — the fixture failed every single day
+  // for a reason that has nothing to do with the code it exists to guard. A
+  // check that goes red daily is one people learn to regenerate without reading,
+  // which is worse than not having it.
+  //
+  // Pinned, the comparison is like with like: a code change still moves the
+  // hash, and data advancing does not. `--update-golden` moves the window
+  // forward deliberately, and the new end date is part of the recorded diff.
+  const defaultLast = ctx.tradingDates.length - 2;
+  let lastI = defaultLast;
+  if (!update && fs.existsSync(GOLDEN)) {
+    const g = JSON.parse(fs.readFileSync(GOLDEN, 'utf8'));
+    if (g.windowEnd) {
+      const idx = ctx.tradingDates.indexOf(g.windowEnd);
+      if (idx < 0) {
+        console.log(`\n  ** the fixture's window end ${g.windowEnd} is no longer in the price series.`);
+        console.log('     Regenerate deliberately with --update-golden; do not silently re-window.');
+        process.exit(1);
+      }
+      lastI = idx;
+    }
+  }
 
   console.log('='.repeat(92));
   console.log('VERIFY strategy_book.js — exact fixture comparison, not a plausibility range');
@@ -205,7 +230,9 @@ function replay(ctx, firstI, lastI, params) {
 
   if (update) {
     fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
-    fs.writeFileSync(GOLDEN, JSON.stringify(run, null, 1));
+    // The window end travels WITH the fixture, so the next run compares the same
+    // span rather than whatever the data happens to reach that day.
+    fs.writeFileSync(GOLDEN, JSON.stringify({ ...run, windowEnd: ctx.tradingDates[lastI] }, null, 1));
     console.log(`  GOLDEN FIXTURE WRITTEN -> ${GOLDEN}`);
     console.log('  Commit it. From now on any change to these numbers fails the test.');
     await pool.end();

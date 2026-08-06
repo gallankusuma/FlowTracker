@@ -3062,8 +3062,14 @@ app.get('/api/virtual-portfolio', async (req, res) => {
     // includes sessions run by a different engine or a different account set —
     // the same flattering arithmetic the identity column exists to prevent.
     const vpMod = require('./virtual_portfolio');
-    let activeIdentity = null;
-    try { activeIdentity = await vpMod.cycleIdentity(pool, vpMod.SOURCE_STRATEGY); } catch { /* table may not exist yet */ }
+    // THE EXPERIMENT identity for the burn-in: it must move when the strategy
+    // hash changes, or two strategies share one streak. The CYCLE identity is a
+    // different value with a different job and is used only for stage lookups.
+    let activeIdentity = null, cycleId = null;
+    try {
+      activeIdentity = await vpMod.experimentIdentity(pool, vpMod.SOURCE_STRATEGY);
+      cycleId = await vpMod.cycleIdentity(pool, vpMod.SOURCE_STRATEGY);
+    } catch { /* tables may not exist yet */ }
     const [burnRows] = activeIdentity
       ? await pool.query(
           `SELECT session_date, passed, failures_json FROM virtual_burnin
@@ -3086,10 +3092,10 @@ app.get('/api/virtual-portfolio', async (req, res) => {
     // each stage of the chain actually complete, and which experiment is this.
     const calState = await vpMod.sessionCalendarState(pool).catch(() => null);
     const session = calState?.calendar || null;
-    const [stageRows] = session && activeIdentity
+    const [stageRows] = session && cycleId
       ? await pool.query(
           `SELECT stage, status, reason, completed_at FROM virtual_cycle_stage
-            WHERE session_date=? AND identity_hash=?`, [session, activeIdentity]).catch(() => [[]])
+            WHERE session_date=? AND identity_hash=?`, [session, cycleId]).catch(() => [[]])
       : [[]];
     const stages = Object.fromEntries(
       ['resolve', 'schedule', 'mark'].map(st => {
@@ -3111,6 +3117,8 @@ app.get('/api/virtual-portfolio', async (req, res) => {
         : reconcileProblems.length ? 'PROBLEMS' : 'CLEAN',
       reconcileProblems: reconcileProblems || [],
       engineVersion: require('./modules/virtual_broker').EXECUTION_ENGINE_VERSION,
+      experimentIdentity: activeIdentity,
+      cycleIdentity: cycleId,
       identity: activeIdentity,
     };
     const charterFor = c => charters.find(x =>
