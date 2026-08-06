@@ -130,6 +130,33 @@ function atrFrom(bars, period = 14) {
 const EXIT_POLICIES = { POSITION: 'POSITION', INTRADAY_EOD: 'INTRADAY_EOD' };
 
 /**
+ * THE EXECUTION ENGINE VERSION — deliberate, and not the git commit.
+ *
+ * `execution_policy_hash` captures the CONFIGURATION: fees, slippage, caps, the
+ * risk layer. It does not move when the ALGORITHM changes, and on 2026-08-05 two
+ * material rules changed without shifting it by a character — gap fills moved to
+ * the open, and an unreadable bar began blocking the walk instead of being
+ * skipped. Trades before and after are not comparable, and nothing said so.
+ *
+ * The raw commit is the wrong instrument for this. It moves when a comment is
+ * edited, which would retire an account and restart its capital over a typo.
+ * This number moves when EXECUTION BEHAVIOUR moves, and a human has to decide
+ * that it did. It is part of the account identity: bump it and the old account
+ * retires while a new one starts again from Rp100 juta.
+ *
+ * BUMP THIS when any of these change materially:
+ *   fill rules, gap handling, missing-bar behaviour, NAV/opening sizing,
+ *   order sequencing, retirement behaviour, transaction lifecycle.
+ *
+ * History:
+ *   1  the original engine (2026-08-04)
+ *   2  session calendar as the date axis; opening-NAV sizing; aggregate per-name
+ *      cap; gap fills at the open; DATA_INCOMPLETE blocks the walk; retirement
+ *      unwinds instead of running on; strategy-hash isolation  (2026-08-05)
+ */
+const EXECUTION_ENGINE_VERSION = 2;
+
+/**
  * Identity of the execution contract. Two accounts differing only in exit
  * policy get different hashes, which is the point: their results are answers to
  * different questions.
@@ -137,8 +164,11 @@ const EXIT_POLICIES = { POSITION: 'POSITION', INTRADAY_EOD: 'INTRADAY_EOD' };
 function executionPolicyHash(config, exitPolicy) {
   const c = { ...DEFAULT_CONFIG, ...config };
   const payload = Object.keys(c).sort().map(k => [k, c[k]]);
+  // The engine version is IN the hash. Without it a behaviour change kept the
+  // same hash, so the same account carried trades executed under two different
+  // algorithms and called the result one record.
   return crypto.createHash('sha256')
-    .update(JSON.stringify({ exitPolicy, config: payload }))
+    .update(JSON.stringify({ exitPolicy, engine: EXECUTION_ENGINE_VERSION, config: payload }))
     .digest('hex').slice(0, 16);
 }
 
@@ -333,7 +363,7 @@ function markToMarket({ cash, positions, priceOf, lastCloseOf = null }) {
 }
 
 module.exports = {
-  LOT, DEFAULT_CONFIG, EXIT_POLICIES, riskLayer,
+  LOT, DEFAULT_CONFIG, EXIT_POLICIES, riskLayer, EXECUTION_ENGINE_VERSION,
   executionPolicyHash, floorToLot, buyCost, sellProceeds,
   sizeOrder, resolveBar, markToMarket, tradeLevels, atrFrom,
 };

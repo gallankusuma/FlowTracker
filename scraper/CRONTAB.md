@@ -175,8 +175,8 @@ Records intentions only. It places no orders and touches no broker.
 20:40  virtual reconcile
 20:50  watchdog          checks what all of the above actually produced
 ```
-Added 2026-08-04. Two simulated Rp100 juta accounts, `POSITION_100M` and
-`INTRADAY_EOD_100M`, driven by the same recommendations under different exit
+Added 2026-08-04. Two simulated Rp100 juta accounts, `POSITION_100M_V2` and
+`INTRADAY_EOD_100M_V2`, driven by the same recommendations under different exit
 policies. Logs to `/var/log/virtual-portfolio.log`.
 
 **The order is load-bearing, and it is not the order the design proposed.** The
@@ -203,7 +203,7 @@ accounts. `setup()` now closes any account whose contract is no longer current â
 CLOSED, never deleted, because its orders and NAV history are the record of what
 that contract did.
 
-`INTRADAY_EOD_100M` is **expected to lose**: EXP-019 measured that rule at
+`INTRADAY_EOD_100M_V2` is **expected to lose**: EXP-019 measured that rule at
 -0.951% per trade on this system's own BUY days (n=2,204, t=-18.5) against a
 -0.673% unconditional base rate. It runs to confirm that forward and must not be
 tuned until it stops losing.

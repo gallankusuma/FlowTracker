@@ -649,6 +649,54 @@ async function cashByAccount(pool) {
       for (const r of rows) assert.strictEqual(Number(r.performance_eligible), 1);
     });
 
+    await t('SETUP WORKS ON A COMPLETELY FRESH SCHEMA', async () => {
+      // The failure this catches: an ALTER placed above its own CREATE TABLE.
+      // Invisible on a database that already has the table, fatal on every new
+      // environment — a fresh install, a disaster recovery, a temp CI schema.
+      // Production never saw it because production already had the table.
+      const db = `zz_fresh_${Date.now().toString(36)}`;
+      await pool.query(`CREATE DATABASE \`${db}\``);
+      const fresh = mysql.createPool({
+        host: process.env.DB_HOST || 'localhost', user: process.env.DB_USER || 'erp_user',
+        password: process.env.DB_PASSWORD, database: db, waitForConnections: true, connectionLimit: 2,
+      });
+      try {
+        // setup() reads idx_ihsg_history / ft_strategy_plan for the start date
+        // and the strategy hash, so give the empty schema the shape it expects.
+        await fresh.query('CREATE TABLE idx_ihsg_history (date DATE PRIMARY KEY, close_price DECIMAL(12,2))');
+        await fresh.query(`INSERT INTO idx_ihsg_history VALUES ('2026-08-04', 6320)`);
+        await fresh.query('CREATE TABLE idx_stock_prices (stock_code VARCHAR(10), date DATE, PRIMARY KEY(stock_code,date))');
+        await fresh.query(`CREATE TABLE ft_strategy_plan (
+          id INT AUTO_INCREMENT PRIMARY KEY, strategy_id VARCHAR(64), as_of_date DATE,
+          run_mode VARCHAR(16), strategy_hash VARCHAR(32), status VARCHAR(16), target_json TEXT,
+          data_snapshot_hash VARCHAR(32), code_commit VARCHAR(40), reason VARCHAR(128))`);
+
+        await vp.setup(fresh, true);   // must not throw
+
+        for (const tbl of ['virtual_accounts', 'virtual_orders', 'virtual_positions',
+                           'virtual_trade_events', 'virtual_nav', 'virtual_charter']) {
+          const [[r]] = await fresh.query(
+            `SELECT COUNT(*) n FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND TABLE_NAME=?`, [db, tbl]);
+          assert.strictEqual(Number(r.n), 1, `${tbl} was not created`);
+        }
+        // And the widened column really is wide on a fresh build.
+        const [[col]] = await fresh.query(
+          `SELECT CHARACTER_MAXIMUM_LENGTH len FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=? AND TABLE_NAME='virtual_positions' AND COLUMN_NAME='exit_reason'`, [db]);
+        assert.ok(Number(col.len) >= 24, `exit_reason is only ${col.len} on a fresh schema`);
+      } finally {
+        await fresh.end();
+        await pool.query(`DROP DATABASE \`${db}\``);
+      }
+    });
+
+    await t('widening a column refuses to run before its table exists', async () => {
+      await assert.rejects(
+        () => vp.migrateColumn(pool, 'zz_no_such_table', 'x', { minLength: 24, definition: 'VARCHAR(24) NULL', why: 'test' }),
+        /does not exist/,
+        'the ALTER-before-CREATE mistake must produce a sentence, not a cryptic SQL error');
+    });
+
     await t('MIGRATIONS PROVE THEMSELVES — a widened enum is read back, not assumed', async () => {
       // The old code did ALTER ... .catch(() => {}), so a migration that failed
       // on permissions reported success and the runtime broke hours later.
@@ -704,7 +752,13 @@ async function cashByAccount(pool) {
       }
     });
 
-    await t('a retiring account UNWINDS at the first available price, it does not keep trading', async () => {
+    await t('A FORCED EXIT CANNOT PRECEDE THE DECISION TO RETIRE', async () => {
+      // This test used to assert the opposite, and locked in the bug: it
+      // demanded the account be empty after ONE cmdResolve, which could only
+      // happen by selling at the latest session's open. Retirement is detected
+      // by the nightly chain around 20:10 WIB; that open was ~09:00, eleven
+      // hours earlier. The record said the account sold before anyone decided
+      // to retire it.
       const acct = (await q(pool,
         `SELECT id FROM virtual_accounts WHERE strategy_id=? AND exit_policy='POSITION'`, [STRATEGY]))[0];
       const before = await q(pool,
@@ -714,22 +768,44 @@ async function cashByAccount(pool) {
       await pool.query(`UPDATE virtual_accounts SET execution_policy_hash='0000gonepolicy3' WHERE id=?`, [acct.id]);
       try {
         await vp.retireSupersededAccounts(pool, STRATEGY, true);
-        const [st] = await q(pool, 'SELECT status FROM virtual_accounts WHERE id=?', [acct.id]);
+        const [st] = await q(pool,
+          'SELECT status, retirement_session, retirement_reason FROM virtual_accounts WHERE id=?', [acct.id]);
         assert.strictEqual(st.status, 'RETIRING');
+        assert.ok(st.retirement_session, 'the session the decision was made on must be recorded');
+        assert.ok(/POLICY_CHANGE|STRATEGY_CHANGE/.test(st.retirement_reason), st.retirement_reason);
 
+        // The decision was recorded on the LATEST session, so there is no session
+        // after it yet. The position must WAIT.
         await vp.cmdResolve(pool, true, OPTS);
+        const [stillOpen] = await q(pool,
+          `SELECT COUNT(*) n FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
+        assert.strictEqual(Number(stillOpen.n), Number(before[0].n),
+          'the position was sold at an open that happened before the retirement decision');
+
+        // Backdate the decision by one session; now a later session exists and
+        // the unwind may legitimately happen there.
+        const priorSession = dates[dates.length - 2];
+        await pool.query('UPDATE virtual_accounts SET retirement_session=? WHERE id=?', [priorSession, acct.id]);
+        await vp.cmdResolve(pool, true, OPTS);
+
         const [after] = await q(pool,
           `SELECT COUNT(*) n FROM virtual_positions WHERE account_id=? AND status='OPEN'`, [acct.id]);
         assert.strictEqual(Number(after.n), 0, 'the retiring account still holds positions');
 
         const [closedRow] = await q(pool,
-          `SELECT exit_reason FROM virtual_positions WHERE account_id=? AND status='CLOSED'
+          `SELECT exit_reason, exit_date FROM virtual_positions WHERE account_id=? AND status='CLOSED'
             ORDER BY id DESC LIMIT 1`, [acct.id]);
         assert.ok(/_CHANGE_EXIT$/.test(closedRow.exit_reason),
           `expected an explicit policy/strategy exit, got ${closedRow.exit_reason}`);
+        const exitDate = String(closedRow.exit_date).slice(0, 10).includes('-')
+          ? String(closedRow.exit_date).slice(0, 10)
+          : new Date(closedRow.exit_date).toISOString().slice(0, 10);
+        assert.ok(exitDate > priorSession,
+          `the exit (${exitDate}) must be strictly after the decision (${priorSession})`);
       } finally {
         await pool.query(
-          `UPDATE virtual_accounts SET execution_policy_hash=?, status='ACTIVE' WHERE id=?`,
+          `UPDATE virtual_accounts SET execution_policy_hash=?, status='ACTIVE',
+                  retirement_session=NULL, retirement_reason=NULL WHERE id=?`,
           [vb.executionPolicyHash({}, 'POSITION'), acct.id]);
       }
     });

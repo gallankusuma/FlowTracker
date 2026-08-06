@@ -1,169 +1,342 @@
-Bro, menurut gue jangan tambah fitur trading baru dulu. Next step terbaik adalah mengubah V2 dari “kode yang bagus” menjadi operasional yang terbukti stabil.
+Setelah empat poin ini ditutup, menurut gue virtual broker bisa dinyatakan engineering-ready untuk official shadow track record.
 
-Urutan yang gue sarankan
-1. Tutup empat blocker terakhir
+Yang sudah berhasil ditutup
+Arahan sebelumnya	Status
+Cron IHSG sebelum resolve	✅
+SESSION_CALENDAR_STALE guard	✅ Sebagian
+Missing bar menghentikan exit walk	✅
+performance_eligible=0 saat data blocked	✅
+Pending order dibatalkan saat contract berubah	✅
+Retiring account tidak memakai natural resolver baru	✅
+Migration tidak swallow error	✅
+Migration dibuktikan melalui information_schema	✅
+Mark memakai consistent transaction snapshot	✅
+Reconcile memakai frozen account config	✅
+Official V2 accounts mulai Rp100 juta baru	✅
+Evaluation gate dibekukan sebelum hasil muncul	✅
+10-session burn-in tracking	✅
+Dashboard membawa charter dan burn-in status	✅
 
-Prioritas paling atas:
+Cron sekarang sudah memiliki urutan yang benar:
 
-Jalankan refresh_ihsg.js sebelum virtual_portfolio resolve.
-Tambahkan hard guard SESSION_CALENDAR_STALE; resolve harus gagal kalau kalender IHSG tertinggal dari price data.
-Missing atau incomplete bar harus memblokir perjalanan posisi, bukan dilewati ke candle berikutnya.
-Saat strategy hash atau execution policy berubah:
-SCHEDULED dan DATA_PENDING dibatalkan;
-open position lama di-force-close dengan alasan POLICY_CHANGE_EXIT atau tetap memakai resolver versi lama.
-Migration enum wajib fail loudly, jangan menggunakan .catch(() => {}).
+19:30  price data
+20:05  refresh IHSG
+20:10  virtual resolve
+20:15  forward fill
+20:20  forward plan
+20:25  forward mark
+20:30  virtual schedule
+20:35  virtual mark
+20:40  virtual reconcile
+20:50  watchdog
 
-Ini penting karena arithmetic dan sizing sekarang sudah cukup kuat; risiko terbesarnya justru engine bekerja dengan kalender atau data lifecycle yang salah.
+Missing atau incomplete exit bar sekarang benar-benar menghentikan perjalanan posisi. Account juga diberi performance_eligible=0 sampai datanya pulih. Ini solusi yang benar.
 
-2. Bekukan versi resmi
-
-Setelah blocker ditutup, buat identitas final:
-
-Virtual Broker Version : 2
-Starting Capital       : Rp100.000.000
-Official Start Date    : tanggal trading berikutnya
-Strategy Hash          : ...
-Execution Policy Hash  : ...
-Code Commit            : ...
-
-Account hasil development sebelumnya jangan digabung dengan record resmi.
-
-Buat account baru:
+Official account juga sudah dipisahkan secara struktural:
 
 POSITION_100M_V2
 INTRADAY_EOD_100M_V2
 
-Keduanya mulai dari nol dengan Rp100 juta masing-masing.
+dan evaluation gate telah dibekukan melalui charter.
 
-3. Jalankan seluruh test di environment database
+P0.1 — Fresh database setup sekarang gagal
 
-Wajib hijau:
+Urutan schema setup salah.
 
-npm test
-npm run test:integration
+Code menjalankan:
 
-Lalu tambahkan test terakhir yang belum terkunci:
+ALTER TABLE virtual_positions
+MODIFY COLUMN exit_reason VARCHAR(24) NULL
 
-stale IHSG calendar → resolve gagal
-incomplete exit bar → posisi tidak boleh membaca hari berikutnya
-policy change → pending order dibatalkan
-retiring account → open position benar-benar ditutup
-migration enum lama → berhasil naik ke schema baru
+sebelum menjalankan:
 
-Current test suite sebenarnya sudah cukup kuat dan telah mencakup strategy isolation, retained ticker, gap execution, NAV reconciliation, dan idempotency.
+CREATE TABLE IF NOT EXISTS virtual_positions (...)
 
-4. Jalankan burn-in selama 10 hari bursa
+Pada production database existing, ini kemungkinan tidak terlihat karena tabel sudah ada. Tetapi pada:
 
-Selama periode ini, jangan ubah parameter trading.
+fresh installation;
+temporary integration database;
+disaster recovery;
+deployment environment baru;
 
-Setiap malam periksa:
+setup akan gagal dengan tabel virtual_positions belum ada.
 
-price data current
-IHSG calendar current
-resolve success
-schedule success
-NAV mark success
-reconcile = 0 problems
-watchdog = healthy
-cash >= 0
-NAV = cash + market value
-no duplicate fill
-no skipped unknown bar
+Perbaikan
 
-Target burn-in:
+Urutannya harus:
 
-10 hari bursa berturut-turut tanpa manual database repair dan tanpa invariant failure.
+1. CREATE TABLE IF NOT EXISTS virtual_positions
+2. Periksa kolom exit_reason
+3. ALTER hanya jika panjangnya kurang dari 24
 
-Kalau ada bug, perbaiki dan restart hitungan 10 hari. Burn-in ini menguji operasional, belum menguji apakah strateginya profitable.
+Contoh:
 
-5. Buat dashboard portfolio yang benar-benar operasional
+await pool.query(`CREATE TABLE IF NOT EXISTS virtual_positions (...)`);
 
-Frontend minimal menampilkan:
+const [[col]] = await pool.query(`
+  SELECT CHARACTER_MAXIMUM_LENGTH len
+  FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA=DATABASE()
+    AND TABLE_NAME='virtual_positions'
+    AND COLUMN_NAME='exit_reason'
+`);
 
-Account summary
-Starting capital
-Current NAV
-Cash
-Market value
-Gross exposure
-Realized P&L
-Unrealized P&L
-Return %
-Maximum drawdown
-Open positions
-Ticker
-Quantity / lot
-Entry
-Current price
-Stop loss
-Profit target
-Market value
-Unrealized P&L
-Holding days
-Order queue
-Scheduled
-Data pending
-Data missing
-Rejected
-No fill
-Filled
-Cancelled
-Journal
-Recommendation
-Order scheduled
-Filled
-SL/PT created
-Exit
-Fee
-Slippage
-Net P&L
-Exit reason
-Strategy hash
-Policy hash
+if (Number(col?.len) < 24) {
+  await pool.query(
+    'ALTER TABLE virtual_positions MODIFY COLUMN exit_reason VARCHAR(24) NULL'
+  );
+}
 
-Pastikan DATA_PENDING dan NAV_DEGRADED terlihat mencolok, bukan tersembunyi sebagai catatan kecil.
+Tambahkan fresh-schema integration test yang menjalankan setup() setelah seluruh virtual_* tables dihapus atau menggunakan temporary database.
 
-6. Tentukan evaluation gate sebelum melihat hasil
+P0.2 — Calendar guard belum benar-benar fail-closed
 
-Sebelum track record bertambah, bekukan kriterianya. Contoh untuk POSITION_100M_V2:
+Guard sekarang hanya menyatakan stale ketika:
 
-Minimum period          : 60 trading days
-Minimum closed trades   : 30
-Maximum drawdown        : <= 12%
-Profit factor           : >= 1.20
-Net return              : > 0 setelah fee/slippage
-No ledger violations    : wajib
-No policy changes       : wajib
+calendar < prices
 
-Untuk INTRADAY_EOD_100M_V2, jangan memakai target profit sebagai ekspektasi. Account itu adalah control/challenger untuk membuktikan apakah closing pada hari yang sama memang merusak edge.
+Ini menutup kasus IHSG tertinggal dari price data. Tetapi arah sebaliknya belum ditangani.
 
-Jangan mengubah SL, PT, target R, fee, atau sizing setelah melihat beberapa trade jelek. Perubahan parameter harus menghasilkan policy hash dan account baru.
+Skenario:
 
-Setelah itu baru pertimbangkan broker integration
+IHSG calendar  : 2026-08-05
+Price data     : 2026-08-04
 
-Urutannya sebaiknya:
+Ini dapat terjadi bila:
 
-Virtual broker
-→ stable shadow record
-→ broker sandbox/read-only
-→ broker order mirroring dengan approval manual
-→ small-capital controlled execution
-→ full automation
+price pull 19:30 gagal;
+refresh IHSG 20:05 berhasil;
+resolve 20:10 dijalankan.
 
-Tahap pertama broker integration sebaiknya hanya:
+Karena calendar < prices false, resolve tetap berjalan. Mark kemudian dapat membuat NAV bertanggal 5 Agustus menggunakan last-known prices tanggal 4 Agustus.
 
-membaca buying power;
-membaca portfolio;
-menghasilkan proposed orders;
-manusia menekan approve;
-reconcile broker fills terhadap proposed fills.
+Guard yang dibutuhkan
+if (!calendar || !prices) {
+  return { blocked: 'MARKET_DATA_UNAVAILABLE' };
+}
 
-Belum perlu mengizinkan sistem langsung mengirim order tanpa approval.
+if (calendar < prices) {
+  return { blocked: 'SESSION_CALENDAR_STALE' };
+}
 
-Fokus sprint berikutnya
+if (prices < calendar) {
+  return { blocked: 'PRICE_DATA_STALE' };
+}
 
-Menurut gue satu sprint berikutnya cukup fokus pada:
+Lebih kuat lagi, jangan hanya memeriksa MAX(date). Pastikan latest session mempunyai coverage saham minimum yang wajar.
 
-Data lifecycle hardening → fresh V2 account → 10-day burn-in → operational dashboard.
+CLI masih keluar dengan status sukses
 
-Setelah itu kita berhenti menilai kualitas code dan mulai menilai kualitas sistem dari data yang benar-benar dihasilkan setiap hari.
+Saat calendar stale, cmdResolve() mengembalikan object blocked. Tetapi main() melakukan:
+
+if (cmd === 'resolve') {
+  await cmdResolve(pool, false);
+  return;
+}
+
+Tidak ada process.exitCode = 1. Default pipeline juga tetap melanjutkan ke schedule dan mark setelah resolve blocked.
+
+Akibatnya cron dapat melihat command berhasil walaupun resolve secara eksplisit menolak bekerja.
+
+Perbaikan
+if (cmd === 'resolve') {
+  const result = await cmdResolve(pool, false);
+  if (result?.blocked) process.exitCode = 1;
+  return;
+}
+
+const resolved = await cmdResolve(pool, false);
+if (resolved?.blocked) {
+  process.exitCode = 1;
+  return;
+}
+
+Integration test saat ini hanya membuktikan cmdResolve() mengembalikan SESSION_CALENDAR_STALE; belum membuktikan CLI keluar non-zero atau default chain berhenti.
+
+P0.3 — Code commit disebut bagian identity, tetapi belum benar-benar mengisolasi account
+
+Dokumentasi charter mengatakan:
+
+Code commit merupakan bagian dari identity.
+
+Alasannya benar: execution policy hash hanya menangkap configuration, bukan perubahan algorithm.
+
+Namun unique key charter saat ini hanya:
+
+account_code
+strategy_id
+strategy_hash
+execution_policy_hash
+
+code_commit tidak termasuk unique identity. virtual_accounts juga tidak memiliki implementation commit/hash.
+
+Skenario:
+
+Commit A:
+account berjalan dan charter dibekukan
+
+Commit B:
+algorithm execution berubah
+strategy hash tetap
+execution policy hash tetap
+account code tetap
+
+→ setup menemukan charter lama
+→ trade baru Commit B masuk account Commit A
+
+Charter tetap menampilkan commit A, padahal sebagian record dibuat oleh commit B.
+
+Solusi yang lebih baik
+
+Jangan memakai raw Git commit untuk memulai ulang account pada setiap perubahan dokumentasi. Buat identity eksplisit:
+
+execution_engine_version
+atau
+execution_engine_hash
+
+Hash tersebut mencakup perubahan material pada:
+
+fill rules;
+gap handling;
+missing-bar behavior;
+NAV sizing;
+order sequencing;
+retirement behavior;
+transaction lifecycle.
+
+Tambahkan ke:
+
+virtual_accounts
+virtual_charter
+unique account identity
+
+Ketika engine hash berubah:
+
+old account → RETIRING
+new account → fresh Rp100 juta
+
+Raw code_commit tetap disimpan untuk reproducibility, tetapi implementation identity sebaiknya berupa version/hash yang disengaja.
+
+P0.4 — Forced retirement exit memakai open yang sudah lewat
+
+Saat account menjadi RETIRING, code force-close posisi menggunakan:
+
+const today = dates[dates.length - 1];
+const px = bars.get(p.ticker)?.get(today)?.open;
+
+Masalahnya, detection dan deployment biasanya terjadi saat nightly process, sekitar pukul 20:10 WIB. Open hari tersebut terjadi sekitar pukul 09:00 WIB—lebih dari 11 jam sebelumnya.
+
+Skenario:
+
+Rabu 20:00  code V3 dideploy
+Rabu 20:10  account V2 menjadi RETIRING
+Rabu 20:10  posisi dicatat exit pada open Rabu
+
+Sistem secara retroaktif menjual sebelum keputusan retirement ada.
+
+Ini bukan hanya asumsi konservatif; ini execution timestamp yang tidak mungkin.
+
+Perbaikan
+
+Simpan:
+
+retired_at
+retirement_session
+retirement_reason
+
+Kemudian forced exit hanya pada:
+
+first authoritative session strictly after retirement was detected
+
+Contoh:
+
+const retirementDate = toDateStr(acct.retired_at);
+
+const exitDate = dates.find(d => d > retirementDate);
+if (!exitDate) {
+  // next session belum tersedia
+  continue;
+}
+
+const px = bars.get(p.ticker)?.get(exitDate)?.open;
+
+Alternatifnya gunakan same-day close hanya jika retirement decision memang direkam sebelum close. Dengan current nightly architecture, next-session open adalah asumsi paling bersih.
+
+Integration test sekarang justru mengharuskan account langsung kosong setelah satu cmdResolve() menggunakan bar terbaru, sehingga test tersebut mengunci perilaku retroaktif.
+
+P1 yang disarankan
+Official start date belum benar-benar “next trading session”
+
+Setup mencari:
+
+SELECT MIN(date)
+FROM idx_ihsg_history
+WHERE date > CURDATE()
+
+Lalu bila tidak ada, menggunakan latest session.
+
+Tabel historical biasanya tidak menyimpan future sessions, sehingga fallback hampir selalu dipakai. Official start dapat menjadi hari ini atau sesi sebelumnya, bukan sesi pertama account benar-benar dapat melakukan trade.
+
+Lebih akurat:
+
+official start = tanggal first official NAV mark
+
+atau session pertama setelah charter frozen.
+
+DATA_BLOCKED event bisa tercatat berulang
+
+Setiap nightly retry pada bar yang sama memasukkan event DATA_BLOCKED baru. Ini tidak merusak accounting, tetapi journal dapat penuh dengan event identik.
+
+Tambahkan unique logical key atau hanya insert ketika block state berubah:
+
+position_id + blocked_date + reason
+CRONTAB.md masih menyebut nama account lama
+
+Bagian jadwal masih mengatakan POSITION_100M dan INTRADAY_EOD_100M, sementara code sudah menggunakan suffix _V2.
+
+Tidak memengaruhi engine, tetapi dokumentasi official record harus presisi.
+
+Burn-in implementation
+
+Burn-in tracking sudah dibuat dengan pendekatan yang benar:
+
+satu row per session;
+streak dihitung dari historical rows;
+bukan mutable counter;
+reconciliation failures masuk ke failure list;
+dashboard menerima streak, target, dan failure history.
+
+Namun jangan mulai menghitung streak resmi sebelum empat P0 di atas ditutup. Account V2 memang belum tentu perlu diganti lagi bila benar-benar belum ada order/position, tetapi charter/identity harus diperbaiki sebelum first official trade.
+
+Penilaian terbaru
+Area	Nilai
+Core accounting	9,3
+Data blocking	9,5
+Session-calendar design	9,0
+Cron orchestration	8,8
+Retirement lifecycle	7,5
+Schema migration safety	7,8
+Track-record identity	7,0
+Burn-in instrumentation	9,0
+Testing	9,2
+Official evidence readiness	8,4
+Kesimpulan
+
+Revisi ini sudah membawa sistem ke tahap:
+
+Operationally instrumented virtual broker with pre-registered evaluation and burn-in monitoring.
+
+Tim sudah menutup hampir semua masalah arithmetic, data blocking, dan accounting sebelumnya.
+
+Yang tersisa sekarang sangat spesifik:
+
+pindahkan ALTER virtual_positions setelah CREATE TABLE;
+freshness guard harus dua arah dan CLI harus exit non-zero;
+implementation version/hash harus benar-benar masuk account identity;
+forced retirement exit harus memakai next available session, bukan open yang sudah lewat.
+
+Setelah empat poin tersebut selesai, menurut gue:
+
+Mulai official 10-session burn-in. Tidak perlu menambah fitur lain dulu.
+
+Review ini berdasarkan static source terbaru di GitHub. Gue belum menjalankan npm test, npm run test:integration, atau membaca live crontab/MySQL di VPS.

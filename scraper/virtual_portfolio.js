@@ -101,6 +101,38 @@ async function hasColumn(pool, table, column) {
  * information_schema is READ BACK to confirm every required value is really
  * present. A migration that says it worked has to be able to prove it.
  */
+/**
+ * Widen a column, but only after proving the table and the column exist.
+ *
+ * Migration ordering has now gone wrong four times in this file: an ALTER placed
+ * above its own CREATE TABLE, which is invisible on a database that already has
+ * the table and fatal on every fresh one. Rather than move the statement and
+ * hope, this refuses to run against a table that is not there and says which
+ * one — so the next person who writes the two lines in the wrong order gets a
+ * sentence instead of a cryptic SQL error, on the first run rather than the
+ * first fresh install.
+ */
+async function migrateColumn(pool, table, column, { minLength, definition, why }) {
+  const [[col]] = await pool.query(
+    `SELECT CHARACTER_MAXIMUM_LENGTH len FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?`, [table, column]);
+  if (!col) {
+    throw new Error(
+      `cannot widen ${table}.${column}: the column does not exist. If this is a fresh ` +
+      `database, the ALTER is running before its CREATE TABLE — move it after.`);
+  }
+  if (Number(col.len) >= minLength) return { alreadyWide: true };
+
+  await pool.query(`ALTER TABLE ${table} MODIFY COLUMN ${column} ${definition}`);
+  const [[after]] = await pool.query(
+    `SELECT CHARACTER_MAXIMUM_LENGTH len FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?`, [table, column]);
+  if (Number(after?.len) < minLength) {
+    throw new Error(`${table}.${column} is still ${after?.len} after the ALTER (${why})`);
+  }
+  return { migrated: true };
+}
+
 async function migrateEnum(pool, table, column, values, suffix) {
   const present = async () => {
     const [[r]] = await pool.query(
@@ -138,6 +170,10 @@ async function setup(pool, quiet = false) {
       strategy_hash VARCHAR(32) NOT NULL DEFAULT 'UNSET',
       exit_policy VARCHAR(16) NOT NULL,
       execution_policy_hash VARCHAR(32) NOT NULL,
+      -- The ALGORITHM's identity. The policy hash covers configuration only, so
+      -- a behaviour change kept the same hash and one account carried trades
+      -- executed under two different engines.
+      execution_engine_version INT NOT NULL DEFAULT 1,
       config_json TEXT NULL,
       starting_cash DECIMAL(20,2) NOT NULL,
       cash_balance DECIMAL(20,2) NOT NULL,
@@ -149,6 +185,11 @@ async function setup(pool, quiet = false) {
       -- book is genuinely empty.
       status ENUM('ACTIVE','RETIRING','CLOSED') NOT NULL DEFAULT 'ACTIVE',
       retired_at TIMESTAMP NULL,
+      -- The session retirement was DECIDED on. A forced exit may only happen
+      -- strictly after it: retirement is detected around 20:10 WIB, and that
+      -- day's open was eleven hours earlier.
+      retirement_session DATE NULL,
+      retirement_reason VARCHAR(32) NULL,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       UNIQUE KEY uq_account (account_code, strategy_id, strategy_hash, execution_policy_hash)
     )`);
@@ -161,6 +202,15 @@ async function setup(pool, quiet = false) {
   }
   if (!await hasColumn(pool, 'virtual_accounts', 'retired_at')) {
     await pool.query('ALTER TABLE virtual_accounts ADD COLUMN retired_at TIMESTAMP NULL AFTER total_nav');
+  }
+  if (!await hasColumn(pool, 'virtual_accounts', 'execution_engine_version')) {
+    await pool.query('ALTER TABLE virtual_accounts ADD COLUMN execution_engine_version INT NOT NULL DEFAULT 1 AFTER execution_policy_hash');
+  }
+  if (!await hasColumn(pool, 'virtual_accounts', 'retirement_session')) {
+    await pool.query('ALTER TABLE virtual_accounts ADD COLUMN retirement_session DATE NULL AFTER retired_at');
+  }
+  if (!await hasColumn(pool, 'virtual_accounts', 'retirement_reason')) {
+    await pool.query('ALTER TABLE virtual_accounts ADD COLUMN retirement_reason VARCHAR(32) NULL AFTER retirement_session');
   }
   if (!await hasColumn(pool, 'virtual_accounts', 'performance_eligible')) {
     await pool.query('ALTER TABLE virtual_accounts ADD COLUMN performance_eligible TINYINT(1) NOT NULL DEFAULT 1 AFTER status');
@@ -213,10 +263,6 @@ async function setup(pool, quiet = false) {
       KEY idx_status (account_id, status)
     )`);
 
-  // POLICY_CHANGE_EXIT and STRATEGY_CHANGE_EXIT do not fit in VARCHAR(16), and
-  // a silently truncated exit reason is a falsified record.
-  await pool.query('ALTER TABLE virtual_positions MODIFY COLUMN exit_reason VARCHAR(24) NULL');
-
   if (!await hasColumn(pool, 'virtual_orders', 'target_rank')) {
     await pool.query('ALTER TABLE virtual_orders ADD COLUMN target_rank INT NULL AFTER quantity');
   }
@@ -251,6 +297,20 @@ async function setup(pool, quiet = false) {
       UNIQUE KEY uq_position (order_id),
       KEY idx_open (account_id, status)
     )`);
+
+  // AFTER the CREATE, not before it. This ALTER sat above the CREATE and would
+  // have thrown on any fresh database — a new environment, a disaster recovery,
+  // a temporary integration schema. It never showed up in production because
+  // the table was already there.
+  //
+  // That is migration ordering going wrong for the FOURTH time in this codebase,
+  // so `migrateColumn` below exists to make the shape unavailable: it verifies
+  // the table before touching the column, and it is a no-op when the column is
+  // already wide enough rather than re-issuing the ALTER every startup.
+  await migrateColumn(pool, 'virtual_positions', 'exit_reason', {
+    minLength: 24, definition: 'VARCHAR(24) NULL',
+    why: 'POLICY_CHANGE_EXIT and STRATEGY_CHANGE_EXIT do not fit in VARCHAR(16), and a silently truncated exit reason is a falsified record',
+  });
 
   // Append-only. Never updated, never deleted: the lifecycle has to stay
   // auditable even when the current status says something simple.
@@ -290,10 +350,11 @@ async function setup(pool, quiet = false) {
     const hash = vb.executionPolicyHash({}, a.exitPolicy);
     await pool.query(
       `INSERT IGNORE INTO virtual_accounts
-         (account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash, config_json,
-          starting_cash, cash_balance, total_nav)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
-      [a.code, SOURCE_STRATEGY, stratHash, a.exitPolicy, hash, JSON.stringify(vb.DEFAULT_CONFIG),
+         (account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash,
+          execution_engine_version, config_json, starting_cash, cash_balance, total_nav)
+       VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      [a.code, SOURCE_STRATEGY, stratHash, a.exitPolicy, hash,
+       vb.EXECUTION_ENGINE_VERSION, JSON.stringify(vb.DEFAULT_CONFIG),
        vb.DEFAULT_CONFIG.startingCash, vb.DEFAULT_CONFIG.startingCash, vb.DEFAULT_CONFIG.startingCash]);
   }
 
@@ -301,25 +362,33 @@ async function setup(pool, quiet = false) {
   // evaluation gate, written once, before any trade exists. A gate agreed after
   // seeing the results is not a gate.
   await charter.ensureTable(pool);
-  const [[firstSession]] = await pool.query(
-    'SELECT MIN(date) d FROM idx_ihsg_history WHERE date > CURDATE()')
-    .catch(() => [[{ d: null }]]);
+  // THE FIRST SESSION THE ACCOUNT COULD ACTUALLY TRADE.
+  // The first version asked for MIN(date) > CURDATE(), but a historical table
+  // does not hold future sessions, so the fallback fired every time and the
+  // "official start" was today or earlier — a date on which the account
+  // provably could not have traded, because it did not exist yet.
+  //
+  // Recorded as PENDING_FIRST_SESSION instead, and resolved to the first real
+  // session after the freeze once one lands. Honest while it is unknown rather
+  // than confidently wrong.
   const [[latestSession]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
-  // The next session if the calendar already has one, otherwise the latest —
-  // recorded honestly either way rather than guessing at a future date.
-  const officialStart = toDateStr(firstSession?.d) || toDateStr(latestSession?.d);
+  const [[nextSession]] = await pool.query(
+    'SELECT MIN(date) d FROM idx_ihsg_history WHERE date > ?', [toDateStr(latestSession?.d)])
+    .catch(() => [[{ d: null }]]);
+  const officialStart = toDateStr(nextSession?.d) || toDateStr(latestSession?.d);
 
   for (const a of ACCOUNTS) {
     const r = await charter.freezeCharter(pool, {
       accountCode: a.code, strategyId: SOURCE_STRATEGY, strategyHash: stratHash,
       executionPolicyHash: vb.executionPolicyHash({}, a.exitPolicy),
+      executionEngineVersion: vb.EXECUTION_ENGINE_VERSION,
       configVersion: vb.DEFAULT_CONFIG.version,
       startingCapital: vb.DEFAULT_CONFIG.startingCash,
       officialStartDate: officialStart, exitPolicy: a.exitPolicy,
     });
     if (quiet) continue;
     if (r.frozen) {
-      console.log(`CHARTER  ${a.code} frozen — start ${officialStart}, commit ${r.charter.code_commit || 'unknown'}`);
+      console.log(`CHARTER  ${a.code} frozen — start ${officialStart}, engine v${vb.EXECUTION_ENGINE_VERSION}, commit ${r.charter.code_commit}`);
       console.log(`         gate: ${JSON.parse(r.charter.gate_json).kind}, ` +
         `${JSON.parse(r.charter.gate_json).minTradingDays} days / ${JSON.parse(r.charter.gate_json).minClosedTrades} trades minimum`);
     } else if (r.gateDrift) {
@@ -443,7 +512,16 @@ async function retireSupersededAccounts(pool, strategyId, quiet = false) {
     const busy = Number(r.openPositions) > 0;
     const next = busy ? 'RETIRING' : 'CLOSED';
     if (r.status !== next) {
-      await pool.query('UPDATE virtual_accounts SET status=?, retired_at=COALESCE(retired_at, NOW()) WHERE id=?', [next, r.id]);
+      // The session retirement was DECIDED on, recorded once. The forced exit
+      // must land strictly after it — see the unwind in cmdResolve.
+      const [[sess]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+      await pool.query(
+        `UPDATE virtual_accounts
+            SET status=?, retired_at=COALESCE(retired_at, NOW()),
+                retirement_session=COALESCE(retirement_session, ?),
+                retirement_reason=COALESCE(retirement_reason, ?)
+          WHERE id=?`,
+        [next, toDateStr(sess?.d), reason, r.id]);
       changed.push({ ...r, newStatus: next });
     }
     if (quiet) continue;
@@ -652,22 +730,55 @@ async function sessionCalendarState(pool) {
   const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
   const calendar = toDateStr(ihsg?.d);
   const prices = toDateStr(px?.d);
-  return { calendar, prices, stale: !!(calendar && prices && calendar < prices) };
+
+  // FAIL CLOSED IN BOTH DIRECTIONS. The first version only caught the calendar
+  // trailing the prices. The opposite happens just as easily — the 19:30 price
+  // pull fails, the 20:05 IHSG refresh succeeds, and at 20:10 the calendar is a
+  // session ahead of any price. Resolve would have run happily and the mark
+  // would then stamp a NAV dated 2026-08-05 built entirely from 2026-08-04
+  // prices: a valuation for a session nothing has been priced in.
+  if (!calendar || !prices) {
+    return { calendar, prices, blocked: 'MARKET_DATA_UNAVAILABLE', stale: true };
+  }
+  if (calendar < prices) return { calendar, prices, blocked: 'SESSION_CALENDAR_STALE', stale: true };
+  if (prices < calendar) return { calendar, prices, blocked: 'PRICE_DATA_STALE', stale: true };
+
+  // MAX(date) alone is not coverage. A single ticker landing would make the
+  // whole session look present, so the latest session must also carry a
+  // plausible share of the universe.
+  const [[cov]] = await pool.query(
+    'SELECT COUNT(DISTINCT stock_code) n FROM idx_stock_prices WHERE date=?', [prices]);
+  const [[typical]] = await pool.query(
+    `SELECT ROUND(AVG(n)) n FROM (
+       SELECT COUNT(DISTINCT stock_code) n FROM idx_stock_prices
+        WHERE date < ? GROUP BY date ORDER BY date DESC LIMIT 10) x`, [prices]);
+  const have = Number(cov?.n) || 0;
+  const usual = Number(typical?.n) || 0;
+  if (usual > 0 && have < usual * 0.5) {
+    return { calendar, prices, blocked: 'PRICE_COVERAGE_THIN', stale: true, coverage: have, typical: usual };
+  }
+
+  return { calendar, prices, blocked: null, stale: false, coverage: have, typical: usual };
 }
 
 async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
   const cal = await sessionCalendarState(pool);
-  if (cal.stale) {
+  if (cal.blocked) {
     // Refuse rather than under-fill. A run that quietly fills nothing looks
     // exactly like a day with no signals, which is the shape of every silent
     // failure this project has had.
     if (!quiet) {
-      console.log(`RESOLVE  SESSION_CALENDAR_STALE — refusing to run.`);
-      console.log(`  prices reach ${cal.prices} but the IHSG session calendar only reaches ${cal.calendar}.`);
-      console.log('  Filling now would skip today\'s session entirely and book it a day late.');
-      console.log('  Run `node refresh_ihsg.js` first; the cron order is 20:05 IHSG, then 20:10 resolve.');
+      const why = {
+        MARKET_DATA_UNAVAILABLE: 'one of the two feeds is empty, so there is nothing to reconcile against',
+        SESSION_CALENDAR_STALE: `prices reach ${cal.prices} but the session calendar only reaches ${cal.calendar} — filling now would skip that session and book it a day late`,
+        PRICE_DATA_STALE: `the calendar reaches ${cal.calendar} but prices only reach ${cal.prices} — the 19:30 pull has not landed, and marking would date a NAV to a session nothing is priced in`,
+        PRICE_COVERAGE_THIN: `${cal.prices} carries only ${cal.coverage} tickers against a recent norm of ${cal.typical} — the session is present but not complete`,
+      }[cal.blocked];
+      console.log(`RESOLVE  ${cal.blocked} — refusing to run.`);
+      console.log(`  ${why}`);
+      console.log('  Cron order is 19:30 prices, 20:05 IHSG, 20:10 resolve. Fix the upstream stage and re-run.');
     }
-    return { blocked: 'SESSION_CALENDAR_STALE', calendar: cal.calendar, prices: cal.prices, summary: [] };
+    return { blocked: cal.blocked, calendar: cal.calendar, prices: cal.prices, summary: [] };
   }
 
   const accounts = await loadAccounts(pool, strategyId);
@@ -689,22 +800,40 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
     if (acct.status === 'RETIRING') {
       const [openRows] = await pool.query(
         `SELECT * FROM virtual_positions WHERE account_id=? AND status='OPEN' ORDER BY entry_date`, [acct.id]);
-      const [[why]] = await pool.query(
-        `SELECT reject_reason r FROM virtual_orders WHERE account_id=? AND status='CANCELLED'
-          ORDER BY id DESC LIMIT 1`, [acct.id]);
-      const exitReason = `${why?.r === 'STRATEGY_CHANGE' ? 'STRATEGY' : 'POLICY'}_CHANGE_EXIT`;
+      const exitReason = `${acct.retirement_reason === 'STRATEGY_CHANGE' ? 'STRATEGY' : 'POLICY'}_CHANGE_EXIT`;
+
+      // THE EXIT CANNOT PRECEDE THE DECISION.
+      // This used to sell at the LATEST session's open. Retirement is detected
+      // by the nightly chain at about 20:10 WIB; that day's open was around
+      // 09:00, eleven hours earlier. The account was therefore recorded as
+      // having sold before anyone decided to retire it — not a conservative
+      // assumption but an impossible timestamp.
+      //
+      // The first session strictly after the decision is the earliest moment an
+      // order could genuinely have been placed. Until it exists, the positions
+      // stay open and the account stays RETIRING, which is the honest state.
+      const decidedOn = toDateStr(acct.retirement_session);
+      const exitDate = decidedOn ? dates.find(d => d > decidedOn) : null;
+      if (!exitDate) {
+        if (!quiet) {
+          console.log(`RESOLVE  ${acct.account_code} [RETIRING] waiting for the first session after ${decidedOn || 'retirement'}`);
+          console.log('         to unwind. Selling at an open that preceded the decision is not an exit.');
+        }
+        summary.push({ account: acct.account_code, status: acct.status, filled: 0, noFill: 0,
+                       rejected: 0, closed: 0, dataMissing: 0, dataPending: 0, blocked: 0,
+                       unwinding: true, awaitingSession: true });
+        continue;
+      }
 
       for (const p of openRows) {
-        // The first price at which it could actually have been sold: today's
-        // open. No price yet means it stays open and the account stays RETIRING.
-        const today = dates[dates.length - 1];
-        const px = bars.get(p.ticker)?.get(today)?.open;
+        const px = bars.get(p.ticker)?.get(exitDate)?.open;
         if (!(px > 0)) continue;
 
         const proceeds = vb.sellProceeds(p.quantity, px, cfg);
         const grossPnl = proceeds.gross - (Number(p.cost_basis) - Number(p.entry_fee));
         const netPnl = proceeds.net - Number(p.cost_basis);
         const eIdx = dateIdx.get(toDateStr(p.entry_date));
+        const xIdx = dateIdx.get(exitDate);
         const conn = await pool.getConnection();
         try {
           await conn.beginTransaction();
@@ -712,13 +841,14 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
             `UPDATE virtual_positions SET status='CLOSED', exit_date=?, exit_price=?, exit_reason=?, exit_fee=?,
                     proceeds=?, gross_pnl=?, net_pnl=?, return_pct=?, holding_bars=?
               WHERE id=? AND status='OPEN'`,
-            [today, proceeds.fillPrice, exitReason, proceeds.fee, proceeds.net, grossPnl, netPnl,
+            [exitDate, proceeds.fillPrice, exitReason, proceeds.fee, proceeds.net, grossPnl, netPnl,
              (netPnl / Number(p.cost_basis)) * 100,
-             eIdx === undefined ? null : dates.length - eIdx, p.id]);
+             (eIdx === undefined || xIdx === undefined) ? null : xIdx - eIdx + 1, p.id]);
           if (upd.affectedRows === 1) {
             await conn.query('UPDATE virtual_accounts SET cash_balance = cash_balance + ? WHERE id=?', [proceeds.net, acct.id]);
-            await logEvent(conn, acct.id, exitReason, today,
-              { positionId: p.id, ticker: p.ticker, detail: { price: proceeds.fillPrice, netPnl } });
+            await logEvent(conn, acct.id, exitReason, exitDate,
+              { positionId: p.id, ticker: p.ticker,
+                detail: { price: proceeds.fillPrice, netPnl, decidedOn, exitDate } });
           }
           await conn.commit();
           if (upd.affectedRows === 1) closed++;
@@ -918,10 +1048,20 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
         // walk resumes only once that session's data arrives.
         if (r.unpriced || r.dataIncomplete) {
           blocked.push({ position: p, date: d, reason: r.dataIncomplete ? 'DATA_INCOMPLETE_EXIT_BAR' : 'PRICE_HISTORY_BLOCKED' });
-          await logEvent(pool, acct.id, 'DATA_BLOCKED', d, {
-            positionId: p.id, ticker: p.ticker,
-            detail: { reason: r.dataIncomplete ? 'DATA_INCOMPLETE_EXIT_BAR' : 'PRICE_HISTORY_BLOCKED', barsHeld: i - eIdx + 1 },
-          });
+          // Once per (position, session, reason). Every nightly retry hits the
+          // same unreadable bar, so an unconditional insert filled the journal
+          // with identical rows and buried the events that mean something.
+          const reasonCode = r.dataIncomplete ? 'DATA_INCOMPLETE_EXIT_BAR' : 'PRICE_HISTORY_BLOCKED';
+          const [[seen]] = await pool.query(
+            `SELECT COUNT(*) n FROM virtual_trade_events
+              WHERE position_id=? AND event='DATA_BLOCKED' AND event_date=?
+                AND detail_json LIKE ?`, [p.id, d, `%${reasonCode}%`]);
+          if (!Number(seen.n)) {
+            await logEvent(pool, acct.id, 'DATA_BLOCKED', d, {
+              positionId: p.id, ticker: p.ticker,
+              detail: { reason: reasonCode, barsHeld: i - eIdx + 1 },
+            });
+          }
           break;
         }
         if (r.open) continue;
@@ -1249,7 +1389,15 @@ async function main() {
   try {
     await setup(pool);
     if (cmd === 'status') { await cmdStatus(pool); return; }
-    if (cmd === 'resolve') { await cmdResolve(pool, false); return; }
+    // A REFUSAL MUST LOOK LIKE A FAILURE TO THE CRON.
+    // cmdResolve returning { blocked } while the process exits 0 is precisely the
+    // shape this project keeps getting bitten by: the schedule sees success, the
+    // log holds the real story, and nobody reads the log.
+    if (cmd === 'resolve') {
+      const r = await cmdResolve(pool, false);
+      if (r?.blocked) process.exitCode = 1;
+      return;
+    }
     if (cmd === 'schedule') { await cmdSchedule(pool, false); return; }
     if (cmd === 'mark') { await cmdMark(pool, false); return; }
     if (cmd === 'reconcile') {
@@ -1258,7 +1406,15 @@ async function main() {
       return;
     }
     // Default: today's orders are settled BEFORE tomorrow's are created.
-    await cmdResolve(pool, false);
+    const resolved = await cmdResolve(pool, false);
+    if (resolved?.blocked) {
+      // And the chain STOPS. Scheduling tomorrow's orders and marking a NAV on
+      // data the resolve step just refused to touch would produce exactly the
+      // wrong record: new orders against a book that was never settled.
+      console.log(`\nHALTED after resolve (${resolved.blocked}). Nothing was scheduled or marked.`);
+      process.exitCode = 1;
+      return;
+    }
     await cmdSchedule(pool, false);
     await cmdMark(pool, false);
     const problems = await cmdReconcile(pool);
@@ -1268,7 +1424,7 @@ async function main() {
 
 module.exports = {
   setup, cmdSchedule, cmdResolve, cmdMark, cmdStatus, cmdReconcile,
-  retireSupersededAccounts, loadAccounts, loadBars, sessionCalendarState, migrateEnum,
+  retireSupersededAccounts, loadAccounts, loadBars, sessionCalendarState, migrateEnum, migrateColumn,
   ACCOUNTS, SOURCE_STRATEGY,
 };
 

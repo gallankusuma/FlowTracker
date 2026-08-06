@@ -99,6 +99,10 @@ async function ensureTable(pool) {
       strategy_id VARCHAR(64) NOT NULL,
       strategy_hash VARCHAR(32) NOT NULL,
       execution_policy_hash VARCHAR(32) NOT NULL,
+      -- The ALGORITHM's identity, deliberate and human-set, not the git commit.
+      -- The commit moves when a comment is edited; this moves when execution
+      -- BEHAVIOUR moves, which is the thing that makes records incomparable.
+      execution_engine_version INT NOT NULL DEFAULT 1,
       config_version INT NOT NULL,
       code_commit VARCHAR(40) NULL,
       starting_capital DECIMAL(20,2) NOT NULL,
@@ -107,8 +111,29 @@ async function ensureTable(pool) {
       frozen_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       -- One charter per identity, and the code below never updates a row. The
       -- gate cannot be softened after a bad month.
-      UNIQUE KEY uq_charter (account_code, strategy_id, strategy_hash, execution_policy_hash)
+      UNIQUE KEY uq_charter (account_code, strategy_id, strategy_hash, execution_policy_hash, execution_engine_version)
     )`);
+
+  // Existing installations predate the engine column and the wider key.
+  const [[col]] = await pool.query(
+    `SELECT COUNT(*) n FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_charter' AND COLUMN_NAME='execution_engine_version'`);
+  if (!Number(col.n)) {
+    await pool.query(
+      'ALTER TABLE virtual_charter ADD COLUMN execution_engine_version INT NOT NULL DEFAULT 1 AFTER execution_policy_hash');
+  }
+  const [[key]] = await pool.query(
+    `SELECT COUNT(*) n FROM information_schema.STATISTICS
+      WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_charter'
+        AND INDEX_NAME='uq_charter' AND COLUMN_NAME='execution_engine_version'`);
+  if (!Number(key.n)) {
+    const [[has]] = await pool.query(
+      `SELECT COUNT(*) n FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='virtual_charter' AND INDEX_NAME='uq_charter'`);
+    if (Number(has.n)) await pool.query('ALTER TABLE virtual_charter DROP INDEX uq_charter');
+    await pool.query(
+      'ALTER TABLE virtual_charter ADD UNIQUE KEY uq_charter (account_code, strategy_id, strategy_hash, execution_policy_hash, execution_engine_version)');
+  }
 }
 
 /**
@@ -119,7 +144,7 @@ async function ensureTable(pool) {
  * rather than quietly keeping either version.
  */
 async function freezeCharter(pool, {
-  accountCode, strategyId, strategyHash, executionPolicyHash,
+  accountCode, strategyId, strategyHash, executionPolicyHash, executionEngineVersion,
   configVersion, startingCapital, officialStartDate, exitPolicy,
 }) {
   await ensureTable(pool);
@@ -142,8 +167,9 @@ async function freezeCharter(pool, {
 
   const [existing] = await pool.query(
     `SELECT * FROM virtual_charter
-      WHERE account_code=? AND strategy_id=? AND strategy_hash=? AND execution_policy_hash=?`,
-    [accountCode, strategyId, strategyHash, executionPolicyHash]);
+      WHERE account_code=? AND strategy_id=? AND strategy_hash=? AND execution_policy_hash=?
+        AND execution_engine_version=?`,
+    [accountCode, strategyId, strategyHash, executionPolicyHash, executionEngineVersion]);
 
   if (existing.length) {
     const stored = JSON.parse(existing[0].gate_json);
@@ -153,16 +179,17 @@ async function freezeCharter(pool, {
 
   await pool.query(
     `INSERT INTO virtual_charter
-       (account_code, strategy_id, strategy_hash, execution_policy_hash, config_version,
-        code_commit, starting_capital, official_start_date, gate_json)
-     VALUES (?,?,?,?,?,?,?,?,?)`,
-    [accountCode, strategyId, strategyHash, executionPolicyHash, configVersion,
+       (account_code, strategy_id, strategy_hash, execution_policy_hash, execution_engine_version,
+        config_version, code_commit, starting_capital, official_start_date, gate_json)
+     VALUES (?,?,?,?,?,?,?,?,?,?)`,
+    [accountCode, strategyId, strategyHash, executionPolicyHash, executionEngineVersion, configVersion,
      commit, startingCapital, officialStartDate, JSON.stringify(gate)]);
 
   const [[row]] = await pool.query(
     `SELECT * FROM virtual_charter
-      WHERE account_code=? AND strategy_id=? AND strategy_hash=? AND execution_policy_hash=?`,
-    [accountCode, strategyId, strategyHash, executionPolicyHash]);
+      WHERE account_code=? AND strategy_id=? AND strategy_hash=? AND execution_policy_hash=?
+        AND execution_engine_version=?`,
+    [accountCode, strategyId, strategyHash, executionPolicyHash, executionEngineVersion]);
   return { frozen: true, charter: row };
 }
 
