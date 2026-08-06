@@ -317,15 +317,23 @@ async function checkForwardStages(pool) {
    re-running one safe to automate. */
 async function checkVirtualPortfolio(pool) {
   line('\nVirtual portfolio — ledger marked, and does it still reconcile');
+  // PRODUCTION ONLY. This read every ACTIVE account and a GLOBAL MAX(mark_date),
+  // so an experimental account with a fresher mark could make the watchdog
+  // report "already marked" while the official accounts were not — the watchdog
+  // and the burn-in contradicting each other about the same night.
+  const vpScope = require('./virtual_portfolio');
   const [accounts] = await pool.query(
-    `SELECT id, account_code FROM virtual_accounts WHERE status='ACTIVE'`).catch(() => [[]]);
-  if (!accounts.length) { line('  no active accounts — nothing to check'); return; }
+    `SELECT id, account_code FROM virtual_accounts WHERE strategy_id=? AND status='ACTIVE'`,
+    [vpScope.SOURCE_STRATEGY]).catch(() => [[]]);
+  if (!accounts.length) { line('  no active official accounts — nothing to check'); return; }
+  const acctIds = accounts.map(a => a.id);
 
   const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
   const priceDate = iso(px.d);
   const [[cal]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
   const sessionDate = iso(cal?.d);
-  const [[nav]] = await pool.query('SELECT MAX(mark_date) d FROM virtual_nav');
+  const [[nav]] = await pool.query(
+    'SELECT MAX(mark_date) d FROM virtual_nav WHERE account_id IN (?)', [acctIds]);
   const navDate = iso(nav?.d);
   line(`  latest NAV mark ${navDate || 'none'} · prices ${priceDate} · session ${sessionDate}`);
 
@@ -358,7 +366,8 @@ async function checkVirtualPortfolio(pool) {
         return vp.cmdMark(pool, true);
       },
       verify: async () => {
-        const [[n]] = await pool.query('SELECT MAX(mark_date) d FROM virtual_nav');
+        const [[n]] = await pool.query(
+          'SELECT MAX(mark_date) d FROM virtual_nav WHERE account_id IN (?)', [acctIds]);
         return !(iso(n.d) >= priceDate);
       },
     });
@@ -515,9 +524,13 @@ async function recordBurnIn(pool) {
   // Excluding the dates already proven not to be sessions, the same subtraction
   // checkIhsgGaps makes. Without it this reported IDX public holidays as missing
   // index bars and failed the burn-in every night, for a fault no refetch can fix.
+  // HARD signatures only for the calendar exclusion. Excluding NO_INDEX_BAR
+  // dates here would hide a real index gap behind the very absence that defines
+  // it — the same circularity the check order above exists to break.
+  const hardPhantom = (await sh.phantomSessions(pool, { useIndexCalendar: false })).map(p => p.date);
   const allPhantom = (await sh.phantomSessions(pool)).map(p => p.date);
   checks.calendarCurrent = !(await sh.missingSessions(pool,
-    { table: 'idx_ihsg_history', col: 'date', exclude: allPhantom })).missing.length;
+    { table: 'idx_ihsg_history', col: 'date', exclude: hardPhantom })).missing.length;
   // A phantom row is a burn-in failure only when the INGEST produced one
   // recently. Scoring the whole history here would have held the streak hostage
   // to years-old data debt: the count could never reach ten while a single 2017
@@ -547,20 +560,29 @@ async function recordBurnIn(pool) {
   // Scoped to the accounts that are actually live. Counting every marked
   // account_id compared 4 marks (two of them retired earlier the same evening)
   // against 2 live accounts, and failed for no real reason.
-  const liveIds = accts.map(a => a.id);
-  const [[marked]] = liveIds.length
+  // One list, declared once: these are the OFFICIAL accounts and every scoped
+  // query below uses it. (It was `liveIds` here and `officialIds` further down,
+  // with the second declared AFTER its first use -- a temporal dead zone that
+  // would have thrown the moment this ran.)
+  const officialIds = accts.map(a => a.id);
+  const [[marked]] = officialIds.length
     ? await pool.query(
         `SELECT COUNT(DISTINCT account_id) n FROM virtual_nav WHERE mark_date=? AND account_id IN (?)`,
-        [sessionDate, liveIds])
+        [sessionDate, officialIds])
     : [[{ n: 0 }]];
   checks.navMarkedToday = accts.length > 0 && Number(marked.n) === accts.length;
 
-  const [[navOk]] = await pool.query(
-    `SELECT COUNT(*) bad FROM virtual_nav
-      WHERE mark_date = ? AND ABS(total_nav - (cash_value + market_value)) > 1`, [sessionDate]);
+  // SCOPED. The earlier comment here claimed this was "deliberately unscoped so
+  // a retired account's NAV identity holds too" — which was wrong reasoning: a
+  // broken test or experimental account could fail the OFFICIAL burn-in.
+  const [[navOk]] = officialIds.length
+    ? await pool.query(
+        `SELECT COUNT(*) bad FROM virtual_nav
+          WHERE mark_date = ? AND account_id IN (?)
+            AND ABS(total_nav - (cash_value + market_value)) > 1`, [sessionDate, officialIds])
+    : [[{ bad: 0 }]];
   checks.navIdentityHolds = Number(navOk.bad) === 0;
 
-  const officialIds = accts.map(a => a.id);
   const [[dupes]] = officialIds.length
     ? await pool.query(
         `SELECT COUNT(*) n FROM (
@@ -630,10 +652,19 @@ async function main() {
     line('='.repeat(72));
 
     // Order matters: repair the index series before anything that reads it.
-    // Phantom dates first: the gap check cannot say which sessions are missing
-    // until it knows which dates were never sessions.
+    // THE CIRCULARITY THIS ORDER BREAKS.
+    // phantomSessions can label a date NO_INDEX_BAR purely because the IHSG
+    // table lacks it — but that is exactly what a real index gap looks like. Feed
+    // those dates to the gap detector as exclusions and a genuine missing session
+    // is classified as "never a session", excluded from repair, and never fixed.
+    // The evidence for the exclusion was the fault itself.
+    //
+    // So: exclude only the HARD signatures (weekend, zero-volume-flat,
+    // duplicate) while repairing gaps; classify NO_INDEX_BAR afterwards, once
+    // the index series has had its chance to be complete.
+    const hardPhantom = (await sh.phantomSessions(pool, { useIndexCalendar: false })).map(p => p.date);
+    await checkIhsgGaps(pool, hardPhantom);
     const phantomDates = await checkPhantomSessions(pool);
-    await checkIhsgGaps(pool, phantomDates);
     await checkPriceGaps(pool);
     await checkFreshness(pool);
     await checkForwardStages(pool);

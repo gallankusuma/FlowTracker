@@ -196,6 +196,53 @@ async function build(pool, seriesDates) {
         'the live series closes changed — this test must be a no-op against production data');
     });
 
+    console.log('\nwatchdog — the circular classification');
+
+    await t('A REAL INDEX GAP IS NOT EXCUSED AS "never a session"', async () => {
+      // The circularity: a date missing from idx_ihsg_history gets the
+      // NO_INDEX_BAR signature, is therefore treated as a phantom, is excluded
+      // from the gap detector, and so is never repaired. The evidence for the
+      // exclusion IS the fault. Hard signatures only when computing exclusions.
+      const [[latest]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+      const victim = (() => {
+        const d = new Date(latest.d);
+        // A weekday well inside the series, with prices present and an index bar.
+        d.setUTCDate(d.getUTCDate() - 3);
+        while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d.setUTCDate(d.getUTCDate() - 1);
+        return d.toISOString().slice(0, 10);
+      })();
+      const [[row]] = await pool.query(
+        'SELECT * FROM idx_ihsg_history WHERE date=?', [victim]);
+      if (!row) { console.log(`      (no index bar on ${victim}; nothing to remove)`); return; }
+      const [[px]] = await pool.query(
+        'SELECT COUNT(*) n FROM idx_stock_prices WHERE date=?', [victim]);
+      assert.ok(Number(px.n) > 0, `need prices on ${victim} for this to be a real session`);
+
+      await pool.query('DELETE FROM idx_ihsg_history WHERE date=?', [victim]);
+      try {
+        const hard = await sh.phantomSessions(pool, { useIndexCalendar: false });
+        const soft = await sh.phantomSessions(pool);
+
+        assert.ok(!hard.some(p => p.date === victim),
+          `${victim} was called a phantom by a HARD signature; the exclusion list would hide it`);
+        assert.ok(soft.some(p => p.date === victim && p.signatures.includes('NO_INDEX_BAR')),
+          'sanity: with the index calendar on, it IS labelled NO_INDEX_BAR');
+
+        // And with the hard-only exclusion, the gap detector still sees it.
+        const gaps = await sh.missingSessions(pool, {
+          table: 'idx_ihsg_history', col: 'date', exclude: hard.map(p => p.date) });
+        assert.ok(gaps.missing.includes(victim),
+          'the real gap must remain visible to the repair path');
+      } finally {
+        await pool.query(
+          `INSERT INTO idx_ihsg_history (date, open_price, high_price, low_price, close_price, volume, change_pct)
+           VALUES (?,?,?,?,?,?,?)`,
+          [victim, row.open_price, row.high_price, row.low_price, row.close_price, row.volume, row.change_pct]);
+        const [[back]] = await pool.query('SELECT COUNT(*) n FROM idx_ihsg_history WHERE date=?', [victim]);
+        assert.strictEqual(Number(back.n), 1, `FAILED TO RESTORE the index bar for ${victim}`);
+      }
+    });
+
   } catch (e) {
     fail++;
     console.log(`\n  FAIL  the run itself threw\n          ${e.stack}`);

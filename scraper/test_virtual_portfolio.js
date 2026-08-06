@@ -898,6 +898,78 @@ async function cashByAccount(pool) {
       }
     });
 
+    console.log('\nvirtual portfolio — every failure must surface as a FAILED stage');
+
+    await t('A SCHEDULE ROLLBACK MAKES THE STAGE FAILED, not OK', async () => {
+      // Eight of ten orders frozen and a stage reading OK means the portfolio
+      // received part of its target book while the checkpoint said the session
+      // was complete.
+      //
+      // Forced with DATA, never by altering a shared table. The first attempt
+      // narrowed virtual_trade_events.ticker to VARCHAR(1); the ALTER itself
+      // failed on existing rows, and briefly reshaping a production table to
+      // provoke a rollback is a worse risk than the bug being tested. A ticker
+      // longer than virtual_orders.ticker allows makes the INSERT throw inside
+      // the transaction, which is exactly the path under test.
+      await vp.cmdResolve(pool, true, OPTS);
+      const d = dates[dates.length - 1];
+      await pool.query('DELETE FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?', [STRATEGY, d]);
+      await pool.query(
+        `INSERT INTO ft_strategy_plan (strategy_id, as_of_date, run_mode, generated_at, strategy_hash,
+                                       data_snapshot_hash, code_commit, exposure, reason, regime_label,
+                                       eligible, vetoed, target_json, status)
+         VALUES (?,?,'LIVE',NOW(),?,?,?,1.00,'ROLLBACK TEST','INVESTED',1,0,?,'PLANNED')`,
+        [STRATEGY, d, PLAN_HASH, 'testsnapshot0001', 'testcommit', JSON.stringify(['ZZTOOLONGTICKER'])]);
+      let r;
+      try {
+        r = await vp.cmdSchedule(pool, true, OPTS);
+      } finally {
+        await pool.query('DELETE FROM ft_strategy_plan WHERE strategy_id=? AND as_of_date=?', [STRATEGY, d]);
+      }
+      assert.strictEqual(r.failed, true, `expected a failed schedule, got ${JSON.stringify(r)}`);
+      assert.ok(r.failures.length >= 1, 'the rolled-back orders must be named');
+      const gate = await vp.stageOk(pool, await vp.currentSession(pool), 'schedule', STRATEGY);
+      assert.strictEqual(gate.ok, false, 'the schedule stage must read FAILED');
+      assert.ok(/FAILED/.test(gate.reason), gate.reason);
+    });
+
+    await t('A MARK ROLLBACK MAKES THE STAGE FAILED, not OK', async () => {
+      await vp.cmdResolve(pool, true, OPTS);
+      // Again with DATA. An unpriceable holding is carried at cost, so a
+      // cost_basis near the DECIMAL(20,2) ceiling makes total_nav overflow when
+      // the NAV row is inserted — the transaction throws and rolls back, without
+      // touching the schema of a live table.
+      const acct = (await q(pool,
+        `SELECT id FROM virtual_accounts WHERE strategy_id=? AND exit_policy='POSITION'`, [STRATEGY]))[0];
+      const [ins] = await pool.query(
+        `INSERT INTO virtual_positions
+           (account_id, order_id, ticker, quantity, entry_date, entry_price, cost_basis, entry_fee, status)
+         VALUES (?, 0, 'ZZNOPRICE', 100, ?, 1, 999999999999999999, 0, 'OPEN')`,
+        [acct.id, dates[dates.length - 1]]);
+      let out;
+      try {
+        out = await vp.cmdMark(pool, true, OPTS);
+      } finally {
+        await pool.query('DELETE FROM virtual_positions WHERE id=?', [ins.insertId]);
+      }
+      assert.strictEqual(out.failed, true, `expected a failed mark, got ${JSON.stringify(out)}`);
+      assert.ok(out.failures.length >= 1, 'the failing account must be named');
+      const gate = await vp.stageOk(pool, await vp.currentSession(pool), 'mark', STRATEGY);
+      assert.strictEqual(gate.ok, false, 'the mark stage must read FAILED');
+      // Restore a clean state for anything after this.
+      await vp.cmdResolve(pool, true, OPTS);
+      await vp.cmdMark(pool, true, OPTS);
+    });
+
+    await t('a resolve that fails reports it in its RETURN VALUE, not only the stage', async () => {
+      // The CLI checks the return value; a bare array has no `failed`, so a
+      // FAILED stage blocked everything downstream while the process exited 0.
+      const r = await vp.cmdResolve(pool, true, OPTS);
+      assert.ok('failed' in r, 'cmdResolve must report failure in its return shape');
+      assert.strictEqual(r.failed, false, 'this run is healthy');
+      assert.ok(Array.isArray(r.failures));
+    });
+
     console.log('\nvirtual portfolio — a changed execution contract');
 
     // LAST on purpose. This inserts an extra account row, and an extra row is

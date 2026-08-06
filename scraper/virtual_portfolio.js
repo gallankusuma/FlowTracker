@@ -673,6 +673,9 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY, force = 
   const target = JSON.parse(plan.target_json || '[]');
   const signalDate = toDateStr(plan.as_of_date);
   let scheduled = 0, skipped = 0, held = 0, mismatched = 0;
+  // Same lesson as resolve: a rolled-back order that only reaches stderr leaves
+  // the stage OK, so eight of ten orders frozen reads as a complete target book.
+  const rollbacks = [];
 
   for (const acct of accounts) {
     if (acct.strategy_hash !== 'UNSET' && acct.strategy_hash !== plan.strategy_hash) {
@@ -718,6 +721,7 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY, force = 
         }
       } catch (e) {
         await conn.rollback();
+        rollbacks.push(`${acct.account_code}/${ticker}: ${e.message}`);
         console.error(`SCHEDULE  ${ticker} rolled back: ${e.message}`);
       } finally { conn.release(); }
     }
@@ -728,6 +732,16 @@ async function cmdSchedule(pool, quiet, { strategyId = SOURCE_STRATEGY, force = 
     console.log(`  ${scheduled} scheduled, ${skipped} already existed, ${held} already held, ${mismatched} account(s) on a different strategy hash`);
     if (retiring) console.log(`  ${retiring} retiring account(s) took no new orders, by design`);
     if (!target.length) console.log('  the book is empty, so there is nothing to schedule — that is a decision, not a failure');
+  }
+  if (rollbacks.length) {
+    await recordStage(pool, session, 'schedule', 'FAILED',
+      `${rollbacks.length} transaction(s) rolled back`, strategyId);
+    if (!quiet) {
+      console.log(`SCHEDULE  stage FAILED — ${rollbacks.length} order(s) rolled back.`);
+      for (const r of rollbacks.slice(0, 5)) console.log(`  ${r}`);
+      console.log('  The account received only part of its target book.');
+    }
+    return { failed: true, failures: rollbacks, scheduled, skipped, held, mismatched };
   }
   await recordStage(pool, session, 'schedule', 'OK', null, strategyId);
   return { scheduled, skipped, held, mismatched };
@@ -855,15 +869,39 @@ async function ensureStageTable(pool) {
  * separate chains and must not unlock each other's stages.
  */
 async function cycleIdentity(pool, strategyId) {
-  const [rows] = await pool.query(
-    `SELECT account_code, strategy_hash, execution_policy_hash, execution_engine_version
-       FROM virtual_accounts WHERE strategy_id=? AND status IN ('ACTIVE','RETIRING')
-      ORDER BY account_code`, [strategyId]);
+  // STATUS IS LIFECYCLE, NOT IDENTITY, and mixing them broke the checkpoint.
+  //
+  // The first version hashed the accounts that were ACTIVE or RETIRING, so the
+  // identity moved DURING a cycle: resolve at 20:10 saw active+retiring,
+  // finished unwinding, and by 20:30 setup() had flipped that account to CLOSED
+  // — schedule then computed a different identity, found no resolve checkpoint
+  // under it, and refused. Fail-closed, but it costs a night's scheduling every
+  // time a retirement completes. Restricting to ACTIVE only moved the problem to
+  // the other end: flipping ACTIVE -> RETIRING changed it just as readily.
+  //
+  // So the identity is derived from what the EXPERIMENT is, not from where each
+  // account happens to be in its lifecycle: the strategy, the engine version,
+  // the strategy hash, and the roster of account codes with their exit policies.
+  // Those change when the experiment changes and hold still while it runs.
+  // NOT the strategy hash. It is read from the latest plan, so it moves when a
+  // new plan lands — which made the identity shift for a reason that has nothing
+  // to do with which cycle is running, and blocked schedule before it could even
+  // report the hash mismatch it exists to catch. Per-account strategy_hash
+  // isolation is enforced in cmdSchedule, where it belongs.
+  let roster;
+  if (strategyId === SOURCE_STRATEGY) {
+    roster = ACCOUNTS.map(a => [a.code, a.exitPolicy, vb.executionPolicyHash({}, a.exitPolicy)]);
+  } else {
+    // Any other strategy (the integration suite, a future second strategy) has
+    // no code-level roster, so use every account code it has ever opened —
+    // status-independent for the same reason.
+    const [rows] = await pool.query(
+      `SELECT DISTINCT account_code, exit_policy FROM virtual_accounts
+        WHERE strategy_id=? ORDER BY account_code`, [strategyId]);
+    roster = rows.map(r => [r.account_code, r.exit_policy, vb.executionPolicyHash({}, r.exit_policy)]);
+  }
   return require('crypto').createHash('sha256')
-    .update(JSON.stringify({
-      strategyId, engine: vb.EXECUTION_ENGINE_VERSION,
-      accounts: rows.map(r => [r.account_code, r.strategy_hash, r.execution_policy_hash, r.execution_engine_version]),
-    }))
+    .update(JSON.stringify({ strategyId, engine: vb.EXECUTION_ENGINE_VERSION, roster }))
     .digest('hex').slice(0, 16);
 }
 
@@ -1271,6 +1309,8 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
     await recordStage(pool, cal.calendar, 'resolve', 'OK', null, strategyId);
   }
 
+  const resolveFailed = rollbacks.length > 0 || anyBlocked;
+
   if (!quiet) for (const s of summary) {
     console.log(`RESOLVE  ${s.account.padEnd(20)} filled ${s.filled}, no-fill ${s.noFill}, rejected ${s.rejected}, closed ${s.closed}` +
       (s.status === 'RETIRING' ? '   [RETIRING - exits only]' : ''));
@@ -1283,6 +1323,13 @@ async function cmdResolve(pool, quiet, { strategyId = SOURCE_STRATEGY } = {}) {
       console.log('            not read past a bar it cannot see and guess which level was hit first.');
     }
   }
+  // A SHAPE THE CALLER CAN ACT ON. This returned a bare array, so the CLI's
+  // `if (r?.blocked)` could never see a FAILED stage: the checkpoint blocked
+  // everything downstream while the resolve process itself exited 0 and the
+  // cron recorded a success.
+  summary.blocked = null;
+  summary.failed = resolveFailed;
+  summary.failures = rollbacks;
   return summary;
 }
 
@@ -1306,6 +1353,7 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY, force = fals
   const { bars, dates } = await loadBars(pool, 30);
   const today = dates[dates.length - 1];
   const out = [];
+  const markFailures = [];
 
   for (const acct of accounts) {
     // ONE SNAPSHOT, INSIDE THE TRANSACTION, WITH THE ACCOUNT LOCKED.
@@ -1362,6 +1410,7 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY, force = fals
       await conn.commit();
     } catch (e) {
       await conn.rollback();
+      markFailures.push(`${acct.account_code}: ${e.message}`);
       console.error(`MARK  ${acct.account_code} rolled back: ${e.message}`);
       continue;
     } finally { conn.release(); }
@@ -1370,6 +1419,22 @@ async function cmdMark(pool, quiet, { strategyId = SOURCE_STRATEGY, force = fals
                realized: realizedPnl, unrealized, startingCash });
   }
 
+  // EVERY account must be marked, not most of them. One account failing while
+  // the stage says OK is the checkpoint giving false evidence about the very
+  // thing it exists to attest.
+  if (markFailures.length || out.length !== accounts.length) {
+    const why = markFailures.length
+      ? `${markFailures.length} account(s) rolled back`
+      : `${out.length} of ${accounts.length} accounts marked`;
+    await recordStage(pool, session, 'mark', 'FAILED', why.slice(0, 64), strategyId);
+    if (!quiet) {
+      console.log(`MARK  stage FAILED — ${why}.`);
+      for (const m of markFailures.slice(0, 5)) console.log(`  ${m}`);
+    }
+    out.failed = true;
+    out.failures = markFailures;
+    return out;
+  }
   await recordStage(pool, session, 'mark', 'OK', null, strategyId);
 
   if (!quiet) for (const o of out) {
@@ -1576,19 +1641,19 @@ async function main() {
     // log holds the real story, and nobody reads the log.
     if (cmd === 'resolve') {
       const r = await cmdResolve(pool, false);
-      if (r?.blocked) process.exitCode = 1;
+      if (r?.blocked || r?.failed) process.exitCode = 1;
       return;
     }
     // Each of these is its own cron process, so each must report its own
     // refusal. An exit code is the only thing a schedule entry can see.
     if (cmd === 'schedule') {
       const r = await cmdSchedule(pool, false);
-      if (r?.blocked) process.exitCode = 1;
+      if (r?.blocked || r?.failed) process.exitCode = 1;
       return;
     }
     if (cmd === 'mark') {
       const r = await cmdMark(pool, false);
-      if (!Array.isArray(r)) process.exitCode = 1;
+      if (!Array.isArray(r) || r.failed) process.exitCode = 1;
       else if (!r.length) {
         // An empty result means either no accounts or a refusal; the refusal
         // path already recorded BLOCKED, so ask the checkpoint which it was.
@@ -1604,16 +1669,17 @@ async function main() {
     }
     // Default: today's orders are settled BEFORE tomorrow's are created.
     const resolved = await cmdResolve(pool, false);
-    if (resolved?.blocked) {
+    if (resolved?.blocked || resolved?.failed) {
       // And the chain STOPS. Scheduling tomorrow's orders and marking a NAV on
       // data the resolve step just refused to touch would produce exactly the
       // wrong record: new orders against a book that was never settled.
-      console.log(`\nHALTED after resolve (${resolved.blocked}). Nothing was scheduled or marked.`);
+      console.log(`\nHALTED after resolve (${resolved.blocked || 'stage FAILED'}). Nothing was scheduled or marked.`);
       process.exitCode = 1;
       return;
     }
-    await cmdSchedule(pool, false);
-    await cmdMark(pool, false);
+    const sched = await cmdSchedule(pool, false);
+    const marked = await cmdMark(pool, false);
+    if (sched?.blocked || sched?.failed || marked?.failed) process.exitCode = 1;
     const problems = await cmdReconcile(pool);
     if (problems.length) process.exitCode = 1;
   } finally { await pool.end(); }

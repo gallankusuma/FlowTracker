@@ -3032,12 +3032,27 @@ app.get('/api/virtual-portfolio', async (req, res) => {
     const includeClosed = req.query.all === '1';
     // RETIRING accounts are always listed: they still hold positions and still
     // mark, so hiding them would repeat the bug that made them necessary.
-    const [accounts] = await pool.query(
-      `SELECT id, account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash,
-              starting_cash, cash_balance, total_nav, status, retired_at, created_at,
-              performance_eligible, data_blocked_json
-         FROM virtual_accounts ${includeClosed ? '' : "WHERE status IN ('ACTIVE','RETIRING')"}
-        ORDER BY status, account_code`);
+    // THE OFFICIAL ACCOUNTS BY DEFAULT. The Trust Center and the burn-in were
+    // already scoped to the production identity while this list was not, so one
+    // response could show production health beside experimental account cards —
+    // three panels describing three different things. `?all=1` still shows
+    // everything, for debugging.
+    const vpScope = require('./virtual_portfolio');
+    const officialCodes = vpScope.ACCOUNTS.map(a => a.code);
+    const [accounts] = includeClosed
+      ? await pool.query(
+          `SELECT id, account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash,
+                  starting_cash, cash_balance, total_nav, status, retired_at, created_at,
+                  performance_eligible, data_blocked_json
+             FROM virtual_accounts ORDER BY status, account_code`)
+      : await pool.query(
+          `SELECT id, account_code, strategy_id, strategy_hash, exit_policy, execution_policy_hash,
+                  starting_cash, cash_balance, total_nav, status, retired_at, created_at,
+                  performance_eligible, data_blocked_json
+             FROM virtual_accounts
+            WHERE strategy_id = ? AND account_code IN (?) AND status IN ('ACTIVE','RETIRING')
+            ORDER BY status, account_code`,
+          [vpScope.SOURCE_STRATEGY, officialCodes]);
 
     // The burn-in streak and the frozen charters travel with the payload. A
     // dashboard that shows a NAV without showing whether the engine is
