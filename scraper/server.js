@@ -3075,10 +3075,20 @@ app.get('/api/virtual-portfolio', async (req, res) => {
           `SELECT session_date, passed, failures_json FROM virtual_burnin
             WHERE identity_hash=? ORDER BY session_date DESC LIMIT 30`, [activeIdentity]).catch(() => [[]])
       : [[]];
-    let streak = 0;
-    for (const r of burnRows) { if (!Number(r.passed)) break; streak++; }
+    // THE SHARED HELPER, not a second loop. The dashboard and the watchdog
+    // computing the same number independently is how they end up disagreeing
+    // about whether the record is valid — and this one walks the exchange
+    // calendar, so a session nobody observed stops the count.
+    const burninMod = require('./modules/burnin');
+    let streak = 0, stoppedBy = null;
+    if (activeIdentity) {
+      try {
+        const r = await burninMod.computeStreak(pool, activeIdentity);
+        streak = r.streak; stoppedBy = r.stoppedBy;
+      } catch { /* leave 0 */ }
+    }
     const burnIn = {
-      streak, target: 10, identity: activeIdentity,
+      streak, target: 10, stoppedBy, identity: activeIdentity,
       latest: burnRows[0] ? {
         date: toDateStr(burnRows[0].session_date), passed: !!Number(burnRows[0].passed),
         failures: burnRows[0].failures_json ? JSON.parse(burnRows[0].failures_json) : [],

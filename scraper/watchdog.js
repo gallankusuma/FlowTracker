@@ -376,8 +376,13 @@ async function checkVirtualPortfolio(pool) {
         // The repair must respect the resolver's own refusal. Marking straight
         // after a blocked resolve would stamp a NAV on data the engine just
         // declined to touch — the watchdog undoing a guard it exists to enforce.
-        if (resolved?.blocked) {
-          throw new Error(`virtual resolve is blocked (${resolved.blocked}); marking would value an unsettled book`);
+        // `failed` as well as `blocked`. cmdMark's own gate already refuses when
+        // the resolve checkpoint is not OK, so this could not have produced a
+        // false NAV — but the watchdog reporting "repair ran" for a session that
+        // never settled is the wrong story about the same night.
+        if (resolved?.blocked || resolved?.failed) {
+          throw new Error(
+            `virtual resolve did not settle: ${resolved.blocked || resolved.failures?.join('; ') || 'FAILED'}`);
         }
         return vp.cmdMark(pool, true);
       },
@@ -628,12 +633,16 @@ async function recordBurnIn(pool) {
   // survive one part of it not running.
   const cycleHash = await vp0.cycleIdentity(pool, vp0.SOURCE_STRATEGY);
   const [stageRows] = await pool.query(
-    `SELECT stage, status FROM virtual_cycle_stage WHERE session_date=? AND identity_hash=?`,
-    [sessionDate, cycleHash]).catch(() => [[]]);
-  const stageMap = Object.fromEntries(stageRows.map(r => [r.stage, r.status]));
-  checks.resolveStageOk = stageMap.resolve === 'OK';
-  checks.scheduleStageOk = stageMap.schedule === 'OK';
-  checks.markStageOk = stageMap.mark === 'OK';
+    `SELECT stage, status, ever_failed, first_failure_reason FROM virtual_cycle_stage
+      WHERE session_date=? AND identity_hash=?`, [sessionDate, cycleHash]).catch(() => [[]]);
+  const stageMap = Object.fromEntries(stageRows.map(r => [r.stage, r]));
+  // OK **and never failed**. A retry that fixed the pipeline is allowed to let
+  // the chain continue; it is not allowed to make the SESSION clean. Otherwise
+  // "any failure restarts the count" is only true until someone re-runs it.
+  const stageClean = st => stageMap[st] && stageMap[st].status === 'OK' && Number(stageMap[st].ever_failed) === 0;
+  checks.resolveStageOk = stageClean('resolve');
+  checks.scheduleStageOk = stageClean('schedule');
+  checks.markStageOk = stageClean('mark');
 
   let reconcileProblems = [];
   try {
@@ -648,40 +657,47 @@ async function recordBurnIn(pool) {
   // Name the actual stage status, not just which check failed: "scheduleStageOk"
   // alone does not say whether it was BLOCKED, FAILED or never run.
   for (const st of ['resolve', 'schedule', 'mark']) {
-    if (stageMap[st] !== 'OK') failures.push(`${st} stage ${stageMap[st] || 'NOT_RUN'}`);
+    const r = stageMap[st];
+    if (!r) { failures.push(`${st} stage NOT_RUN`); continue; }
+    if (r.status !== 'OK') { failures.push(`${st} stage ${r.status}`); continue; }
+    if (Number(r.ever_failed) === 1) {
+      failures.push(`${st} stage recovered but FAILED earlier this session (${r.first_failure_reason || 'no reason recorded'})`);
+    }
   }
   if (reconcileProblems.length) failures.push(...reconcileProblems.map(p => `reconcile: ${p}`));
   const passed = failures.length === 0;
 
-  await pool.query(
-    `INSERT INTO virtual_burnin (session_date, identity_hash, engine_version, passed, checks_json, failures_json)
-     VALUES (?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE passed=VALUES(passed), checks_json=VALUES(checks_json), failures_json=VALUES(failures_json)`,
-    [sessionDate, identityHash, vb.EXECUTION_ENGINE_VERSION, passed ? 1 : 0,
-     JSON.stringify(checks), failures.length ? JSON.stringify(failures) : null]);
+  // Append-only attempt, then the session's verdict as the WORST attempt. A
+  // repaired re-run can no longer promote a failed session to clean.
+  const burnin = require('./modules/burnin');
+  const rec = await burnin.recordAttempt(pool, {
+    sessionDate, identityHash, engineVersion: vb.EXECUTION_ENGINE_VERSION,
+    passed, checks, failures,
+  });
 
-  // Walk backwards. The streak is DERIVED, never stored — a stored counter can
-  // drift from the rows it claims to summarise, and only in the flattering
-  // direction.
-  const [rows] = await pool.query(
-    'SELECT session_date, passed FROM virtual_burnin WHERE identity_hash=? ORDER BY session_date DESC',
-    [identityHash]);
-  let streak = 0;
-  for (const r of rows) { if (!Number(r.passed)) break; streak++; }
+  // ONE definition, shared with the dashboard. It walks the exchange calendar,
+  // so a session with no verdict stops the count just as a failed one does.
+  const { streak, stoppedBy } = await burnin.computeStreak(pool, identityHash, sessionDate);
 
   line('\nBurn-in');
-  line(`  session ${sessionDate}: ${passed ? 'CLEAN' : 'FAILED'}`);
+  line(`  session ${sessionDate}: attempt ${passed ? 'CLEAN' : 'FAILED'}, ` +
+       `session verdict ${rec.verdict ? 'CLEAN' : 'FAILED'} (${rec.attempts} attempt(s))`);
+  if (passed && !rec.verdict) {
+    line('  this attempt was clean but the session already failed — a session that has');
+    line('  failed is never promoted, however well a later run goes.');
+  }
   for (const [k, v] of Object.entries(checks)) line(`    ${v ? 'ok  ' : '**  '}${k}`);
   if (failures.length) for (const f of failures) line(`    -> ${f}`);
-  line(`  consecutive clean sessions: ${streak} of 10`);
-  if (!passed) {
+  line(`  consecutive clean sessions: ${streak} of 10   (stopped by ${stoppedBy})`);
+  if (!rec.verdict) {
     line('  the count RESTARTS. Ten clean sessions means ten in a row, not ten in total.');
-    report({ level: 'FAIL', what: `burn-in session ${sessionDate} failed`, detail: failures.join('; ') });
+    report({ level: 'FAIL', what: `burn-in session ${sessionDate} failed`,
+             detail: (rec.allFailures.length ? rec.allFailures : failures).join('; ') });
   } else if (streak >= 10) {
     line('  TEN CONSECUTIVE CLEAN SESSIONS. Operationally stable.');
     line('  This says nothing whatsoever about whether the strategy makes money.');
   }
-  return { sessionDate, identityHash, passed, streak, checks, failures };
+  return { sessionDate, identityHash, passed, verdict: rec.verdict, streak, stoppedBy, checks, failures };
 }
 
 async function main() {

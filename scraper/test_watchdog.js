@@ -253,6 +253,107 @@ async function build(pool, seriesDates) {
       assert.strictEqual(Number(back.n), 1, `the index bar for ${victim} did not survive the rollback`);
     });
 
+    console.log('\nwatchdog — a failure cannot be retried away');
+
+    const burnin = require('./modules/burnin');
+    const vp = require('./virtual_portfolio');
+    const ID = 'zztestidentity01';
+
+    await t('A SESSION THAT FAILED IS NEVER PROMOTED BY A LATER CLEAN RUN', async () => {
+      // The verdict row was upserted, so a second watchdog run on a repaired
+      // system rewrote passed=0 to passed=1 and the session joined the streak.
+      // The burn-in's own rule is that any failure in a session breaks it.
+      const [[s]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+      const day = burnin.iso(s.d);
+      await pool.query('DELETE FROM virtual_burnin_attempt WHERE identity_hash=?', [ID]).catch(() => {});
+      await pool.query('DELETE FROM virtual_burnin WHERE identity_hash=?', [ID]);
+      try {
+        const first = await burnin.recordAttempt(pool, {
+          sessionDate: day, identityHash: ID, engineVersion: 9,
+          passed: false, checks: { x: false }, failures: ['x'],
+        });
+        assert.strictEqual(first.verdict, false);
+
+        const second = await burnin.recordAttempt(pool, {
+          sessionDate: day, identityHash: ID, engineVersion: 9,
+          passed: true, checks: { x: true }, failures: [],
+        });
+        assert.strictEqual(second.verdict, false,
+          'a repaired re-run promoted a failed session to clean');
+        assert.strictEqual(second.attempts, 2, 'both attempts must be kept');
+
+        const [[row]] = await pool.query(
+          'SELECT passed, failures_json FROM virtual_burnin WHERE identity_hash=? AND session_date=?', [ID, day]);
+        assert.strictEqual(Number(row.passed), 0, 'the stored verdict was upgraded');
+        assert.ok(row.failures_json && row.failures_json.includes('x'),
+          'the original failure must still be readable');
+      } finally {
+        await pool.query('DELETE FROM virtual_burnin_attempt WHERE identity_hash=?', [ID]);
+        await pool.query('DELETE FROM virtual_burnin WHERE identity_hash=?', [ID]);
+      }
+    });
+
+    await t('A MISSING SESSION STOPS THE STREAK — silence is not evidence', async () => {
+      // Monday clean, Tuesday's watchdog never ran, Wednesday and Thursday
+      // clean. Counting the rows that exist gives three. The honest answer is
+      // two: nothing at all is known about Tuesday.
+      const [sess] = await pool.query(
+        'SELECT date FROM idx_ihsg_history ORDER BY date DESC LIMIT 4');
+      assert.strictEqual(sess.length, 4, 'need four sessions to build the gap');
+      const [d0, d1, d2, d3] = sess.map(r => burnin.iso(r.date));   // newest first
+
+      await pool.query('DELETE FROM virtual_burnin WHERE identity_hash=?', [ID]);
+      try {
+        for (const d of [d0, d1, d3]) {          // d2 deliberately has no row
+          await pool.query(
+            `INSERT INTO virtual_burnin (session_date, identity_hash, engine_version, passed)
+             VALUES (?,?,?,1)`, [d, ID, 9]);
+        }
+        const r = await burnin.computeStreak(pool, ID, d0);
+        assert.strictEqual(r.streak, 2, `expected 2 (${d0}, ${d1}), got ${r.streak}`);
+        assert.ok(r.stoppedBy.includes(d2), `must stop at the unobserved session: ${r.stoppedBy}`);
+      } finally {
+        await pool.query('DELETE FROM virtual_burnin WHERE identity_hash=?', [ID]);
+      }
+    });
+
+    await t('the dashboard and the watchdog cannot disagree — one helper, one number', async () => {
+      // They each had their own loop. Two implementations of the same claim
+      // drift, and then two panels tell the operator different stories.
+      const identity = await vp.experimentIdentity(pool, vp.SOURCE_STRATEGY);
+      const a = await burnin.computeStreak(pool, identity);
+      const b = await burnin.computeStreak(pool, identity);
+      assert.strictEqual(a.streak, b.streak);
+      const src = require('fs').readFileSync(`${__dirname}/server.js`, 'utf8');
+      assert.ok(/burninMod\.computeStreak|burnin.*computeStreak/.test(src),
+        'server.js must call the shared helper rather than re-deriving the streak');
+      const wd = require('fs').readFileSync(`${__dirname}/watchdog.js`, 'utf8');
+      assert.ok(/burnin\.computeStreak/.test(wd),
+        'watchdog.js must call the shared helper too');
+    });
+
+    await t('A STAGE THAT FAILED THEN SUCCEEDED KEEPS ever_failed=1', async () => {
+      // The pipeline may recover and continue; the SESSION may not become clean.
+      const day = burnin.iso((await pool.query('SELECT MAX(date) d FROM idx_ihsg_history'))[0][0].d);
+      const strategy = 'ZZ_STAGE_STICKY_TEST';
+      await vp.ensureStageTable(pool);
+      const identity = await vp.cycleIdentity(pool, strategy);
+      await pool.query('DELETE FROM virtual_cycle_stage WHERE identity_hash=?', [identity]);
+      try {
+        await vp.recordStage(pool, day, 'schedule', 'FAILED', 'rolled back', strategy);
+        await vp.recordStage(pool, day, 'schedule', 'OK', null, strategy);
+
+        const gate = await vp.stageOk(pool, day, 'schedule', strategy);
+        assert.strictEqual(gate.ok, true, 'a recovered pipeline must be allowed to continue');
+        assert.strictEqual(gate.everFailed, true, 'but the failure must remain on the record');
+        assert.strictEqual(gate.attempts, 2);
+        assert.strictEqual(gate.firstFailure, 'rolled back',
+          'the FIRST failure reason is kept, not overwritten by the retry');
+      } finally {
+        await pool.query('DELETE FROM virtual_cycle_stage WHERE identity_hash=?', [identity]);
+      }
+    });
+
   } catch (e) {
     fail++;
     console.log(`\n  FAIL  the run itself threw\n          ${e.stack}`);

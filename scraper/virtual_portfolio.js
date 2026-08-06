@@ -869,9 +869,29 @@ async function ensureStageTable(pool) {
       stage VARCHAR(16) NOT NULL,
       status ENUM('OK','BLOCKED','FAILED') NOT NULL,
       reason VARCHAR(64) NULL,
+      -- FAILURE IS STICKY. The row is upserted, so a retry that succeeded
+      -- rewrote status to OK and the evidence that the stage had ever failed was
+      -- gone. A pipeline may legitimately be re-run and continue; a burn-in
+      -- session may not be quietly promoted to clean because the second attempt
+      -- worked. status is the CURRENT state; ever_failed is the RECORD.
+      ever_failed TINYINT(1) NOT NULL DEFAULT 0,
+      attempt_count INT NOT NULL DEFAULT 1,
+      first_failure_reason VARCHAR(64) NULL,
+      first_failed_at TIMESTAMP NULL,
       completed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
       UNIQUE KEY uq_stage (session_date, identity_hash, stage)
     )`);
+
+  for (const [col, def] of [
+    ['ever_failed', 'TINYINT(1) NOT NULL DEFAULT 0 AFTER reason'],
+    ['attempt_count', 'INT NOT NULL DEFAULT 1 AFTER ever_failed'],
+    ['first_failure_reason', 'VARCHAR(64) NULL AFTER attempt_count'],
+    ['first_failed_at', 'TIMESTAMP NULL AFTER first_failure_reason'],
+  ]) {
+    if (!await hasColumn(pool, 'virtual_cycle_stage', col)) {
+      await pool.query(`ALTER TABLE virtual_cycle_stage ADD COLUMN ${col} ${def}`);
+    }
+  }
 
   for (const [col, def] of [
     ['strategy_id', `VARCHAR(64) NOT NULL DEFAULT '' AFTER session_date`],
@@ -976,11 +996,24 @@ async function recordStage(pool, sessionDate, stage, status, reason = null, stra
   if (!sessionDate) return;
   await ensureStageTable(pool);
   const identity = await cycleIdentity(pool, strategyId);
+  const failedNow = status !== 'OK' ? 1 : 0;
   await pool.query(
-    `INSERT INTO virtual_cycle_stage (session_date, strategy_id, identity_hash, engine_version, stage, status, reason)
-     VALUES (?,?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE status=VALUES(status), reason=VALUES(reason), completed_at=CURRENT_TIMESTAMP`,
-    [sessionDate, strategyId, identity, vb.EXECUTION_ENGINE_VERSION, stage, status, reason]);
+    `INSERT INTO virtual_cycle_stage
+       (session_date, strategy_id, identity_hash, engine_version, stage, status, reason,
+        ever_failed, attempt_count, first_failure_reason, first_failed_at)
+     VALUES (?,?,?,?,?,?,?,?,1,?,?)
+     ON DUPLICATE KEY UPDATE
+       status = VALUES(status),
+       reason = VALUES(reason),
+       -- Never cleared. GREATEST keeps a 1 once it has been set, whatever a
+       -- later attempt reports.
+       ever_failed = GREATEST(ever_failed, VALUES(ever_failed)),
+       attempt_count = attempt_count + 1,
+       first_failure_reason = COALESCE(first_failure_reason, VALUES(first_failure_reason)),
+       first_failed_at = COALESCE(first_failed_at, VALUES(first_failed_at)),
+       completed_at = CURRENT_TIMESTAMP`,
+    [sessionDate, strategyId, identity, vb.EXECUTION_ENGINE_VERSION, stage, status, reason,
+     failedNow, failedNow ? (reason || status) : null, failedNow ? new Date() : null]);
 }
 
 async function stageOk(pool, sessionDate, stage, strategyId = SOURCE_STRATEGY) {
@@ -988,12 +1021,18 @@ async function stageOk(pool, sessionDate, stage, strategyId = SOURCE_STRATEGY) {
   await ensureStageTable(pool);
   const identity = await cycleIdentity(pool, strategyId);
   const [[r]] = await pool.query(
-    `SELECT status, reason FROM virtual_cycle_stage
-      WHERE session_date=? AND identity_hash=? AND stage=?`,
+    `SELECT status, reason, ever_failed, attempt_count, first_failure_reason
+       FROM virtual_cycle_stage WHERE session_date=? AND identity_hash=? AND stage=?`,
     [sessionDate, identity, stage]);
-  if (!r) return { ok: false, reason: `${stage.toUpperCase()}_NOT_RUN` };
-  if (r.status !== 'OK') return { ok: false, reason: `${stage.toUpperCase()}_${r.status}:${r.reason || ''}` };
-  return { ok: true };
+  if (!r) return { ok: false, reason: `${stage.toUpperCase()}_NOT_RUN`, everFailed: false };
+  if (r.status !== 'OK') {
+    return { ok: false, reason: `${stage.toUpperCase()}_${r.status}:${r.reason || ''}`, everFailed: true };
+  }
+  // `ok` is the CURRENT state, so a fixed pipeline may continue. `everFailed`
+  // travels with it so the burn-in can refuse to call the session clean.
+  return { ok: true, everFailed: Number(r.ever_failed) === 1,
+           attempts: Number(r.attempt_count),
+           firstFailure: r.first_failure_reason || null };
 }
 
 /** The session the current cycle belongs to — the calendar's latest closed bar. */
