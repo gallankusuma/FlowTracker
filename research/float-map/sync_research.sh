@@ -31,7 +31,7 @@ fi
 
 echo "deploying $COMMIT to $HOST:$DEST"
 ssh "$HOST" "mkdir -p $DEST"
-for f in float_fetch.js float_cost_map.js float_map_daily.js exp023_float_map_ic.js; do
+for f in model.js test_model.js float_fetch.js float_cost_map.js float_map_daily.js exp023_float_map_ic.js; do
   scp -q "$HERE/$f" "$HOST:$DEST/$f"
   echo "  $f"
 done
