@@ -62,6 +62,9 @@ export default function TradeJournal() {
   const [filterStatus, setFilterStatus] = useState("ALL");
   const [filterTicker, setFilterTicker] = useState("");
   const [tab, setTab]         = useState<"journal"|"stats">("journal");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmingBulk, setConfirmingBulk] = useState(false);
+  const [undo, setUndo] = useState<{ trades: Trade[]; at: number } | null>(null);
 
   // Persist
   useEffect(() => {
@@ -88,7 +91,35 @@ export default function TradeJournal() {
     setForm(DEFAULT_FORM); setShowForm(false);
   };
 
-  const deleteTrade = (id: string) => setTrades(prev => prev.filter(t => t.id !== id));
+  /**
+   * Deleting is the only irreversible thing this page does.
+   *
+   * The journal lives in localStorage and nowhere else — no server copy, no
+   * backup, no export unless you took one. So every delete keeps the removed
+   * rows around long enough to put them back, and the single-row ✕ goes through
+   * the same path it always did rather than dropping a trade instantly on a
+   * misclick.
+   */
+  const removeTrades = (ids: string[]) => {
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    const removed = trades.filter(t => idSet.has(t.id));
+    if (!removed.length) return;
+    setTrades(prev => prev.filter(t => !idSet.has(t.id)));
+    setSelected(prev => { const n = new Set(prev); ids.forEach(i => n.delete(i)); return n; });
+    setConfirmingBulk(false);
+    setUndo({ trades: removed, at: Date.now() });
+  };
+
+  const deleteTrade = (id: string) => removeTrades([id]);
+
+  const restoreUndo = () => {
+    if (!undo) return;
+    // Re-inserted by date so a restored row lands back where it belongs rather
+    // than at the end of the list.
+    setTrades(prev => [...prev, ...undo.trades].sort((a, b) => b.date.localeCompare(a.date)));
+    setUndo(null);
+  };
 
   const startEdit = (t: Trade) => {
     setForm({ ticker: t.ticker, date: t.date, exitDate: t.exitDate, type: t.type, entry: t.entry,
@@ -102,6 +133,42 @@ export default function TradeJournal() {
     if (filterTicker) d = d.filter(t => t.ticker.includes(filterTicker.toUpperCase()));
     return d;
   }, [trades, filterStatus, filterTicker]);
+
+  /**
+   * Only ever delete what is on screen.
+   *
+   * Selecting rows, then narrowing the filter, then hitting delete is the
+   * obvious way to lose trades you were not looking at. So the bulk action
+   * operates on selected ∩ visible, and the button prints that number — if it
+   * disagrees with what you can see, the number is what happens.
+   */
+  const visibleSelected = useMemo(
+    () => filtered.filter(t => selected.has(t.id)).map(t => t.id),
+    [filtered, selected]);
+  const allVisibleSelected = filtered.length > 0 && visibleSelected.length === filtered.length;
+
+  const toggleOne = (id: string) => setSelected(prev => {
+    const n = new Set(prev);
+    n.has(id) ? n.delete(id) : n.add(id);
+    return n;
+  });
+  const toggleAllVisible = () => setSelected(prev => {
+    const n = new Set(prev);
+    if (allVisibleSelected) filtered.forEach(t => n.delete(t.id));
+    else filtered.forEach(t => n.add(t.id));
+    return n;
+  });
+
+  // A confirmation that survives the thing it was asked about is a trap: change
+  // the selection and the armed button now means something else.
+  useEffect(() => { setConfirmingBulk(false); }, [visibleSelected.length]);
+
+  // The undo offer expires, so it cannot sit there for an hour looking live.
+  useEffect(() => {
+    if (!undo) return;
+    const t = setTimeout(() => setUndo(null), 15000);
+    return () => clearTimeout(t);
+  }, [undo]);
 
   const stats = useMemo(() => {
     const closed = trades.filter(t => t.status !== "OPEN");
@@ -263,6 +330,88 @@ export default function TradeJournal() {
               })}
             </div>
 
+            {/* Selection bar — only appears when there is something to act on */}
+            {filtered.length > 0 && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+                marginBottom: 12, padding: "9px 14px", borderRadius: 10,
+                background: visibleSelected.length ? "rgba(248,81,73,0.05)" : "var(--bg-secondary)",
+                border: `1px solid ${visibleSelected.length ? "rgba(248,81,73,0.25)" : "var(--border)"}`,
+              }}>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, fontWeight: 700, color: "var(--text-muted)" }}>
+                  <input
+                    type="checkbox"
+                    checked={allVisibleSelected}
+                    ref={el => { if (el) el.indeterminate = visibleSelected.length > 0 && !allVisibleSelected; }}
+                    onChange={toggleAllVisible}
+                    style={{ width: 15, height: 15, accentColor: "#f85149", cursor: "pointer" }} />
+                  Pilih semua ({filtered.length})
+                </label>
+
+                {visibleSelected.length > 0 && (
+                  <>
+                    <span style={{ fontSize: 12, fontWeight: 800, color: "#f85149" }}>
+                      {visibleSelected.length} dipilih
+                    </span>
+                    {/* Two-step rather than a browser dialog: the button states
+                        the count it is about to destroy, and you have to mean it
+                        twice. */}
+                    <button
+                      onClick={() => confirmingBulk ? removeTrades(visibleSelected) : setConfirmingBulk(true)}
+                      style={{
+                        padding: "6px 14px", borderRadius: 7, cursor: "pointer",
+                        fontSize: 12, fontWeight: 800,
+                        border: `1px solid ${confirmingBulk ? "#f85149" : "rgba(248,81,73,0.4)"}`,
+                        background: confirmingBulk ? "#f85149" : "rgba(248,81,73,0.08)",
+                        color: confirmingBulk ? "#fff" : "#f85149",
+                      }}>
+                      {confirmingBulk
+                        ? `Yakin? Hapus ${visibleSelected.length} trade`
+                        : `🗑 Hapus ${visibleSelected.length}`}
+                    </button>
+                    <button onClick={() => { setSelected(new Set()); setConfirmingBulk(false); }}
+                      style={{ padding: "6px 12px", borderRadius: 7, border: "1px solid var(--border)", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+                      Batal pilih
+                    </button>
+                  </>
+                )}
+
+                {/* Selected-but-hidden rows are NOT going to be deleted, and
+                    that is worth saying out loud rather than leaving as a
+                    surprise either way. */}
+                {selected.size > visibleSelected.length && (
+                  <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                    ({selected.size - visibleSelected.length} lagi dipilih tapi tersembunyi oleh filter — tidak ikut terhapus)
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* Undo — the journal has no server copy, so this is the only way back */}
+            {undo && (
+              <div style={{
+                display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+                marginBottom: 12, padding: "10px 14px", borderRadius: 10,
+                background: "rgba(227,179,65,0.08)", border: "1px solid rgba(227,179,65,0.35)",
+              }}>
+                <span style={{ fontSize: 12, fontWeight: 700 }}>
+                  {undo.trades.length} trade dihapus
+                  <span style={{ color: "var(--text-muted)", fontWeight: 500 }}>
+                    {" "}({undo.trades.map(t => t.ticker).slice(0, 6).join(", ")}
+                    {undo.trades.length > 6 ? `, +${undo.trades.length - 6}` : ""})
+                  </span>
+                </span>
+                <button onClick={restoreUndo} style={{
+                  padding: "5px 14px", borderRadius: 7, border: "1px solid #e3b341",
+                  background: "rgba(227,179,65,0.15)", color: "#e3b341",
+                  cursor: "pointer", fontSize: 12, fontWeight: 800,
+                }}>↩ Kembalikan</button>
+                <span style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                  Journal cuma tersimpan di browser ini — kalau bar ini hilang, datanya tidak bisa dikembalikan.
+                </span>
+              </div>
+            )}
+
             {/* Empty state */}
             {trades.length === 0 && (
               <div style={{ background: "var(--bg-secondary)", borderRadius: 14, border: "1px dashed var(--border)", padding: "60px 24px", textAlign: "center" }}>
@@ -280,11 +429,24 @@ export default function TradeJournal() {
                 const cfg = STATUS_CFG[t.status];
                 return (
                   <div key={t.id} style={{
-                    background: "var(--bg-secondary)", borderRadius: 12,
-                    border: `1px solid ${t.status==="WIN" ? "rgba(63,185,80,0.2)" : t.status==="LOSS" ? "rgba(248,81,73,0.15)" : "var(--border)"}`,
+                    background: selected.has(t.id) ? "rgba(248,81,73,0.05)" : "var(--bg-secondary)",
+                    borderRadius: 12,
+                    // A selected row is about to be destroyed, so selection wins
+                    // over the status colour rather than blending with it.
+                    border: `1px solid ${selected.has(t.id) ? "rgba(248,81,73,0.5)"
+                      : t.status==="WIN" ? "rgba(63,185,80,0.2)"
+                      : t.status==="LOSS" ? "rgba(248,81,73,0.15)" : "var(--border)"}`,
                     padding: "14px 20px",
                   }}>
                     <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                      {/* Row checkbox */}
+                      <input
+                        type="checkbox"
+                        checked={selected.has(t.id)}
+                        onChange={() => toggleOne(t.id)}
+                        aria-label={`Pilih ${t.ticker}`}
+                        style={{ width: 15, height: 15, accentColor: "#f85149", cursor: "pointer", flexShrink: 0 }} />
+
                       {/* Status badge */}
                       <span style={{ fontSize: 10, fontWeight: 800, padding: "3px 10px", borderRadius: 6, background: cfg.bg, color: cfg.color, border: `1px solid ${cfg.border}`, whiteSpace: "nowrap" }}>
                         {cfg.label}
