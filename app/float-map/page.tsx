@@ -25,12 +25,12 @@ const card: React.CSSProperties = {
   borderRadius: 12, padding: 18,
 };
 const th: React.CSSProperties = {
-  textAlign: 'left', padding: '7px 10px', fontSize: 10, fontWeight: 800,
+  textAlign: 'left', padding: '7px 10px', fontSize: 13, fontWeight: 800,
   color: 'var(--text-muted)', letterSpacing: '0.05em',
   borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap',
 };
 const td: React.CSSProperties = {
-  padding: '7px 10px', fontSize: 12, borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap',
+  padding: '7px 10px', fontSize: 15, borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap',
 };
 const rp = (n: number) => 'Rp' + Math.round(n).toLocaleString('id-ID');
 
@@ -55,7 +55,7 @@ export default function FloatMapPage() {
       <div style={{ padding: 28 }}>
         <div style={{ ...card, borderColor: WARN }}>
           <div style={{ color: WARN, fontWeight: 800, marginBottom: 6 }}>FLOAT MAP UNAVAILABLE</div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+          <div style={{ fontSize: 15, color: 'var(--text-muted)', lineHeight: 1.6 }}>
             {err} — nothing is shown rather than an empty map, because an empty map
             looks like a market with no cost structure and a reader has no way to tell
             the difference.
@@ -73,20 +73,20 @@ export default function FloatMapPage() {
   return (
     <>
     <Navbar />
-    <div style={{ padding: '24px 28px 60px', maxWidth: 1180, margin: '0 auto' }}>
+    <div style={{ padding: '24px 32px 60px', maxWidth: 'none' }}>
 
       <div style={{ ...card, marginBottom: 16 }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 14 }}>
           <div>
-            <div style={{ fontSize: 18, fontWeight: 800 }}>FLOAT COST MAP</div>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+            <div style={{ fontSize: 23, fontWeight: 800 }}>FLOAT COST MAP</div>
+            <div style={{ fontSize: 14, color: 'var(--text-muted)', marginTop: 4 }}>
               session {data.session} · {data.universe} tickers with a free float on record
               {data.skippedCorporateAction > 0 && ` · ${data.skippedCorporateAction} excluded for a detected corporate action`}
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 10, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.06em' }}>CONFIDENCE</div>
-            <div style={{ fontSize: 15, fontWeight: 800, color: data.confidence >= 60 ? OK : WARN, marginTop: 3 }}>
+            <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.06em' }}>CONFIDENCE</div>
+            <div style={{ fontSize: 19, fontWeight: 800, color: data.confidence >= 60 ? OK : WARN, marginTop: 3 }}>
               {data.confidence}/100
             </div>
           </div>
@@ -96,7 +96,7 @@ export default function FloatMapPage() {
         <div style={{
           marginTop: 14, padding: '11px 13px', borderRadius: 8,
           background: 'rgba(88,166,255,0.07)', border: `1px solid ${INFO}44`,
-          fontSize: 12, lineHeight: 1.6,
+          fontSize: 15, lineHeight: 1.6,
         }}>
           <b style={{ color: INFO }}>Ranked on the momentum-residualised gap, not the raw one.</b>{' '}
           {data.evidence?.experiment} measured the raw cost gap at IC {data.evidence?.rawIC60D} over
@@ -112,11 +112,14 @@ export default function FloatMapPage() {
         </div>
       </div>
 
-      <div style={{ display: 'grid', gridTemplateColumns: 'minmax(320px,1fr) minmax(300px,420px)', gap: 14, alignItems: 'start' }}>
+      {/* Two fixed minimums summed to 634px, which is wider than any phone, so
+          the page pushed sideways instead of wrapping. auto-fit with a min()
+          floor gives two columns when there is room and one when there is not. */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))', gap: 14, alignItems: 'start' }}>
 
         {/* ── ranking ─────────────────────────────────────────────────── */}
         <div style={{ ...card, padding: 0, overflow: 'hidden' }}>
-          <div style={{ padding: '14px 18px 6px', fontSize: 11, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)' }}>
+          <div style={{ padding: '14px 18px 6px', fontSize: 14, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)' }}>
             RANKED BY RESIDUAL COST GAP
           </div>
           <div style={{ overflowX: 'auto', maxHeight: 620, overflowY: 'auto' }}>
@@ -137,7 +140,7 @@ export default function FloatMapPage() {
                       {r.avgCostGapResid === null ? '–' : `${r.avgCostGapResid > 0 ? '+' : ''}${r.avgCostGapResid}%`}
                     </td>
                     {/* Muted on purpose: this is the column that measured nothing. */}
-                    <td style={{ ...td, color: MUTED, fontSize: 11 }}>
+                    <td style={{ ...td, color: MUTED, fontSize: 14 }}>
                       {r.avgCostGap > 0 ? '+' : ''}{r.avgCostGap}%
                     </td>
                     <td style={td}>{rp(r.price)}</td>
@@ -154,12 +157,12 @@ export default function FloatMapPage() {
         {/* ── the map itself ──────────────────────────────────────────── */}
         {cur && (
           <div style={card}>
-            <div style={{ fontSize: 11, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: 4 }}>
+            <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: 4 }}>
               ESTIMATED COST DISTRIBUTION
             </div>
-            <div style={{ fontSize: 20, fontWeight: 900, marginBottom: 12 }}>{cur.ticker}</div>
+            <div style={{ fontSize: 25, fontWeight: 900, marginBottom: 12 }}>{cur.ticker}</div>
 
-            <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 11, lineHeight: 1.5 }}>
+            <div style={{ fontFamily: 'ui-monospace, monospace', fontSize: 14, lineHeight: 1.5 }}>
               {cur.dist.map((d: any) => {
                 const here = d.price <= cur.price && d.price + (cur.dist[0].price - cur.dist[1]?.price || 1) > cur.price;
                 return (
@@ -178,7 +181,7 @@ export default function FloatMapPage() {
               })}
             </div>
 
-            <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)', fontSize: 12, lineHeight: 1.9 }}>
+            <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)', fontSize: 15, lineHeight: 1.9 }}>
               <Row k="Current price" v={rp(cur.price)} />
               <Row k="Estimated avg cost" v={rp(cur.avgCost)} />
               <Row k="Residual gap" v={`${cur.avgCostGapResid > 0 ? '+' : ''}${cur.avgCostGapResid}%`}
@@ -191,7 +194,7 @@ export default function FloatMapPage() {
               <Row k="Float rotation 20d / 60d" v={`${cur.rotation20}% / ${cur.rotation60}%`} />
             </div>
 
-            <div style={{ marginTop: 12, fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.6 }}>
+            <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
               <b>Estimated.</b> Nobody outside KSEI knows the real holders. This is inventory
               accounting over the float: each session a share of it changes hands, the old
               distribution decays proportionally, and the shares that moved are re-assigned

@@ -44,18 +44,18 @@ const card: React.CSSProperties = {
   borderRadius: 12, padding: 18,
 };
 const th: React.CSSProperties = {
-  textAlign: 'left', padding: '7px 10px', fontSize: 10, fontWeight: 800,
+  textAlign: 'left', padding: '7px 10px', fontSize: 13, fontWeight: 800,
   color: 'var(--text-muted)', letterSpacing: '0.05em',
   borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap',
 };
 const td: React.CSSProperties = {
-  padding: '7px 10px', fontSize: 12, borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap',
+  padding: '7px 10px', fontSize: 15, borderBottom: '1px solid var(--border)', whiteSpace: 'nowrap',
 };
 const label: React.CSSProperties = {
-  fontSize: 10, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.06em',
+  fontSize: 13, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.06em',
 };
 const sectionTitle: React.CSSProperties = {
-  fontSize: 11, fontWeight: 800, letterSpacing: '0.08em',
+  fontSize: 14, fontWeight: 800, letterSpacing: '0.08em',
   color: 'var(--text-muted)', margin: '0 0 10px',
 };
 
@@ -69,11 +69,11 @@ function Dot({ color }: { color: string }) {
 function Row({ k, v, color, hint }: { k: string; v: React.ReactNode; color?: string; hint?: string }) {
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', padding: '5px 0', gap: 16 }}>
-      <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+      <span style={{ fontSize: 15, color: 'var(--text-muted)' }}>
         {k}
-        {hint && <span style={{ display: 'block', fontSize: 10, opacity: 0.7, marginTop: 1 }}>{hint}</span>}
+        {hint && <span style={{ display: 'block', fontSize: 13, opacity: 0.7, marginTop: 1 }}>{hint}</span>}
       </span>
-      <span style={{ fontSize: 12, fontWeight: 700, color: color || 'var(--text-primary)', textAlign: 'right' }}>{v}</span>
+      <span style={{ fontSize: 15, fontWeight: 700, color: color || 'var(--text-primary)', textAlign: 'right' }}>{v}</span>
     </div>
   );
 }
@@ -122,7 +122,7 @@ export default function TradeDeskPage() {
       <div style={{ padding: 28 }}>
         <div style={{ ...card, borderColor: BAD }}>
           <div style={{ color: BAD, fontWeight: 800, marginBottom: 6 }}>TRADE DESK UNAVAILABLE</div>
-          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+          <div style={{ fontSize: 15, color: 'var(--text-muted)' }}>
             Could not reach the engine: {error}. Nothing below is being shown — an empty
             desk would look like a quiet day.
           </div>
@@ -162,16 +162,16 @@ export default function TradeDeskPage() {
   return (
     <>
     <Navbar />
-    <div style={{ padding: '24px 28px 60px', maxWidth: 1180, margin: '0 auto' }}>
+    <div style={{ padding: '24px 32px 60px', maxWidth: 'none' }}>
 
       {/* ── header ─────────────────────────────────────────────────────── */}
       <div style={{ ...card, marginBottom: 16, borderColor: blocked ? WARN : 'var(--border)' }}>
         <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
           <div>
-            <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: '0.02em' }}>
+            <div style={{ fontSize: 23, fontWeight: 800, letterSpacing: '0.02em' }}>
               FLOWTRACKER IDX — TRADE DESK
             </div>
-            <div style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: 4 }}>
+            <div style={{ fontSize: 14, color: 'var(--text-muted)', marginTop: 4 }}>
               Strategy <b style={{ color: 'var(--text-primary)' }}>{strategy}</b>
               {' · '}engine v{trust.engineVersion ?? '?'}
               {' · '}session {trust.sessionCalendar || '–'}
@@ -180,13 +180,13 @@ export default function TradeDeskPage() {
           <div style={{ display: 'flex', gap: 28, flexWrap: 'wrap' }}>
             <div>
               <div style={label}>OPERATIONAL</div>
-              <div style={{ fontSize: 13, fontWeight: 800, color: opColor, marginTop: 3 }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: opColor, marginTop: 3 }}>
                 <Dot color={opColor} />{opText}
               </div>
             </div>
             <div>
               <div style={label}>BURN-IN</div>
-              <div style={{ fontSize: 13, fontWeight: 800, marginTop: 3 }}>
+              <div style={{ fontSize: 16, fontWeight: 800, marginTop: 3 }}>
                 {burn.streak ?? 0} / {burn.target ?? 10}
               </div>
             </div>
@@ -198,7 +198,7 @@ export default function TradeDeskPage() {
           <div style={{
             marginTop: 14, padding: '10px 12px', borderRadius: 8,
             background: 'rgba(227,179,65,0.08)', border: `1px solid ${WARN}44`,
-            fontSize: 12, lineHeight: 1.55,
+            fontSize: 15, lineHeight: 1.55,
           }}>
             <b style={{ color: WARN }}>No new orders will be placed while this holds.</b>{' '}
             The session calendar is at <b>{trust.sessionCalendar || '–'}</b> but prices only reach{' '}
@@ -242,13 +242,13 @@ export default function TradeDeskPage() {
                 const c = s.status === 'DONE' ? OK : s.status === 'FAILED' ? BAD : MUTED;
                 return (
                   <span key={st} title={s.reason || ''} style={{
-                    fontSize: 10, fontWeight: 800, padding: '4px 9px', borderRadius: 6,
+                    fontSize: 13, fontWeight: 800, padding: '4px 9px', borderRadius: 6,
                     border: `1px solid ${c}55`, color: c, letterSpacing: '0.04em',
                   }}>{st.toUpperCase()} · {s.status}</span>
                 );
               })}
             </div>
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 }}>
+            <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 8, lineHeight: 1.5 }}>
               NOT_RUN before the nightly cron is normal. NOT_RUN after it is a missing
               session, and a missing session stops the burn-in streak.
             </div>
@@ -260,7 +260,7 @@ export default function TradeDeskPage() {
       <div style={{ ...card, marginBottom: 16 }}>
         <div style={sectionTitle}>TOMORROW — PLAN (WHAT THE TRACKED STRATEGY WILL EXECUTE)</div>
         {allPending.length === 0 ? (
-          <div style={{ fontSize: 12, lineHeight: 1.65, color: 'var(--text-muted)' }}>
+          <div style={{ fontSize: 15, lineHeight: 1.65, color: 'var(--text-muted)' }}>
             <b style={{ color: 'var(--text-primary)' }}>Nothing scheduled.</b>{' '}
             {regime && Number(regime.exposure) === 0 ? (
               <>
@@ -300,7 +300,7 @@ export default function TradeDeskPage() {
                 ))}
               </tbody>
             </table>
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 10, lineHeight: 1.5 }}>
+            <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 10, lineHeight: 1.5 }}>
               No entry price is shown because there is not one yet: these fill at the next
               session&apos;s OPEN. A number here would be a guess wearing the clothes of a plan.
             </div>
@@ -324,14 +324,14 @@ export default function TradeDeskPage() {
           <div style={{ ...card, marginBottom: 16 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 10 }}>
               <div style={sectionTitle}>SIGNALS — RESEARCH SCANNER</div>
-              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+              <div style={{ fontSize: 13, color: 'var(--text-muted)' }}>
                 {scan?.source || '–'} {scan?.engine?.version ? `· v${scan.engine.version}` : ''}
                 {scan?.market ? ` · ${scan.market.total} scanned` : ''}
               </div>
             </div>
 
             {!scan ? (
-              <div style={{ fontSize: 12, color: MUTED }}>Scanner unreachable.</div>
+              <div style={{ fontSize: 15, color: MUTED }}>Scanner unreachable.</div>
             ) : (
               <>
                 {/* Two warnings that change what these rows MEAN, so they go
@@ -340,7 +340,7 @@ export default function TradeDeskPage() {
                   <div style={{
                     padding: '9px 12px', borderRadius: 8, marginBottom: 12,
                     background: 'rgba(227,179,65,0.08)', border: `1px solid ${WARN}44`,
-                    fontSize: 12, lineHeight: 1.55,
+                    fontSize: 15, lineHeight: 1.55,
                   }}>
                     <b style={{ color: WARN }}>Mixed vintage: prices are {trust.sessionCalendar},
                     broker inputs are {scanDate}.</b>{' '}
@@ -355,7 +355,7 @@ export default function TradeDeskPage() {
                   <div style={{
                     padding: '9px 12px', borderRadius: 8, marginBottom: 12,
                     background: 'rgba(88,166,255,0.07)', border: `1px solid ${INFO}44`,
-                    fontSize: 12, lineHeight: 1.55,
+                    fontSize: 15, lineHeight: 1.55,
                   }}>
                     <b style={{ color: INFO }}>Shadow only — every one of these sizes to zero.</b>{' '}
                     Conviction sizing is switched off because no measured edge survived
@@ -364,7 +364,7 @@ export default function TradeDeskPage() {
                 )}
 
                 {buys.length === 0 ? (
-                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                  <div style={{ fontSize: 15, color: 'var(--text-muted)' }}>
                     No BUY signals. {scan?.market ? `${scan.market.total} names scanned, breadth ${scan.market.breadthPct}%.` : ''}
                   </div>
                 ) : (
@@ -388,7 +388,7 @@ export default function TradeDeskPage() {
                           <td style={{ ...td, color: r.confidence >= 50 ? OK : WARN }}>{r.confidence}%</td>
                           <td style={{ ...td, color: r.winRate >= 50 ? OK : WARN }}>
                             {r.winRate}%
-                            {r.winRateSample ? <span style={{ color: 'var(--text-muted)', fontSize: 10 }}> /{r.winRateSample}</span> : null}
+                            {r.winRateSample ? <span style={{ color: 'var(--text-muted)', fontSize: 13 }}> /{r.winRateSample}</span> : null}
                           </td>
                           <td style={td}>{rp(r.tradePlan?.entry)}</td>
                           <td style={{ ...td, color: BAD }}>{rp(r.tradePlan?.stopLoss)}</td>
@@ -403,7 +403,7 @@ export default function TradeDeskPage() {
                   </table>
                 )}
 
-                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 11, lineHeight: 1.6, borderTop: '1px solid var(--border)', paddingTop: 9 }}>
+                <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 11, lineHeight: 1.6, borderTop: '1px solid var(--border)', paddingTop: 9 }}>
                   <b>This is a different engine from the tracked strategy.</b> The scanner is
                   research output over the whole universe; the virtual accounts execute{' '}
                   <b>{strategy}</b> with its regime gate, which is why the plan above can be
@@ -427,7 +427,7 @@ export default function TradeDeskPage() {
       <div style={{ ...card, marginBottom: 16 }}>
         <div style={sectionTitle}>OPEN POSITIONS</div>
         {allOpen.length === 0
-          ? <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+          ? <div style={{ fontSize: 15, color: 'var(--text-muted)' }}>
               No open positions. Both accounts are fully in cash.
             </div>
           : (
@@ -463,9 +463,9 @@ export default function TradeDeskPage() {
           return (
             <div key={a.id} style={card}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-                <div style={{ fontSize: 12, fontWeight: 800 }}>{a.account_code}</div>
+                <div style={{ fontSize: 15, fontWeight: 800 }}>{a.account_code}</div>
                 <span style={{
-                  fontSize: 9, fontWeight: 800, padding: '3px 8px', borderRadius: 5,
+                  fontSize: 11, fontWeight: 800, padding: '3px 8px', borderRadius: 5,
                   letterSpacing: '0.05em',
                   border: `1px solid ${isControl ? MUTED : INFO}66`, color: isControl ? MUTED : INFO,
                 }}>{a.charter?.gate?.kind || 'NO CHARTER'}</span>
@@ -480,7 +480,7 @@ export default function TradeDeskPage() {
                    hint="toward the evaluation gate" />
               {isControl && (
                 <div style={{
-                  marginTop: 10, fontSize: 10, lineHeight: 1.55, color: 'var(--text-muted)',
+                  marginTop: 10, fontSize: 13, lineHeight: 1.55, color: 'var(--text-muted)',
                   borderTop: '1px solid var(--border)', paddingTop: 9,
                 }}>
                   A <b>control</b>, not a candidate. EXP-019 measured this rule at −0.951%
@@ -497,7 +497,7 @@ export default function TradeDeskPage() {
       <div style={{ ...card, marginBottom: 16 }}>
         <div style={sectionTitle}>RECENT EXITS</div>
         {allExits.length === 0
-          ? <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+          ? <div style={{ fontSize: 15, color: 'var(--text-muted)' }}>
               No closed trades yet on the official accounts.
             </div>
           : (
@@ -553,12 +553,12 @@ export default function TradeDeskPage() {
                  hint={staleFeeds.length && !criticalStale.length ? 'none of them critical' : undefined} />
           </div>
           <div>
-            <Row k="Burn-in identity" v={<code style={{ fontSize: 11 }}>{burn.identity || '–'}</code>} />
-            <Row k="Experiment" v={<code style={{ fontSize: 11 }}>{trust.experimentIdentity || '–'}</code>} />
-            <Row k="Cycle" v={<code style={{ fontSize: 11 }}>{trust.cycleIdentity || '–'}</code>} />
+            <Row k="Burn-in identity" v={<code style={{ fontSize: 14 }}>{burn.identity || '–'}</code>} />
+            <Row k="Experiment" v={<code style={{ fontSize: 14 }}>{trust.experimentIdentity || '–'}</code>} />
+            <Row k="Cycle" v={<code style={{ fontSize: 14 }}>{trust.cycleIdentity || '–'}</code>} />
           </div>
         </div>
-        <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 14, lineHeight: 1.6, borderTop: '1px solid var(--border)', paddingTop: 10 }}>
+        <div style={{ fontSize: 13, color: 'var(--text-muted)', marginTop: 14, lineHeight: 1.6, borderTop: '1px solid var(--border)', paddingTop: 10 }}>
           Every value on this page is read from the engine — nothing here is recomputed.
           The burn-in streak walks the exchange calendar, so a session with no verdict
           stops it rather than being skipped: silence is not evidence of a clean day.
