@@ -1025,3 +1025,46 @@ A second defect the same rewrite fixed: buying capacity was `1 − committedWeig
 - **EXP-010 follow-up — investigate the 60D decile-10 underperformance** (worst of all 10 deciles, −6.74%, vs universe average −2.59pp) for whether it's driven by a small number of extreme momentum-crash names (one verified case: TOBA, decile-10 leader 2025-08-26, −41.5% by 60 trading days later) — if so, a volatility/extension filter applied at the RANKING stage itself (not just entry-timing) may be a more targeted fix than abandoning momentum ranking altogether.
 - **Setup B (Pullback)** — explicit future follow-up per the reviewer's own spec, but now gated behind the ranking-formula revisit above, not just EXP-009's data-depth issue — building a timing layer (breakout OR pullback) on top of an unproven ranking doesn't resolve the more fundamental open question EXP-010 raised.
 - **Backfill other backtest scripts to import `evaluateCandidateOutcome`/`mulberry32` from `awo_optimizer.js`** instead of each maintaining its own copy, now that both are exported — `backtest_momentum_leadership.js` and `backtest_momentum_rank_diagnostic.js` are the first scripts to do this; `backtest_baseline_comparison.js`, `backtest_param_sweep.js`, `backtest_factor_ablation.js`, `backtest_walkforward_split.js` still each carry their own duplicate.
+
+---
+
+## EXP-2026-08-07-023 — Float Cost Basis Map: nothing raw, something after momentum is removed
+
+**Question**: the proposed Float Cost Basis Map estimates where the tradable float was acquired — proportional-replacement chip distribution, decayed by daily turnover measured against free float. It is derived from the price path, so "% underwater" is close to a restatement of recent returns: a stock that fell has holders trapped above it *by construction*. So the question is not "does it have IC" but **"does it have IC that momentum does not already have"**.
+
+**Design**: cross-sectional ranking only, shaped after EXP-011. Canonical date axis from `idx_ihsg_history`; 250-session lookback; 40 price buckets; turnover coefficient 0.75; weekly ranking dates; horizons 20/40/60D; tie-aware Spearman; date-block bootstrap 95% (2000 draws). Liquidity floor Rp 5bn median 20-day value. Universe = the 99 tickers with a free float on record. No timing, no stops, no costs.
+
+**Free float had to be sourced first — it was not in the database at all.** IDX's own `TradebleShares` endpoint is behind Cloudflare and currently refuses even a real browser (the same blockage that has left `idx_broker_summary` stale since 2026-07-31). Yahoo's `floatShares`/`sharesOutstanding` answered for **100/100** of the top-100 by turnover, including the whole illiquid half. One value was rejected rather than stored: **BBNI came back at 2556% of shares outstanding**, which is not a small error but a different quantity wearing the right field name. Stored in `idx_free_float`, rejections in `idx_free_float_rejected`.
+
+**Two data faults surfaced while building the model.** `idx_stock_prices.value` has been **0 since 2026-08-03** — an ingestion regression of the same vintage as the broker outage — and on the days it *is* populated, `value / volume` comes back exactly equal to the close. It is `volume × close` and never carried intraday information, so the model uses typical price `(H+L+C)/3` and the word VWAP was removed from the code. Volume was verified to be in **shares, not lots**, via median daily turnover of 0.58% of float; had it been lots, every rotation figure would have been understated 100×.
+
+### Results — 414 cross-sections, median 70 names, 2017-08 .. 2026-05
+
+| | raw IC 60D | residualised on ROC20+ROC60, IC 60D | IR | %pos |
+|---|---|---|---|---|
+| `avgCostGap` | 0.0075 | **0.0378 \*** | 0.23 | 61% |
+| `distToPeak` | 0.0187 \* | 0.0215 \* | 0.13 | 59% |
+| `profitSupply` | 0.0102 | 0.0224 \* | 0.14 | 54% |
+| `rotation20` / `rotation60` | ~0.016 | ~0.01, n.s. | — | — |
+
+Excluded and reported: **163 ticker-dates for a detected corporate action** (>35% single-session move; excluded rather than adjusted), **7,222 below the liquidity floor**.
+
+### Findings
+
+1. **Raw, the map predicts almost nothing.** Every metric sits between 0.005 and 0.019, and the metrics overlap heavily with momentum (`profitSupply` vs ROC60 = 0.60, `avgCostGap` vs ROC60 = 0.61). Read straight off a screen, this is a repackaging of the price path.
+
+2. **Residualising against momentum RAISES the IC rather than lowering it**, which only makes sense if momentum is itself negatively predictive here and was cancelling part of the signal. Measured in this exact sample rather than assumed from EXP-010: ROC20 40D **−0.0183 \***, ROC60 40D **−0.0223 \***, ROC60 60D **−0.0216 \***. It is. So the cost map carries real information that the momentum it is built from was masking.
+
+3. **The size is comparable to the best factor this project has ever found, and that factor was judged untradeable.** `avgCostGap` residualised at 60D is IC 0.0378 / IR 0.23; EXP-011's HI52W is IC 0.044 / IR 0.25, recorded there as "not a tradeable edge as it stands". This is the second factor to show consistent forward predictiveness, at the same modest scale.
+
+4. **The result is robust to the free-float bias — and that is itself informative.** Free float is a today snapshot applied backwards nine years, which rights issues make wrong. Perturbing every ticker's float by exp(N(0,0.30)) across three seeds gave 0.0389 / 0.0381 / 0.0323; at exp(N(0,0.60)) it gave 0.0326. All still significant. **The signal does not care how wrong the float is**, which contradicts the design premise that free float is "the whole game": what carries the information is the shape of the cost distribution, and the float only modulates decay speed.
+
+5. **It survives on recent data alone.** Restricted to 2023-01-01 onward (159 cross-sections, where today's float is most likely still correct), the residualised 60D IC is 0.0316 with **IR 0.25** — a slightly lower IC at the same risk-adjusted level, on 38% of the dates. Notably the RAW panel collapses over the same window (60D 0.0021, n.s.) while the residual holds, which is finding 1 and 2 restated more sharply.
+
+**Multiple testing**: 15 pairs per panel, ~0.8 false positives expected at α=0.05; 8 cells were significant across both panels. But `profitSupply`, `avgCostGap` and `distToPeak` are highly correlated with one another — this is closer to one finding than to eight, and should be counted that way.
+
+**Limitations**: survivorship-biased toward the currently-liquid 99; no costs, no timing, no stops; historical free float unavailable, only tested for insensitivity rather than corrected; corporate actions excluded, not adjusted; the broker-flow enrichment ("smart-money cost", measured from `idx_broker_summary.buy_avg` rather than modelled) is not part of this IC study and remains untested.
+
+**Decision this drives**: if the Float Cost Map is used at all, it must be used as **a residual against momentum, not as the number printed on the chart** — the raw metric is approximately zero and the chart is extremely persuasive, which is the exact profile of EXP-016's inverted broker signal and of the contemporaneous scanner score. Phase 1 remains analytics-only; it does not touch `HI52W_REGIME_BROKERVETO_V1`, and the IDX burn-in stays sterile. Free-float sourcing is worth keeping for its own sake but is **not** the critical dependency it appeared to be.
+
+**Scripts**: `/root/research/float_fetch.js` (free float → `idx_free_float`), `/root/research/float_cost_map.js` (per-ticker map + confidence score), `/root/research/exp022_float_map_ic.js` (this study; `--from`, `--float-noise`, `--seed` drive the sensitivity runs). Deliberately outside `/var/www/flowtracker-scraper` so the frozen tree and `predeploy_check.sh` are undisturbed.
