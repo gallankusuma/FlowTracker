@@ -748,6 +748,10 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
   const [bulkMsg, setBulkMsg] = useState("");
   const [market, setMarket] = useState<"IDX" | "CRYPTO" | "US">("IDX");
   const [journalMarket, setJournalMarket] = useState<"ALL" | "IDX" | "CRYPTO" | "US">("ALL");
+  const [selectedRecs, setSelectedRecs] = useState<Set<number>>(new Set());
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [openSortCol, setOpenSortCol] = useState<string>("");
   const [openSortAsc, setOpenSortAsc] = useState(true);
   const [searchTicker, setSearchTicker] = useState("");
@@ -976,6 +980,33 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ status }),
     });
+    await loadJournal();
+  };
+
+  /**
+   * Delete rows from the journal.
+   *
+   * This one is server-side and permanent — there is no undo, unlike the
+   * local trade journal. It also edits the denominator of the win rate on the
+   * Stats tab, which is why the confirm step says so: deleting the losers is
+   * the easiest way in this whole application to make the system look good.
+   */
+  const deleteRecs = async (ids: number[]) => {
+    if (!ids.length) return;
+    setDeleting(true);
+    const failed: number[] = [];
+    for (const id of ids) {
+      try {
+        const r = await fetch(`${apiBase}/api/recommendations/${id}`, { method: "DELETE" });
+        if (!r.ok) failed.push(id);
+      } catch { failed.push(id); }
+    }
+    setDeleting(false);
+    setConfirmDelete(false);
+    // Keep anything that did NOT delete selected, so a partial failure is
+    // visible and retryable instead of silently leaving rows behind.
+    setSelectedRecs(new Set(failed));
+    setDeleteError(failed.length ? `${failed.length} baris gagal dihapus — masih terpilih, coba lagi.` : null);
     await loadJournal();
   };
 
@@ -1587,6 +1618,25 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
           return true;
         });
 
+        // The same predicate the table below renders with. Selection and the
+        // delete button must agree with what is on screen, so they read from
+        // one definition rather than each re-deriving it.
+        const visibleOpen = filteredRecs.filter((r: any) =>
+          r.ticker !== "SUMMARY" && r.pattern_type !== "MONTHLY" && r.status === "OPEN");
+        const visibleSelectedIds = visibleOpen.filter((r: any) => selectedRecs.has(r.id)).map((r: any) => r.id);
+        const allVisibleSelected = visibleOpen.length > 0 && visibleSelectedIds.length === visibleOpen.length;
+        const toggleAllVisible = () => setSelectedRecs(prev => {
+          const n = new Set(prev);
+          if (allVisibleSelected) visibleOpen.forEach((r: any) => n.delete(r.id));
+          else visibleOpen.forEach((r: any) => n.add(r.id));
+          return n;
+        });
+        const toggleRec = (id: number) => setSelectedRecs(prev => {
+          const n = new Set(prev);
+          n.has(id) ? n.delete(id) : n.add(id);
+          return n;
+        });
+
         return (
         <>
           <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 16, flexWrap: "wrap" }}>
@@ -1700,11 +1750,75 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
               );
             }} />
           </div>
+          {/* Bulk selection — only when there is something to act on */}
+          {visibleOpen.length > 0 && (
+            <div style={{
+              display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+              marginBottom: 12, padding: "9px 14px", borderRadius: 10,
+              background: visibleSelectedIds.length ? "rgba(248,81,73,0.05)" : "var(--bg-secondary)",
+              border: `1px solid ${visibleSelectedIds.length ? "rgba(248,81,73,0.25)" : "var(--border)"}`,
+            }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, fontWeight: 700, color: "var(--text-muted)" }}>
+                <input type="checkbox" checked={allVisibleSelected}
+                  ref={el => { if (el) el.indeterminate = visibleSelectedIds.length > 0 && !allVisibleSelected; }}
+                  onChange={toggleAllVisible}
+                  style={{ width: 15, height: 15, accentColor: "#f85149", cursor: "pointer" }} />
+                Pilih semua ({visibleOpen.length})
+              </label>
+
+              {visibleSelectedIds.length > 0 && (
+                <>
+                  <span style={{ fontSize: 12, fontWeight: 800, color: "#f85149" }}>{visibleSelectedIds.length} dipilih</span>
+                  <button
+                    disabled={deleting}
+                    onClick={() => confirmDelete ? deleteRecs(visibleSelectedIds) : setConfirmDelete(true)}
+                    style={{
+                      padding: "6px 14px", borderRadius: 7, cursor: deleting ? "wait" : "pointer",
+                      fontSize: 12, fontWeight: 800, opacity: deleting ? 0.6 : 1,
+                      border: `1px solid ${confirmDelete ? "#f85149" : "rgba(248,81,73,0.4)"}`,
+                      background: confirmDelete ? "#f85149" : "rgba(248,81,73,0.08)",
+                      color: confirmDelete ? "#fff" : "#f85149",
+                    }}>
+                    {deleting ? "Menghapus…"
+                      : confirmDelete ? `Yakin? Hapus ${visibleSelectedIds.length} permanen`
+                      : `🗑 Hapus ${visibleSelectedIds.length}`}
+                  </button>
+                  <button onClick={() => { setSelectedRecs(new Set()); setConfirmDelete(false); setDeleteError(null); }}
+                    style={{ padding: "6px 12px", borderRadius: 7, border: "1px solid var(--border)", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+                    Batal pilih
+                  </button>
+                </>
+              )}
+
+              {selectedRecs.size > visibleSelectedIds.length && (
+                <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                  ({selectedRecs.size - visibleSelectedIds.length} terpilih tapi tidak terlihat — tidak ikut terhapus)
+                </span>
+              )}
+
+              {/* Said once, at the moment it matters: this button edits the
+                  denominator of the win rate on the Stats tab. */}
+              {confirmDelete && (
+                <span style={{ fontSize: 11, color: "#e3b341", fontWeight: 700 }}>
+                  Permanen, tidak ada undo — dan ini mengubah Win Rate di tab Stats.
+                </span>
+              )}
+              {deleteError && (
+                <span style={{ fontSize: 11, color: "#f85149", fontWeight: 700 }}>{deleteError}</span>
+              )}
+            </div>
+          )}
+
           <div style={{ background: "var(--bg-secondary)", borderRadius: 12, border: "1px solid var(--border)", overflow: "hidden" }}>
             <div style={{ overflowX: "auto" }}>
               <div style={{ display: "grid",
-                gridTemplateColumns: "80px 90px 50px 80px 70px 70px 70px 50px 60px 90px 90px 90px 85px 90px 50px 100px 95px",
-                padding: "10px 16px", borderBottom: "1px solid var(--border)", gap: 8, minWidth: 1315 }}>
+                gridTemplateColumns: "34px 80px 90px 50px 80px 70px 70px 70px 50px 60px 90px 90px 90px 85px 90px 50px 100px 95px",
+                padding: "10px 16px", borderBottom: "1px solid var(--border)", gap: 8, minWidth: 1349 }}>
+                <input type="checkbox" checked={allVisibleSelected}
+                  ref={el => { if (el) el.indeterminate = visibleSelectedIds.length > 0 && !allVisibleSelected; }}
+                  onChange={toggleAllVisible}
+                  aria-label="Pilih semua"
+                  style={{ width: 15, height: 15, accentColor: "#f85149", cursor: "pointer" }} />
                 {["TICKER","PATTERN","DIR","ENTRY","SL","T1","T2","R:R","LOT","MODAL","EST T1","EST T2","HARGA ACTUAL","FLOAT P/L","HOLD","STATUS","DITAMBAHKAN"].map(h => (
                   <span key={h} onClick={() => { if(openSortCol===h) setOpenSortAsc(!openSortAsc); else { setOpenSortCol(h); setOpenSortAsc(true); } }}
                     style={{ fontSize: 12, fontWeight: 800, color: openSortCol===h?"#3b82f6":"var(--text-secondary)", letterSpacing: "0.1em", cursor:"pointer", userSelect:"none" }}>
@@ -1756,14 +1870,22 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
                 return (
                   <div key={r.id} style={{
                     display: "grid",
-                    gridTemplateColumns: "80px 90px 50px 80px 70px 70px 70px 50px 60px 90px 90px 90px 85px 90px 50px 100px 95px",
+                    gridTemplateColumns: "34px 80px 90px 50px 80px 70px 70px 70px 50px 60px 90px 90px 90px 85px 90px 50px 100px 95px",
                     padding: "11px 16px", borderBottom: "1px solid rgba(48,54,61,0.5)",
-                    gap: 8, alignItems: "center", minWidth: 1315,
+                    gap: 8, alignItems: "center", minWidth: 1349,
                     opacity: isClosed ? 0.65 : 1,
-                    background: r.status === "HIT_T2" ? "rgba(16,185,129,0.04)" :
+                    // Selection wins over the outcome colour: a selected row is
+                    // about to be destroyed, which matters more right now than
+                    // whether it hit its target.
+                    background: selectedRecs.has(r.id) ? "rgba(248,81,73,0.07)" :
+                                r.status === "HIT_T2" ? "rgba(16,185,129,0.04)" :
                                 r.status === "HIT_T1" ? "rgba(52,211,153,0.03)" :
                                 r.status === "STOPPED" ? "rgba(248,113,113,0.04)" : "transparent",
                   }}>
+                    <input type="checkbox" checked={selectedRecs.has(r.id)}
+                      onChange={() => toggleRec(r.id)}
+                      aria-label={`Pilih ${r.ticker}`}
+                      style={{ width: 15, height: 15, accentColor: "#f85149", cursor: "pointer" }} />
                     <span style={{ fontSize: 15, fontWeight: 900, color: "var(--text-primary)" }}>{r.ticker}</span>
                     <div style={{ display: "flex", flexDirection: "column", gap: 3, alignItems: "flex-start" }}>
                       <span style={{ display: "inline-block", padding: "2px 7px", borderRadius: 5, background: meta.bg,
