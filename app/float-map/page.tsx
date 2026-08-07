@@ -70,6 +70,46 @@ export default function FloatMapPage() {
   const cur = rows.find((r: any) => r.ticker === sel) || rows[0];
   const maxShare = cur ? Math.max(...cur.dist.map((d: any) => d.share)) : 1;
 
+  /**
+   * A snapshot that stopped being regenerated still returns HTTP 200 and still
+   * looks like today's ranking. That is more dangerous than a missing file:
+   * missing is obvious, stale-but-valid is not. So the age of the underlying
+   * session is measured here and the ranking is DISABLED past the threshold,
+   * not merely annotated.
+   *
+   * Counted in weekdays, because a Friday snapshot read on Monday morning is
+   * one session old, not three days old. IDX holidays will occasionally make
+   * this read stale when it is not — a false STALE is the safe direction.
+   */
+  const weekdaysBetween = (fromISO: string) => {
+    const a = new Date(fromISO + 'T00:00:00Z'), b = new Date();
+    let n = 0;
+    for (const d = new Date(a); d < b; d.setUTCDate(d.getUTCDate() + 1)) {
+      const wd = d.getUTCDay();
+      if (wd !== 0 && wd !== 6) n++;
+    }
+    return n;
+  };
+  const sessionAge = data.session ? weekdaysBetween(String(data.session).slice(0, 10)) : 99;
+  const STALE_AFTER = 2;                       // one missed nightly run is tolerated; two is not
+  const stale = sessionAge > STALE_AFTER;
+
+  const dateStatus = (label: string, value: string | null, expected?: string) => {
+    if (!value) return { label, value: '–', tone: WARN, note: 'not recorded' };
+    const v = String(value).slice(0, 10);
+    if (expected && v !== expected) {
+      const lag = weekdaysBetween(v);
+      return { label, value: v, tone: lag > 2 ? BAD : WARN, note: `${lag} session(s) behind` };
+    }
+    return { label, value: v, tone: OK, note: 'current' };
+  };
+  const sessionStr = String(data.session).slice(0, 10);
+  const statuses = [
+    dateStatus('Price', data.priceMaxDate ?? data.session, sessionStr),
+    dateStatus('Broker flow', data.brokerMaxDate, sessionStr),
+    dateStatus('Free float', data.freeFloatAsOf, undefined),
+  ];
+
   return (
     <>
     <Navbar />
@@ -91,6 +131,58 @@ export default function FloatMapPage() {
             </div>
           </div>
         </div>
+
+        {/* ── data status ─────────────────────────────────────────────── */}
+        <div style={{
+          marginTop: 14, display: 'flex', gap: 22, flexWrap: 'wrap', alignItems: 'flex-start',
+          padding: '11px 13px', borderRadius: 8,
+          background: stale ? 'rgba(248,81,73,0.07)' : 'var(--bg-primary)',
+          border: `1px solid ${stale ? BAD + '55' : 'var(--border)'}`,
+        }}>
+          {statuses.map(s => (
+            <div key={s.label}>
+              <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.05em' }}>
+                {s.label.toUpperCase()}
+              </div>
+              <div style={{ fontSize: 14, fontWeight: 700, color: s.tone, marginTop: 2 }}>{s.value}</div>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>{s.note}</div>
+            </div>
+          ))}
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.05em' }}>SNAPSHOT</div>
+            <div style={{ fontSize: 14, fontWeight: 700, color: stale ? BAD : OK, marginTop: 2 }}>
+              {data.generatedAt ? new Date(data.generatedAt).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '–'}
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+              session {sessionStr} · {sessionAge} weekday(s) ago
+            </div>
+          </div>
+          <div style={{ marginLeft: 'auto' }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.05em' }}>MODEL</div>
+            <div style={{ fontSize: 14, fontWeight: 700, marginTop: 2 }}>{data.modelVersion || '–'}</div>
+            <div style={{ fontSize: 11, color: data.modelCommit ? 'var(--text-muted)' : WARN }}>
+              {data.modelCommit
+                ? <>commit <code>{data.modelCommit}</code> · k={data.turnoverCoefficient}</>
+                : 'commit NOT STAMPED — output cannot be traced to source'}
+            </div>
+          </div>
+        </div>
+
+        {/* The ranking is switched off, not annotated. A stale ordering that
+            still sorts looks exactly like a fresh one. */}
+        {stale && (
+          <div style={{
+            marginTop: 12, padding: '12px 14px', borderRadius: 8,
+            background: 'rgba(248,81,73,0.1)', border: `1px solid ${BAD}`,
+            fontSize: 15, lineHeight: 1.6,
+          }}>
+            <b style={{ color: BAD }}>⚠ STALE SNAPSHOT — RANKING DISABLED.</b>{' '}
+            The most recent snapshot is built on session <b>{sessionStr}</b>, {sessionAge} weekdays
+            ago. The nightly job has not produced a current one, so the ordering below would be
+            yesterday&apos;s answer wearing today&apos;s date. Values are shown greyed for
+            reference only. Check <code>/var/log/float-map.log</code> on the VPS.
+          </div>
+        )}
 
         {/* Said before the table, not after it. */}
         <div style={{
@@ -118,9 +210,9 @@ export default function FloatMapPage() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))', gap: 14, alignItems: 'start' }}>
 
         {/* ── ranking ─────────────────────────────────────────────────── */}
-        <div style={{ ...card, padding: 0, overflow: 'hidden' }}>
+        <div style={{ ...card, padding: 0, overflow: 'hidden', opacity: stale ? 0.45 : 1, filter: stale ? 'grayscale(1)' : 'none' }}>
           <div style={{ padding: '14px 18px 6px', fontSize: 14, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)' }}>
-            RANKED BY RESIDUAL COST GAP
+            RANKED BY RESIDUAL COST GAP{stale && ' — DISABLED'}
           </div>
           <div style={{ overflowX: 'auto', maxHeight: 620, overflowY: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
@@ -186,12 +278,12 @@ export default function FloatMapPage() {
               <Row k="Estimated avg cost" v={rp(cur.avgCost)} />
               <Row k="Residual gap" v={`${cur.avgCostGapResid > 0 ? '+' : ''}${cur.avgCostGapResid}%`}
                    color={cur.avgCostGapResid >= 0 ? OK : BAD} />
-              <Row k="Estimated in profit" v={`${cur.profitSupply}%`} color={OK} />
+              <Row k="Estimated in profit" v={`${cur.profitSupply}%`} color={OK} desc />
               <Row k="Overhead supply" v={`${cur.overheadSupply}%`}
-                   color={cur.overheadSupply > 40 ? BAD : WARN} />
-              <Row k="Largest cost cluster" v={`${rp(cur.peakLow)}–${rp(cur.peakHigh)}`} />
+                   color={cur.overheadSupply > 40 ? BAD : WARN} desc />
+              <Row k="Largest cost cluster" v={`${rp(cur.peakLow)}–${rp(cur.peakHigh)}`} desc />
               <Row k="Free float" v={`${cur.floatPct}%`} />
-              <Row k="Float rotation 20d / 60d" v={`${cur.rotation20}% / ${cur.rotation60}%`} />
+              <Row k="Float rotation 20d / 60d" v={`${cur.rotation20}% / ${cur.rotation60}%`} desc />
             </div>
 
             <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
@@ -211,10 +303,21 @@ export default function FloatMapPage() {
   );
 }
 
-function Row({ k, v, color }: { k: string; v: React.ReactNode; color?: string }) {
+/**
+ *  marks a metric that is DESCRIPTIVE ONLY. EXP-023 measured
+ * profitSupply at residual IC 0.022 and rotation at ~0.01 (not significant);
+ * only the residualised avgCostGap sorted forward returns. Colouring these
+ * green and red without saying so reads as a validated signal.
+ */
+function Row({ k, v, color, desc }: { k: string; v: React.ReactNode; color?: string; desc?: boolean }) {
   return (
     <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
-      <span style={{ color: 'var(--text-muted)' }}>{k}</span>
+      <span style={{ color: 'var(--text-muted)' }}>
+        {k}
+        {desc && <span title="Descriptive estimate — not independently validated as a trading signal"
+          style={{ marginLeft: 5, fontSize: 10, fontWeight: 800, color: '#8b949e',
+                   border: '1px solid #8b949e55', borderRadius: 4, padding: '0 4px' }}>DESC</span>}
+      </span>
       <span style={{ fontWeight: 700, color: color || 'var(--text-primary)' }}>{v}</span>
     </div>
   );
