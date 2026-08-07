@@ -16,7 +16,7 @@
  */
 
 import Navbar from '@/components/Navbar';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 
 const OK = '#3fb950', WARN = '#e3b341', BAD = '#f85149', MUTED = '#8b949e', INFO = '#58a6ff';
 
@@ -38,6 +38,45 @@ export default function FloatMapPage() {
   const [data, setData] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
   const [sel, setSel] = useState<string | null>(null);
+
+  /**
+   * Match the list's height to the detail panel beside it.
+   *
+   * A fixed height cannot work: the panel's height depends on how many
+   * distribution buckets the selected ticker has, so it changes on every click.
+   * A viewport-based height cannot work either — at 1600x900 the panel is
+   * 1265px tall against a 900px viewport, so the list stopped less than
+   * halfway down and read as truncated.
+   *
+   * Only applied when the two are actually side by side. On a narrow screen the
+   * grid stacks them, and forcing a tall scroller there would strand the detail
+   * panel below a screenful of empty list.
+   */
+  const leftCardRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
+  const [listHeight, setListHeight] = useState<number | null>(null);
+
+  useEffect(() => {
+    const sync = () => {
+      const leftCard = leftCardRef.current, detail = detailRef.current;
+      if (!leftCard || !detail) return;
+      // Compare the two CARDS. Comparing the scroller instead was off by the
+      // height of the heading above it, so this test never once passed.
+      const sideBySide = Math.abs(leftCard.getBoundingClientRect().top - detail.getBoundingClientRect().top) < 40;
+      if (!sideBySide) { setListHeight(null); return; }
+      // Minus the section heading that sits above the scroll area.
+      // The scroller is the card minus its heading; match the detail card's
+      // total height so the two columns end level.
+      const heading = leftCard.offsetHeight - (listRef.current?.offsetHeight ?? 0);
+      setListHeight(Math.max(420, detail.offsetHeight - heading));
+    };
+    sync();
+    const ro = new ResizeObserver(sync);
+    if (detailRef.current) ro.observe(detailRef.current);
+    window.addEventListener('resize', sync);
+    return () => { ro.disconnect(); window.removeEventListener('resize', sync); };
+  }, [sel, data]);
 
   useEffect(() => {
     fetch('/api/float-map')
@@ -210,11 +249,18 @@ export default function FloatMapPage() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(100%, 320px), 1fr))', gap: 14, alignItems: 'start' }}>
 
         {/* ── ranking ─────────────────────────────────────────────────── */}
-        <div style={{ ...card, padding: 0, overflow: 'hidden', opacity: stale ? 0.45 : 1, filter: stale ? 'grayscale(1)' : 'none' }}>
+        <div ref={leftCardRef} style={{ ...card, padding: 0, overflow: 'hidden', opacity: stale ? 0.45 : 1, filter: stale ? 'grayscale(1)' : 'none' }}>
           <div style={{ padding: '14px 18px 6px', fontSize: 14, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)' }}>
             RANKED BY RESIDUAL COST GAP{stale && ' — DISABLED'}
           </div>
-          <div style={{ overflowX: 'auto', maxHeight: 620, overflowY: 'auto' }}>
+          {/* Was a flat 620px, which stopped short of the bottom on any normal
+              screen and left the column looking truncated next to the detail
+              panel. Tied to the viewport instead so it reaches the fold, with a
+              floor so it stays usable on a short window. */}
+          <div ref={listRef} style={{
+            overflowX: 'auto', overflowY: 'auto',
+            height: listHeight ?? 620, minHeight: 420,
+          }}>
             <table style={{ width: '100%', borderCollapse: 'collapse' }}>
               <thead><tr>
                 <th style={th}>#</th><th style={th}>TICKER</th>
@@ -248,7 +294,7 @@ export default function FloatMapPage() {
 
         {/* ── the map itself ──────────────────────────────────────────── */}
         {cur && (
-          <div style={card}>
+          <div ref={detailRef} style={card}>
             <div style={{ fontSize: 14, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)', marginBottom: 4 }}>
               ESTIMATED COST DISTRIBUTION
             </div>
