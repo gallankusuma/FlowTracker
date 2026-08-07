@@ -177,8 +177,8 @@ export default function FloatMapPage() {
             fontSize: 15, lineHeight: 1.6,
           }}>
             <b style={{ color: BAD }}>⚠ STALE SNAPSHOT — RANKING DISABLED.</b>{' '}
-            The most recent snapshot is built on session <b>{sessionStr}</b>, {sessionAge} weekdays
-            ago. The nightly job has not produced a current one, so the ordering below would be
+            The most recent snapshot is built on session <b>{sessionStr}</b>, {sessionAge}{' '}
+            weekdays ago. The nightly job has not produced a current one, so the ordering below would be
             yesterday&apos;s answer wearing today&apos;s date. Values are shown greyed for
             reference only. Check <code>/var/log/float-map.log</code> on the VPS.
           </div>
