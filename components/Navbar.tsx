@@ -13,6 +13,7 @@ const NAV_ITEMS = [
   { label: "Insider Moves",       href: "/insider-moves",       icon: "👁" },
   { label: "Broker Activity",     href: "/broker-activity",     icon: "📋" },
   { label: "Signal Scanner",      href: "/signal-scanner",      icon: "🎯", badge: "NEW" },
+  { label: "Float Map",           href: "/float-map",           icon: "🧭", badge: "EXP", badgeColor: "#a371f7" },
   { label: "IDX Big Caps",        href: "/idx",                 icon: "🏛", badge: "NEW", badgeColor: "#f0a500" },
   { label: "US Market",           href: "/us-signal-scanner",   icon: "🇺🇸", badge: "NEW", badgeColor: "#f0a500" },
   { label: "AWO",                  href: "/awo-dashboard",       icon: "🧠", badge: "AI", badgeColor: "#17C671" },
