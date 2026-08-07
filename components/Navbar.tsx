@@ -5,6 +5,9 @@ import { useState, useEffect, useRef } from "react";
 
 const NAV_ITEMS = [
   { label: "Dashboard",           href: "/",                    icon: "🏠" },
+  // Second, on purpose: this is the page the day is supposed to start on, and a
+  // "start here" screen buried under More is a screen nobody starts on.
+  { label: "Trade Desk",          href: "/trade-desk",          icon: "🖥", badge: "LIVE", badgeColor: "#3fb950" },
   { label: "Flow Analyzer",       href: "/flow-analyzer",       icon: "🌊" },
   { label: "Accum. Streak",       href: "/accumulation-streak", icon: "🔥" },
   { label: "Insider Moves",       href: "/insider-moves",       icon: "👁" },
@@ -22,7 +25,9 @@ const NAV_ITEMS = [
   { label: "Journey",              href: "/journey",              icon: "📈", badge: "NEW", badgeColor: "#f0a500" },
 ];
 
-const PRIMARY_COUNT = 7;
+// Raised from 7 when Trade Desk was inserted at position 2, so that adding it
+// does not silently demote whatever used to be last in the primary bar.
+const PRIMARY_COUNT = 8;
 const PRIMARY_ITEMS = NAV_ITEMS.slice(0, PRIMARY_COUNT);
 const MORE_ITEMS    = NAV_ITEMS.slice(PRIMARY_COUNT);
 

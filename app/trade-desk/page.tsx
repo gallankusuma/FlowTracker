@@ -16,6 +16,10 @@
  * than only its length, and an empty plan has to explain itself.
  */
 
+// Each page mounts the Navbar itself in this app — it is not in the root
+// layout. Miss it and the page has no way out except the browser's back
+// button, which is how /virtual-portfolio ended up stranded.
+import Navbar from '@/components/Navbar';
 import { useState, useEffect } from 'react';
 import { API_BASE } from '@/lib/apiConfig';
 
@@ -99,17 +103,26 @@ export default function TradeDeskPage() {
     return () => { cancelled = true; };
   }, []);
 
-  if (loading) return <div style={{ padding: 28, color: 'var(--text-muted)' }}>loading trade desk…</div>;
+  if (loading) return (
+    <><Navbar />
+      <div style={{ padding: 28, color: 'var(--text-muted)' }}>loading trade desk…</div>
+    </>
+  );
+  // The Navbar renders in every branch, including the failures. A page that
+  // drops its own navigation when something goes wrong strands you exactly when
+  // you most need to go somewhere else.
   if (error) return (
-    <div style={{ padding: 28 }}>
-      <div style={{ ...card, borderColor: BAD }}>
-        <div style={{ color: BAD, fontWeight: 800, marginBottom: 6 }}>TRADE DESK UNAVAILABLE</div>
-        <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
-          Could not reach the engine: {error}. Nothing below is being shown — an empty
-          desk would look like a quiet day.
+    <><Navbar />
+      <div style={{ padding: 28 }}>
+        <div style={{ ...card, borderColor: BAD }}>
+          <div style={{ color: BAD, fontWeight: 800, marginBottom: 6 }}>TRADE DESK UNAVAILABLE</div>
+          <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+            Could not reach the engine: {error}. Nothing below is being shown — an empty
+            desk would look like a quiet day.
+          </div>
         </div>
       </div>
-    </div>
+    </>
   );
 
   const trust = vp?.trust || {};
@@ -141,6 +154,8 @@ export default function TradeDeskPage() {
     .slice(0, 10);
 
   return (
+    <>
+    <Navbar />
     <div style={{ padding: '24px 28px 60px', maxWidth: 1180, margin: '0 auto' }}>
 
       {/* ── header ─────────────────────────────────────────────────────── */}
@@ -428,5 +443,6 @@ export default function TradeDeskPage() {
         </div>
       </div>
     </div>
+    </>
   );
 }
