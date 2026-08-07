@@ -82,6 +82,7 @@ export default function TradeDeskPage() {
   const [vp, setVp] = useState<any>(null);
   const [ihsg, setIhsg] = useState<any>(null);
   const [health, setHealth] = useState<any>(null);
+  const [scan, setScan] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -91,9 +92,14 @@ export default function TradeDeskPage() {
       fetch(`${API_BASE}/api/virtual-portfolio`).then(r => r.json()),
       fetch(`${API_BASE}/api/ihsg?range=1M`).then(r => r.json()).catch(() => null),
       fetch(`${API_BASE}/api/system/health`).then(r => r.json()).catch(() => null),
-    ]).then(([v, i, h]) => {
+      // The research scanner is a SEPARATE engine from the strategy the virtual
+      // accounts execute. Showing only the portfolio's order queue made the desk
+      // look like the system had no opinion at all, when in fact it had one and
+      // was deliberately not acting on it.
+      fetch(`${API_BASE}/api/signal-scanner`).then(r => r.json()).catch(() => null),
+    ]).then(([v, i, h, s]) => {
       if (cancelled) return;
-      setVp(v); setIhsg(i); setHealth(h); setLoading(false);
+      setVp(v); setIhsg(i); setHealth(h); setScan(s); setLoading(false);
     }).catch(e => {
       if (cancelled) return;
       // A desk that cannot reach the engine must say so, not render an empty
@@ -252,7 +258,7 @@ export default function TradeDeskPage() {
 
       {/* ── tomorrow ───────────────────────────────────────────────────── */}
       <div style={{ ...card, marginBottom: 16 }}>
-        <div style={sectionTitle}>TOMORROW — PLAN</div>
+        <div style={sectionTitle}>TOMORROW — PLAN (WHAT THE TRACKED STRATEGY WILL EXECUTE)</div>
         {allPending.length === 0 ? (
           <div style={{ fontSize: 12, lineHeight: 1.65, color: 'var(--text-muted)' }}>
             <b style={{ color: 'var(--text-primary)' }}>Nothing scheduled.</b>{' '}
@@ -262,7 +268,9 @@ export default function TradeDeskPage() {
                 below its 200-day average and has been since {regime.since}. The strategy is
                 deliberately flat, so an empty plan is the strategy working, not the pipeline
                 failing. The two are indistinguishable on a screen that only shows an empty
-                table, which is why this sentence is here.
+                table, which is why this sentence is here. The research scanner below may
+                still be flagging names — it is a different engine and does not pass through
+                this gate.
               </>
             ) : blocked ? (
               <>Orders cannot be scheduled while the engine is blocked (see above).</>
@@ -299,6 +307,121 @@ export default function TradeDeskPage() {
           </>
         )}
       </div>
+
+      {/* ── research scanner ───────────────────────────────────────────── */}
+      {(() => {
+        const rows = scan?.data || [];
+        const buys = rows.filter((r: any) => /BUY/.test(r.signal))
+          .sort((a: any, b: any) => b.score - a.score);
+        // Two dates that are easy to conflate and must not be: the session we
+        // are in, and the session the scanner's inputs actually cover.
+        const scanDate = scan?.date || null;
+        const lagging = scanDate && trust.sessionCalendar && scanDate !== trust.sessionCalendar;
+        // A tier that sizes nothing is a research opinion, not a position.
+        const sizesNothing = buys.length > 0 && buys.every((r: any) => !r.sizeMultiplier);
+
+        return (
+          <div style={{ ...card, marginBottom: 16 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', flexWrap: 'wrap', gap: 10 }}>
+              <div style={sectionTitle}>SIGNALS — RESEARCH SCANNER</div>
+              <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>
+                {scan?.source || '–'} {scan?.engine?.version ? `· v${scan.engine.version}` : ''}
+                {scan?.market ? ` · ${scan.market.total} scanned` : ''}
+              </div>
+            </div>
+
+            {!scan ? (
+              <div style={{ fontSize: 12, color: MUTED }}>Scanner unreachable.</div>
+            ) : (
+              <>
+                {/* Two warnings that change what these rows MEAN, so they go
+                    above the rows, not in a footnote under them. */}
+                {lagging && (
+                  <div style={{
+                    padding: '9px 12px', borderRadius: 8, marginBottom: 12,
+                    background: 'rgba(227,179,65,0.08)', border: `1px solid ${WARN}44`,
+                    fontSize: 12, lineHeight: 1.55,
+                  }}>
+                    <b style={{ color: WARN }}>Mixed vintage: prices are {trust.sessionCalendar},
+                    broker inputs are {scanDate}.</b>{' '}
+                    Verified against the price table — the entry, stop and target below are
+                    computed from today&apos;s close, while the bandarmology factors are five
+                    sessions behind because that feed is stale (see SYSTEM EVIDENCE). Nothing
+                    in a row tells you which half is which, so treat the broker-derived parts
+                    as a week old.
+                  </div>
+                )}
+                {sizesNothing && (
+                  <div style={{
+                    padding: '9px 12px', borderRadius: 8, marginBottom: 12,
+                    background: 'rgba(88,166,255,0.07)', border: `1px solid ${INFO}44`,
+                    fontSize: 12, lineHeight: 1.55,
+                  }}>
+                    <b style={{ color: INFO }}>Shadow only — every one of these sizes to zero.</b>{' '}
+                    Conviction sizing is switched off because no measured edge survived
+                    testing (EXP-005, EXP-018). The tier letter is a label, not a position size.
+                  </div>
+                )}
+
+                {buys.length === 0 ? (
+                  <div style={{ fontSize: 12, color: 'var(--text-muted)' }}>
+                    No BUY signals. {scan?.market ? `${scan.market.total} names scanned, breadth ${scan.market.breadthPct}%.` : ''}
+                  </div>
+                ) : (
+                  <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                    <thead><tr>
+                      <th style={th}>TICKER</th><th style={th}>SIGNAL</th><th style={th}>SCORE</th>
+                      <th style={th}>TIER</th><th style={th}>CONF</th><th style={th}>WIN RATE</th>
+                      <th style={th}>ENTRY</th><th style={th}>STOP</th><th style={th}>TARGET</th>
+                      <th style={th}>R:R</th><th style={th}>SIZE</th>
+                    </tr></thead>
+                    <tbody>
+                      {buys.slice(0, 12).map((r: any) => (
+                        <tr key={r.ticker}>
+                          <td style={{ ...td, fontWeight: 800 }}>{r.ticker}</td>
+                          <td style={{ ...td, color: OK, fontWeight: 700 }}>{r.signal}</td>
+                          <td style={td}>{r.score}</td>
+                          <td style={td} title={r.tierReason || ''}>{r.convictionTier || '–'}</td>
+                          {/* Confidence and historical win rate sit next to the
+                              tier on purpose: a tier A at 25% confidence should
+                              not read like a strong recommendation. */}
+                          <td style={{ ...td, color: r.confidence >= 50 ? OK : WARN }}>{r.confidence}%</td>
+                          <td style={{ ...td, color: r.winRate >= 50 ? OK : WARN }}>
+                            {r.winRate}%
+                            {r.winRateSample ? <span style={{ color: 'var(--text-muted)', fontSize: 10 }}> /{r.winRateSample}</span> : null}
+                          </td>
+                          <td style={td}>{rp(r.tradePlan?.entry)}</td>
+                          <td style={{ ...td, color: BAD }}>{rp(r.tradePlan?.stopLoss)}</td>
+                          <td style={{ ...td, color: OK }}>{rp(r.tradePlan?.target1)}</td>
+                          <td style={td}>{r.tradePlan?.riskReward ?? '–'}</td>
+                          <td style={{ ...td, color: r.sizeMultiplier ? 'var(--text-primary)' : MUTED }}>
+                            {r.sizeMultiplier ? `${r.sizeMultiplier}×` : '0 ×'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+
+                <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 11, lineHeight: 1.6, borderTop: '1px solid var(--border)', paddingTop: 9 }}>
+                  <b>This is a different engine from the tracked strategy.</b> The scanner is
+                  research output over the whole universe; the virtual accounts execute{' '}
+                  <b>{strategy}</b> with its regime gate, which is why the plan above can be
+                  empty while this table is not. Neither list is an instruction — the accounts
+                  on this page are simulated, and nothing here places an order.
+                  {scan?.market && <> Breadth {scan.market.breadthPct}% · {scan.market.bullish} bullish, {scan.market.bearish} bearish.</>}
+                  {' '}A high score is <b>not</b> a forecast: the score is computed from a window
+                  that includes today, so today&apos;s risers score highly by construction. Measured
+                  2026-08-07, score correlates 0.35 with the same day&apos;s move, while the
+                  strongest genuinely forward-looking factor this project has found (EXP-011,
+                  52-week-high proximity) sits at IC 0.044. Sorting by score and seeing green is
+                  the engine describing the day, not predicting it.
+                </div>
+              </>
+            )}
+          </div>
+        );
+      })()}
 
       {/* ── open positions ─────────────────────────────────────────────── */}
       <div style={{ ...card, marginBottom: 16 }}>
