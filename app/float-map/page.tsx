@@ -123,7 +123,10 @@ export default function FloatMapPage() {
   const weekdaysBetween = (fromISO: string) => {
     const a = new Date(fromISO + 'T00:00:00Z'), b = new Date();
     let n = 0;
+    // Start the day AFTER the session: the session itself is not elapsed time,
+    // and counting it made a same-day snapshot read as "1 weekday ago".
     for (const d = new Date(a); d < b; d.setUTCDate(d.getUTCDate() + 1)) {
+      if (d.getTime() === a.getTime()) continue;
       const wd = d.getUTCDay();
       if (wd !== 0 && wd !== 6) n++;
     }
@@ -145,8 +148,20 @@ export default function FloatMapPage() {
   const sessionStr = String(data.session).slice(0, 10);
   const statuses = [
     dateStatus('Price', data.priceMaxDate ?? data.session, sessionStr),
-    dateStatus('Broker flow', data.brokerMaxDate, sessionStr),
-    dateStatus('Free float', data.freeFloatAsOf, undefined),
+    // Counted on idx_ihsg_history server-side, so an IDX holiday no longer
+    // reads as staleness the way a Monday-to-Friday count did.
+    data.brokerMaxDate
+      ? { label: 'Broker flow', value: String(data.brokerMaxDate).slice(0, 10),
+          tone: (data.brokerLagSessions ?? 99) <= 1 ? OK : (data.brokerLagSessions ?? 99) <= 3 ? WARN : BAD,
+          note: `${data.brokerLagSessions ?? '?'} session(s) behind` }
+      : { label: 'Broker flow', value: '-', tone: WARN, note: 'not recorded' },
+    // Coverage, not one date: MAX(fetched_at) reported CURRENT when a single
+    // ticker refreshed and the rest still carried month-old numbers.
+    data.freeFloat
+      ? { label: 'Free float', value: `${data.freeFloat.fresh}/${data.freeFloat.total} fresh`,
+          tone: data.freeFloat.coveragePct >= 90 ? OK : data.freeFloat.coveragePct >= 70 ? WARN : BAD,
+          note: `${data.freeFloat.stale} stale, ${data.freeFloat.rejected} rejected` }
+      : { label: 'Free float', value: '-', tone: WARN, note: 'not recorded' },
   ];
 
   return (
@@ -164,10 +179,11 @@ export default function FloatMapPage() {
             </div>
           </div>
           <div>
-            <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.06em' }}>CONFIDENCE</div>
-            <div style={{ fontSize: 19, fontWeight: 800, color: data.confidence >= 60 ? OK : WARN, marginTop: 3 }}>
-              {data.confidence}/100
+            <div style={{ fontSize: 13, fontWeight: 800, color: 'var(--text-muted)', letterSpacing: '0.06em' }}>MEDIAN CONFIDENCE</div>
+            <div style={{ fontSize: 19, fontWeight: 800, color: (data.confidence?.medianOverall ?? 0) >= 60 ? OK : WARN, marginTop: 3 }}>
+              {data.confidence?.medianOverall ?? '-'}/100
             </div>
+            <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>per ticker, not global</div>
           </div>
         </div>
 
@@ -267,6 +283,7 @@ export default function FloatMapPage() {
                 <th style={th}>RESID</th><th style={th}>raw</th>
                 <th style={th}>PRICE</th><th style={th}>EST COST</th>
                 <th style={th}>IN PROFIT</th><th style={th}>FLOAT</th>
+                <th style={th}>CONF</th><th style={th}>SEED LEFT</th>
               </tr></thead>
               <tbody>
                 {rows.map((r: any) => (
@@ -285,6 +302,13 @@ export default function FloatMapPage() {
                     <td style={td}>{rp(r.avgCost)}</td>
                     <td style={{ ...td, color: r.profitSupply >= 50 ? OK : WARN }}>{r.profitSupply}%</td>
                     <td style={{ ...td, color: r.floatPct < 15 ? WARN : 'var(--text-primary)' }}>{r.floatPct}%</td>
+                    <td style={{ ...td, color: r.confidence >= 60 ? OK : r.confidence >= 40 ? WARN : BAD }}>{r.confidence}</td>
+                    {/* How much of the map is still the arbitrary day-one seed.
+                        Above ~20% the "estimated cost basis" is largely a
+                        statement about a date somebody picked. */}
+                    <td style={{ ...td, color: r.seedRemaining <= 5 ? OK : r.seedRemaining <= 20 ? WARN : BAD }}>
+                      {r.seedRemaining}%
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -329,6 +353,11 @@ export default function FloatMapPage() {
                    color={cur.overheadSupply > 40 ? BAD : WARN} desc />
               <Row k="Largest cost cluster" v={`${rp(cur.peakLow)}–${rp(cur.peakHigh)}`} desc />
               <Row k="Free float" v={`${cur.floatPct}%`} />
+              <Row k="Confidence (data / convergence)"
+                   v={`${cur.confidence} (${cur.confidenceData} / ${cur.confidenceConvergence})`}
+                   color={cur.confidence >= 60 ? OK : cur.confidence >= 40 ? WARN : BAD} />
+              <Row k="Day-one seed still in the map" v={`${cur.seedRemaining}%`}
+                   color={cur.seedRemaining <= 5 ? OK : cur.seedRemaining <= 20 ? WARN : BAD} />
               <Row k="Float rotation 20d / 60d" v={`${cur.rotation20}% / ${cur.rotation60}%`} desc />
             </div>
 

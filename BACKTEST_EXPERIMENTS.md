@@ -1068,3 +1068,35 @@ Excluded and reported: **163 ticker-dates for a detected corporate action** (>35
 **Decision this drives**: if the Float Cost Map is used at all, it must be used as **a residual against momentum, not as the number printed on the chart** — the raw metric is approximately zero and the chart is extremely persuasive, which is the exact profile of EXP-016's inverted broker signal and of the contemporaneous scanner score. Phase 1 remains analytics-only; it does not touch `HI52W_REGIME_BROKERVETO_V1`, and the IDX burn-in stays sterile. Free-float sourcing is worth keeping for its own sake but is **not** the critical dependency it appeared to be.
 
 **Scripts**: `/root/research/float_fetch.js` (free float → `idx_free_float`), `/root/research/float_cost_map.js` (per-ticker map + confidence score), `/root/research/exp022_float_map_ic.js` (this study; `--from`, `--float-noise`, `--seed` drive the sensitivity runs). Deliberately outside `/var/www/flowtracker-scraper` so the frozen tree and `predeploy_check.sh` are undisturbed.
+
+### EXP-023 addendum (2026-08-08) — the seed, and a control the first pass missed
+
+Building per-ticker confidence surfaced a problem with the study above. The
+model seeds 100% of the float at the first session's typical price and lets
+turnover erode it, and `seedRemaining = Π(1 − turnoverᵢ × k)` turns out to be
+**34.4% at the median** across the 99-name universe — not a tail case. MIKA
+sits at 80.1%, HEAL 79.8%, CPIN 78.7%. For most names a large part of the
+"estimated cost basis" is a statement about where the price was 250 sessions
+ago, not about holder cost.
+
+That matters because the original residualisation removed ROC20 and ROC60 but
+**not** the ~250-day lookback the seed encodes — so the headline 0.0378 might
+have been long-horizon momentum wearing a new name.
+
+Re-run with ROC250 added as a third control:
+
+| residualised on | IC 20D | IC 40D | IC 60D | IR 60D |
+|---|---|---|---|---|
+| ROC20 + ROC60 | 0.0219 \* | 0.0323 \* | 0.0378 \* | 0.23 |
+| ROC20 + ROC60 + **ROC250** | 0.0210 \* | 0.0334 \* | **0.0338 \*** | 0.23 |
+
+**It survives.** The 60D IC drops from 0.0378 to 0.0338, still significant,
+with an identical information ratio, and 40D is marginally higher. So the
+signal is not merely the long lookback the unconverged seed carries — but the
+concern was legitimate and had to be measured rather than argued.
+
+`seedRemaining` is now computed per ticker, stored, split out as a MODEL
+CONVERGENCE score beside DATA quality, and shown on the page as "day-one seed
+still in the map". A name whose map is mostly its own initialisation can no
+longer score the same as one whose float has rotated forty times: the median
+confidence fell from a flat 80/100 to **48/100** once it was measured honestly.
