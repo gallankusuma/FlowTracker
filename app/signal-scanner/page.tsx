@@ -993,6 +993,37 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
    */
   const deleteRecs = async (ids: number[]) => {
     if (!ids.length) return;
+
+    // A FILE ON DISK BEFORE ANYTHING IS DESTROYED.
+    //
+    // On 2026-08-07 this table went from 52 rows to 0 within ten minutes of
+    // this button shipping, and it was only recoverable because MySQL happened
+    // to have ROW binlog enabled. That is luck, not a recovery plan. These rows
+    // are the entire forward record of what the engine predicted and what
+    // actually happened — there is no backtest that can regenerate them, and
+    // re-POSTing would mint new ids and new created_at values, so a restore
+    // through the API produces a journal whose timestamps are fiction.
+    //
+    // So the browser writes a full snapshot of exactly what is about to be
+    // deleted, first, and a failure to write it aborts the delete.
+    const doomed = recs.filter((r: any) => ids.includes(r.id));
+    try {
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      const blob = new Blob([JSON.stringify(doomed, null, 2)], { type: "application/json" });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href = url;
+      a.download = `ft-recommendations-deleted-${stamp}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (e: any) {
+      setDeleteError(`Backup gagal dibuat — tidak jadi menghapus. (${e?.message || e})`);
+      setConfirmDelete(false);
+      return;
+    }
+
     setDeleting(true);
     const failed: number[] = [];
     for (const id of ids) {
@@ -1780,7 +1811,7 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
                       color: confirmDelete ? "#fff" : "#f85149",
                     }}>
                     {deleting ? "Menghapus…"
-                      : confirmDelete ? `Yakin? Hapus ${visibleSelectedIds.length} permanen`
+                      : confirmDelete ? `Yakin? Hapus ${visibleSelectedIds.length} — backup .json diunduh dulu`
                       : `🗑 Hapus ${visibleSelectedIds.length}`}
                   </button>
                   <button onClick={() => { setSelectedRecs(new Set()); setConfirmDelete(false); setDeleteError(null); }}
@@ -2154,15 +2185,86 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
                 <span style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)" }}>📋 Riwayat Realized Trades</span>
                 <span style={{ fontSize: 12, color: "var(--text-muted)", marginLeft: "auto" }}>{realizedTrades.length} trades</span>
               </div>
+              {/* Bulk selection.
+                  This table is not a list of records that happen to be here —
+                  it IS the win rate printed a few centimetres above. Deleting
+                  from it is editing the score, so the controls say so. */}
+              {(() => {
+                const ids = realizedTrades.map((r: any) => r.id);
+                const sel = ids.filter((id: number) => selectedRecs.has(id));
+                const allSel = ids.length > 0 && sel.length === ids.length;
+                const losersSel = realizedTrades.filter((r: any) =>
+                  selectedRecs.has(r.id) && ["LOSS","STOPPED"].includes(r.status)).length;
+                if (!ids.length) return null;
+                return (
+                  <div style={{
+                    display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap",
+                    margin: "0 0 12px", padding: "9px 14px", borderRadius: 10,
+                    background: sel.length ? "rgba(248,81,73,0.05)" : "var(--bg-secondary)",
+                    border: `1px solid ${sel.length ? "rgba(248,81,73,0.25)" : "var(--border)"}`,
+                  }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", fontSize: 12, fontWeight: 700, color: "var(--text-muted)" }}>
+                      <input type="checkbox" checked={allSel}
+                        ref={el => { if (el) el.indeterminate = sel.length > 0 && !allSel; }}
+                        onChange={() => setSelectedRecs(prev => {
+                          const n = new Set(prev);
+                          if (allSel) ids.forEach((id: number) => n.delete(id));
+                          else ids.forEach((id: number) => n.add(id));
+                          return n;
+                        })}
+                        style={{ width: 15, height: 15, accentColor: "#f85149", cursor: "pointer" }} />
+                      Pilih semua ({ids.length})
+                    </label>
+                    {sel.length > 0 && (
+                      <>
+                        <span style={{ fontSize: 12, fontWeight: 800, color: "#f85149" }}>{sel.length} dipilih</span>
+                        <button disabled={deleting}
+                          onClick={() => confirmDelete ? deleteRecs(sel) : setConfirmDelete(true)}
+                          style={{
+                            padding: "6px 14px", borderRadius: 7, cursor: deleting ? "wait" : "pointer",
+                            fontSize: 12, fontWeight: 800, opacity: deleting ? 0.6 : 1,
+                            border: `1px solid ${confirmDelete ? "#f85149" : "rgba(248,81,73,0.4)"}`,
+                            background: confirmDelete ? "#f85149" : "rgba(248,81,73,0.08)",
+                            color: confirmDelete ? "#fff" : "#f85149",
+                          }}>
+                          {deleting ? "Menghapus…"
+                            : confirmDelete ? `Yakin? Hapus ${sel.length} — backup .json diunduh dulu`
+                            : `🗑 Hapus ${sel.length}`}
+                        </button>
+                        <button onClick={() => { setSelectedRecs(new Set()); setConfirmDelete(false); setDeleteError(null); }}
+                          style={{ padding: "6px 12px", borderRadius: 7, border: "1px solid var(--border)", background: "transparent", color: "var(--text-muted)", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+                          Batal pilih
+                        </button>
+                      </>
+                    )}
+                    {/* The specific move worth naming, because it is the one
+                        that quietly turns a record into a advertisement. */}
+                    {losersSel > 0 && (
+                      <span style={{ fontSize: 11, color: "#e3b341", fontWeight: 700 }}>
+                        {losersSel} dari yang dipilih adalah LOSS/STOPPED — menghapusnya akan
+                        menaikkan Win Rate di atas tanpa satu trade pun berubah.
+                      </span>
+                    )}
+                    {confirmDelete && sel.length > 0 && (
+                      <span style={{ fontSize: 11, color: "#f85149", fontWeight: 700 }}>
+                        Permanen, tidak ada undo.
+                      </span>
+                    )}
+                    {deleteError && <span style={{ fontSize: 11, color: "#f85149", fontWeight: 700 }}>{deleteError}</span>}
+                  </div>
+                );
+              })()}
+
               <div style={{ overflowX: "auto" }}>
                 {/* Table header - fr units fill full width */}
                 <div style={{
                   display: "grid",
-                  gridTemplateColumns: "1.1fr 1.4fr 0.4fr 1fr 1fr 1.2fr 1.2fr 0.5fr 0.9fr 1.3fr 1.4fr 1.3fr",
+                  gridTemplateColumns: "34px 1.1fr 1.4fr 0.4fr 1fr 1fr 1.2fr 1.2fr 0.5fr 0.9fr 1.3fr 1.4fr 1.3fr",
                   gap: 8, padding: "8px 16px",
                   borderBottom: "1px solid rgba(255,255,255,0.05)",
                   width: "100%", boxSizing: "border-box"
                 }}>
+                  <span />
                   {["TICKER","PATTERN","DIR","ENTRY","CLOSE","TGL MASUK","TGL KELUAR","HOLD","RESULT%","MODAL","P&L (Rp)","STATUS"].map(h => (
                     <span key={h} style={{ fontSize: 12, fontWeight: 800, color: "var(--text-secondary)", letterSpacing: "0.08em" }}>{h}</span>
                   ))}
@@ -2192,14 +2294,23 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
                   };
                   const sLabel: Record<string,string> = { WIN:"WIN ✅", LOSS:"LOSS ❌", HIT_T1:"HIT T1 🎯", HIT_T2:"HIT T2 🎯", STOPPED:"STOP 🛑", EXPIRED:"EXPIRED ⏰" };
                   const meta     = PATTERN_META[r.pattern_type] || PATTERN_META.ABCD;
-                  const COLS     = "1.1fr 1.4fr 0.4fr 1fr 1fr 1.2fr 1.2fr 0.5fr 0.9fr 1.3fr 1.4fr 1.3fr";
+                  const COLS     = "34px 1.1fr 1.4fr 0.4fr 1fr 1fr 1.2fr 1.2fr 0.5fr 0.9fr 1.3fr 1.4fr 1.3fr";
                   return (
                     <div key={r.id} style={{
                       display: "grid", gridTemplateColumns: COLS,
                       gap: 8, padding: "14px 16px", borderBottom: "1px solid rgba(48,54,61,0.4)",
                       alignItems: "center", width: "100%", boxSizing: "border-box",
-                      background: isWin ? "rgba(52,211,153,0.03)" : "rgba(248,113,113,0.03)",
+                      background: selectedRecs.has(r.id) ? "rgba(248,81,73,0.09)"
+                        : isWin ? "rgba(52,211,153,0.03)" : "rgba(248,113,113,0.03)",
                     }}>
+                      <input type="checkbox" checked={selectedRecs.has(r.id)}
+                        onChange={() => setSelectedRecs(prev => {
+                          const n = new Set(prev);
+                          n.has(r.id) ? n.delete(r.id) : n.add(r.id);
+                          return n;
+                        })}
+                        aria-label={`Pilih ${r.ticker}`}
+                        style={{ width: 15, height: 15, accentColor: "#f85149", cursor: "pointer" }} />
                       {/* TICKER */}
                       <span style={{ fontSize: 15, fontWeight: 900, color: "var(--text-primary)" }}>{r.ticker}</span>
                       {/* PATTERN */}
