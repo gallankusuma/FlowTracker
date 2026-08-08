@@ -1,57 +1,57 @@
 # Review Brief — 2026-08-08
 
-**Untuk tim review. Ini bukan balasan atas review; ini laporan masalah baru yang ditemukan saat mengerjakan prasyarat Pattern Replay.**
+**For the review team. This is not a response to a review; it reports a new problem found while doing the Pattern Replay precondition.**
 
-Ringkas: mesin sinyal IDX buta selama 8 hari, menyajikan angka basi sebagai angka hari ini, dan gerbang kesehatannya sendiri melaporkan "passed" selama itu berlangsung. Sudah diperbaiki sebagian. Akar penyebabnya belum, dan tidak bisa diperbaiki dengan kode.
+Short version: the IDX signal engine was blind for 8 days, serving stale numbers dated as today, and its own health gate reported "passed" the whole time. Partly fixed. The root cause is not, and cannot be fixed with code.
 
 ---
 
-## 1. Bagaimana ini ketemu
+## 1. How this surfaced
 
-Review Pattern Replay menetapkan satu prasyarat sebelum fitur dibangun:
+The Pattern Replay review set one precondition before any feature work:
 
 > "berapa hari history yang benar-benar lengkap? … Karena kalau hari yang hilang diperlakukan nol, pattern-nya palsu."
 
-Audit `idx_signal_history` untuk menjawab itu yang membuka sisanya. Prasyarat itu benar dan menyelamatkan kita dari membangun di atas data busuk.
+Auditing `idx_signal_history` to answer that is what opened everything else. The precondition was right and it saved us from building on rotten data.
 
 ---
 
-## 2. Yang sudah dikerjakan dan terverifikasi
+## 2. Done and verified
 
-### 2.1 Pembersihan 9 tanggal hantu — SELESAI
+### 2.1 Nine phantom dates purged — DONE
 
-979 baris di 9 tanggal non-sesi dihapus dari `idx_signal_history`:
+979 rows on 9 non-session dates deleted from `idx_signal_history`:
 `2026-05-01, 05-14, 05-15, 05-23, 05-27, 05-28, 05-30, 06-01, 06-06`
 
-Diverifikasi lewat dua jalur independen sebelum dihapus: **nol** price bar dan **nol** IHSG bar di kesembilan tanggal. Tiga di antaranya hari Sabtu, sisanya libur bursa. Semuanya bersumber `backfill_v2`, jadi ini cacat generator backfill, bukan feed live.
+Verified through two independent paths before deleting: **zero** price bars and **zero** IHSG bars on all nine. Three are Saturdays, the rest IDX holidays. All sourced `backfill_v2`, so this is a backfill-generator defect, not the live feed.
 
-Backup pra-hapus: `/root/backups/idx_signal_history-before-cleanup-2026-08-08.sql` (VPS).
-Sesudah: 17.183 baris, 119 hari, nol tanggal non-sesi tersisa.
+Pre-delete backup: `/root/backups/idx_signal_history-before-cleanup-2026-08-08.sql` (VPS).
+After: 17,183 rows, 119 days, zero non-session dates remaining.
 
-Kelas cacat yang sama dengan purge phantom price session 2026-08-04.
+Same defect class as the 2026-08-04 phantom price-session purge.
 
-### 2.2 Kekhawatiran "27 tanggal multi-source" — TIDAK TERBUKTI
+### 2.2 The "27 multi-source dates" concern — DID NOT HOLD
 
-Awalnya saya usulkan aturan prioritas sumber (`live` menang). **Tidak diperlukan.** Query menunjukkan **nol** pasangan `(data_date, stock_code)` duplikat. Tanggal-tanggal itu hanya berisi ticker berbeda dari sumber berbeda; tidak ada baris yang bertabrakan, tidak ada look-ahead dari situ. Usulan saya salah dan ditarik.
+I originally proposed a source-priority rule (`live` wins). **Not needed.** The query returns **zero** duplicate `(data_date, stock_code)` pairs. Those dates simply carry different tickers from different sources; no rows collide, and no look-ahead comes from it. My proposal was wrong and is withdrawn.
 
-### 2.3 Penolakan basi di `/api/signal-scanner` — TER-DEPLOY
+### 2.3 Staleness refusal in `/api/signal-scanner` — DEPLOYED
 
-`server.js:6158`. Endpoint mengembalikan **503** alih-alih menyajikan skor basi sebagai hari ini.
+`server.js:6158`. The endpoint now returns **503** instead of passing stale scores off as today.
 
-Terverifikasi live:
+Verified live:
 ```
 HTTP 503
 {"source":"stale-broker-feed","stale":true,"sessionsBehind":5,
  "latestBrokerDate":"2026-07-31","latestSessionDate":"2026-08-07"}
 ```
 
-**Keputusan desain yang minta ditinjau:** jam scanner sengaja **tidak** dipindahkan ke tabel harga. `idx_stock_prices` current sampai 08-07, jadi memindahkannya akan membuat endpoint "hidup" lagi — tapi f1 konsentrasi dan seluruh keluarga faktor broker bersumber dari tabel broker yang sama matinya. Hasilnya bukan sinyal lebih segar, melainkan sinyal percaya diri di atas input yang tidak ada. Menolak lebih jujur daripada mengarang. **Kalau tim tidak setuju, ini titik yang paling layak diperdebatkan.**
+**Design decision that most needs review:** the scanner's clock was deliberately **not** moved to the price tables. `idx_stock_prices` is current through 08-07, so moving it would make the endpoint "alive" again — but f1 concentration and the entire broker factor family read from the same dead broker tables. The result would not be fresher signals; it would be confident ones built on inputs that do not exist. Refusing is more honest than inventing. **If the team disagrees, this is the point most worth arguing.**
 
-Nol baris matematika skor berubah, jadi `strategy_hash` tidak bergeser.
+Zero lines of scoring math changed, so `strategy_hash` does not move.
 
-### 2.4 Check `brokerDataCurrent` di gerbang burn-in — TER-DEPLOY
+### 2.4 `brokerDataCurrent` check in the burn-in gate — DEPLOYED
 
-`watchdog.js:521`. Terverifikasi live:
+`watchdog.js:521`. Verified live:
 ```
 session_date 2026-08-07 · passed 0 · brokerDataCurrent false
 priceDataCurrent true · failures_json ["brokerDataCurrent"]
@@ -59,11 +59,11 @@ priceDataCurrent true · failures_json ["brokerDataCurrent"]
 
 ---
 
-## 3. Temuan utama, dan bagian yang paling perlu dikritik
+## 3. The main finding, and the part that most needs criticism
 
-**Feed broker mati 2026-07-31. Ketiga tabel serentak:**
+**The broker feed died on 2026-07-31. All three tables at once:**
 
-| tabel | terbaru |
+| table | newest |
 |---|---|
 | `idx_broker_summary` | 2026-07-31 |
 | `idx_concentration` | 2026-07-31 |
@@ -71,78 +71,79 @@ priceDataCurrent true · failures_json ["brokerDataCurrent"]
 | `idx_stock_prices` | 2026-08-07 |
 | `idx_ihsg_history` | 2026-08-07 |
 
-`/api/signal-scanner` mengambil notion "hari ini" dari `idx_broker_summary`, bukan dari harga (`server.js:6152`). Jadi selama 8 hari endpoint menyajikan skor 31 Juli, **bertanggal 31 Juli**, tanpa satu pun tanda basi di UI. Snapshot yang ditulis di akhir handler menulis ulang 31 Juli dengan nilai identik, sehingga jumlah baris pun tidak pernah bergerak — tidak ada sinyal apa pun bahwa ada yang salah.
+`/api/signal-scanner` takes its notion of "today" from `idx_broker_summary`, not from prices (`server.js:6152`). So for 8 days the endpoint served 31 July scores, **dated 31 July**, with no staleness indication anywhere in the UI. The snapshot write at the end of the handler rewrote 31 July with identical values, so even the row count never moved — there was no signal at all that anything was wrong.
 
-### 3.1 Gerbang burn-in punya titik buta persis di tempat kegagalannya
+### 3.1 The burn-in gate was blind in exactly the place it failed
 
-15 check, semua lulus, tiap malam:
+15 checks, all passing, every night:
 ```json
-"priceDataCurrent": true,   ← jujur, harga memang current
-"calendarCurrent":  true,   ← jujur, kalender memang benar
+"priceDataCurrent": true,   ← honestly true, prices were current
+"calendarCurrent":  true,   ← honestly true, the calendar was fine
 ...
 ```
-**Tidak ada satu pun check yang menanyakan apakah data broker masih hidup.**
+**Not one check asked whether the broker data was still alive.**
 
-### 3.2 Yang paling mengganggu: informasinya sudah ada, tapi tidak mengikat
+### 3.2 The part that bothers me most: the information already existed, but bound nothing
 
-Watchdog **sudah** mendeteksinya, dan sudah lama:
+The watchdog **had** been detecting this, and for a while:
 
 > `broker is stale (idx_broker_summary): 5 trading days behind (tolerance 2). Not auto-repaired: this feed is owned by another job…`
 
-Tapi itu ditulis sebagai **WARNING**. Warning tidak mengikat apa pun, jadi di malam yang sama gerbang burn-in tetap menulis `passed: 1`. Sistem tahu, mengatakannya, dan tetap meluluskan dirinya sendiri.
+But it was written as a **WARNING**. A warning binds nothing, so the same night the burn-in gate still wrote `passed: 1`. The system knew, said so, and passed itself anyway.
 
-**Ini pertanyaan untuk tim, dan menurut saya lebih penting daripada bug-nya:** berapa banyak warning lain di sistem ini yang berada dalam posisi sama — benar, terdeteksi, tercetak, dan tidak mengikat apa pun?
-
----
-
-## 4. Dampak ke burn-in
-
-Burn-in Virtual Broker V2 mulai **2026-08-05**. Feed broker mati **2026-07-31**.
-
-**Ketiga sesi burn-in yang tercatat seluruhnya berjalan di atas data broker basi.** Bukan sebagian — tidak ada satu pun sesi yang pernah melihat data broker segar.
-
-Tidak ada baris yang saya hapus. Burn-in mereset dirinya sendiri dengan benar: streak menuntut sesi berturut-turut, sesi 08-07 sekarang gagal, jadi hitungan kembali nol. Tiga sesi hijau lama tetap tercatat sebagai bukti bahwa sistem pernah salah menilai dirinya sendiri. Menurut saya itu harus tetap terbaca, bukan dibersihkan.
-
-Catatan tambahan: `identity_hash` berganti tiga kali dalam satu hari 05 Agustus. Identitas yang berjalan sekarang baru punya satu sesi. Hitungan 10 sesi praktis belum pernah benar-benar berjalan. **Belum saya selidiki kenapa identitas bergeser sesering itu — ini kandidat kuat untuk ditinjau.**
+**This is the question for the team, and I think it matters more than the bug:** how many other warnings in this system are in the same position — correct, detected, printed, and binding nothing?
 
 ---
 
-## 5. Masih terbuka
+## 4. Impact on the burn-in
 
-1. **Feed broker tetap mati.** Sumbernya akun flowtracker.id yang kena ban permanen. Kedua perbaikan di atas membuat sistem jujur soal kebutaannya, **bukan menyembuhkannya**. Selama tidak ada pengganti, scanner menolak tiap hari dan burn-in tidak akan pernah mencapai satu sesi bersih. Itu perilaku yang benar, bukan bug baru.
-2. **6 sesi bursa asli tanpa snapshot sama sekali:** `2026-06-15, 06-22, 06-29, 07-13, 07-15, 07-16` — price bar-nya lengkap. Ditambah 5 sesi Agustus yang hilang karena feed mati. Jendela H-5…H-1 yang melewatinya akan diam-diam jadi 4 hari sambil tetap dilabeli 5 hari. **Pattern Replay harus MENOLAK window tidak lengkap — bukan menggeser, bukan mengisi nol.**
-3. **Snapshot ditulis sebagai efek samping HTTP request**, bukan job terjadwal. Tidak ada satu pun cron memanggil `/api/signal-scanner`. Riwayat hanya bertambah kalau ada manusia membuka halaman. Cron sengaja **belum** dipasang: memasangnya di atas jam yang mati hanya akan membuat sistem terlihat sehat.
-4. **Ketidakkonsistenan yang saya buat sendiri:** toleransi check baru = 1 sesi, warning lama = 2. Di lag tepat 2, gerbang gagal tapi warning diam. Tidak berbahaya, tapi dua angka untuk pertanyaan yang sama akan membingungkan nanti. Layak disamakan jadi 2.
-5. **Periode `live` hanya ~22 hari.** Riset winners-vs-controls (review item 8–10) harus dibatasi ke situ. Sampel ini kecil — saya sebut sekarang, sebelum ada hasil yang kelihatan meyakinkan.
+The Virtual Broker V2 burn-in started **2026-08-05**. The broker feed died **2026-07-31**.
 
----
+**All three recorded burn-in sessions ran entirely on stale broker data.** Not some — not one session ever saw a live broker feed.
 
-## 6. Koreksi atas pernyataan saya sendiri
+No rows were deleted. The burn-in resets itself correctly: the streak requires consecutive sessions, 08-07 now fails, so the count returns to zero. The three old green sessions remain on record as evidence that the system once misjudged itself. I think that should stay readable rather than be cleaned up.
 
-Dicatat karena tim ini bernilai justru saat menangkap yang meleset:
-
-- Saya bilang "burn-in mulai sekitar 22 Juli". **Salah.** 22 Juli adalah tanggal snapshot sinyal jadi kontinu; burn-in mulai 5 Agustus. Dua hal berbeda yang saya samakan.
-- Saya bilang riwayat hilang **karena** halaman tidak dibuka. **Tidak lengkap.** Itu menjelaskan hari-hari bolong Juni–Juli, tapi sama sekali bukan sebab berhentinya di 31 Juli.
-- Saya menduga panggilan endpoint **menimpa** snapshot 07-31 dengan faktor hari ini. **Salah.** Diff terhadap backup: nol baris berubah. Tidak ada data yang rusak.
-- Saya mengusulkan aturan prioritas sumber untuk 27 tanggal. **Tidak diperlukan** — nol duplikat.
+Additional note: `identity_hash` shifted three times on 05 August alone. The identity running now has only one session. The 10-session count has effectively never really started. **I have not investigated why the identity moves that often — strong candidate for review.**
 
 ---
 
-## 7. Status deploy
+## 5. Still open
+
+1. **The broker feed is still dead.** Its source is the permanently banned flowtracker.id account. Both fixes above make the system **honest about its blindness, not cured of it**. Until a replacement exists, the scanner will refuse every day and the burn-in will never reach a single clean session. That is correct behaviour, not a new bug.
+2. **Six real exchange sessions have no snapshots at all:** `2026-06-15, 06-22, 06-29, 07-13, 07-15, 07-16` — their price bars are complete. Plus five August sessions lost to the dead feed. Any H-5…H-1 window crossing these silently becomes a 4-day window while still being labelled 5-day. **Pattern Replay must REFUSE an incomplete window — not shift it, not zero-fill it.**
+3. **Snapshots are written as a side effect of an HTTP request**, not a scheduled job. Nothing calls `/api/signal-scanner` from cron. History only grows when a human opens the page. A cron was deliberately **not** installed: installing one on top of a dead clock would only make the system look healthy.
+4. **An inconsistency I introduced:** the new check tolerates 1 session, the existing warning tolerates 2. At exactly 2 sessions behind, the gate fails while the warning stays silent. Not dangerous, but two numbers for the same question will confuse someone later. Worth aligning to 2.
+5. **The `live` period is only ~22 days.** The winners-vs-controls research (review items 8–10) must be restricted to it. This sample is small — stated now, before any result starts looking convincing.
+
+---
+
+## 6. Corrections to my own statements
+
+Recorded because this team's value comes from catching what slips:
+
+- I said the burn-in started "around 22 July". **Wrong.** 22 July is when signal snapshots became continuous; the burn-in started 5 August. Two different things I conflated.
+- I said history was missing **because** the page wasn't being opened. **Incomplete.** That explains the June–July gaps but is not at all why it stopped on 31 July.
+- I suspected calling the endpoint **overwrote** the 07-31 snapshot with today's factors. **Wrong.** Diffed against the backup: zero rows changed. No data was corrupted.
+- I proposed a source-priority rule for the 27 dates. **Not needed** — zero duplicates.
+
+---
+
+## 7. Deploy status
 
 | | |
 |---|---|
-| `flowtracker-scraper` | restart 44 → 45, `server.js` + `watchdog.js` ter-deploy, diverifikasi live |
-| `flowtracker` (frontend) | tidak tersentuh |
-| `strategy_hash` | tidak bergeser (nol perubahan matematika skor) |
+| `flowtracker-scraper` | restart 44 → 45, `server.js` + `watchdog.js` deployed, verified live |
+| `flowtracker` (frontend) | untouched |
+| `strategy_hash` | unmoved (zero scoring-math changes) |
 | Backup | `/root/backups/idx_signal_history-before-cleanup-2026-08-08.sql` |
+| Commit | `302597a` |
 
 ---
 
-## 8. Yang saya minta ditinjau
+## 8. What I am asking you to review
 
-1. **Keputusan menolak vs. memindahkan jam ke tabel harga** (§2.3) — titik paling layak diperdebatkan.
-2. **Warning yang tidak mengikat** (§3.2) — audit menyeluruh, bukan hanya kasus ini.
-3. **`identity_hash` bergeser 3× dalam sehari** (§4) — belum diselidiki.
-4. **Kontrak refuse-on-incomplete untuk Pattern Replay** (§5.2) sebelum P1 dikerjakan.
-5. **Opsi pengganti feed broker** — ini yang sekarang menghalangi semuanya.
+1. **Refusing vs. moving the clock to the price tables** (§2.3) — the most arguable decision here.
+2. **Warnings that bind nothing** (§3.2) — a sweep, not just this instance.
+3. **`identity_hash` shifting 3× in one day** (§4) — uninvestigated.
+4. **The refuse-on-incomplete contract for Pattern Replay** (§5.2), before P1 is built.
+5. **Replacement options for the broker feed** — this is what now blocks everything else.
