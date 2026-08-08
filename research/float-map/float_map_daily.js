@@ -125,8 +125,10 @@ const MIGRATIONS = [
 
   const [floats] = await pool.query(
     `SELECT stock_code, float_pct, float_shares, fetch_status, last_success_at,
-            DATEDIFF(NOW(), last_success_at) age_days
-       FROM idx_free_float`).catch(async () => {
+            DATEDIFF(NOW(), last_success_at) age_days,
+            in_top_turnover, in_top_mcap
+       FROM idx_free_float
+      WHERE in_top_turnover = 1 OR in_top_mcap = 1`).catch(async () => {
     // Older table shape, before per-ticker status existed.
     const [rows] = await pool.query(
       `SELECT stock_code, float_pct, float_shares, 'VALID' fetch_status,
@@ -138,6 +140,8 @@ const MIGRATIONS = [
     shares: Number(f.float_shares), pct: Number(f.float_pct),
     status: f.fetch_status || 'VALID',
     asOf: f.last_success_at, ageDays: Number(f.age_days ?? 999),
+    // Why this name is in the universe at all: turnover, size, or both.
+    inTurnover: !!f.in_top_turnover, inMcap: !!f.in_top_mcap,
   }]));
 
   // PER-TICKER FRESHNESS. MAX(fetched_at) across the table said CURRENT when a
@@ -255,6 +259,7 @@ const MIGRATIONS = [
       peakLow: Math.round(r.m.peakLow), peakHigh: Math.round(r.m.peakHigh),
       rotation20: +(r.m.rotation20 * 100).toFixed(0), rotation60: +(r.m.rotation60 * 100).toFixed(0),
       floatPct: +r.ff.pct.toFixed(1),
+      universe: r.ff.inTurnover && r.ff.inMcap ? 'BOTH' : r.ff.inMcap ? 'MCAP' : 'TURNOVER',
       floatAsOf: r.ff.asOf ? new Date(r.ff.asOf).toISOString().slice(0, 10) : null,
       floatAgeDays: r.ff.ageDays,
       seedRemaining: r.conf.seedRemainingPct,

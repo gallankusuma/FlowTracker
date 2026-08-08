@@ -37,6 +37,12 @@ CREATE TABLE IF NOT EXISTS idx_free_float (
   float_shares BIGINT NOT NULL,
   shares_outstanding BIGINT NOT NULL,
   float_pct DECIMAL(8,4) NOT NULL,
+  -- Market cap comes from the same fetch as the float, because selecting the
+  -- top 100 by market cap needs shares outstanding, which only the fetch knows.
+  market_cap BIGINT NULL,
+  avg_turnover BIGINT NULL,
+  in_top_turnover TINYINT(1) NOT NULL DEFAULT 0,
+  in_top_mcap TINYINT(1) NOT NULL DEFAULT 0,
   source VARCHAR(24) NOT NULL,
   -- PER-TICKER FRESHNESS. A single MAX(fetched_at) across the table reported
   -- CURRENT when one ticker refreshed and ninety-eight still carried
@@ -117,6 +123,14 @@ async function floatFor(ticker, s) {
     'ADD COLUMN last_success_at TIMESTAMP NULL AFTER last_attempt_at', applied);
   await S.ensureColumn(pool, db, 'idx_free_float', 'last_error',
     'ADD COLUMN last_error VARCHAR(160) NULL AFTER last_success_at', applied);
+  await S.ensureColumn(pool, db, 'idx_free_float', 'market_cap',
+    'ADD COLUMN market_cap BIGINT NULL AFTER float_pct', applied);
+  await S.ensureColumn(pool, db, 'idx_free_float', 'avg_turnover',
+    'ADD COLUMN avg_turnover BIGINT NULL AFTER market_cap', applied);
+  await S.ensureColumn(pool, db, 'idx_free_float', 'in_top_turnover',
+    'ADD COLUMN in_top_turnover TINYINT(1) NOT NULL DEFAULT 0 AFTER avg_turnover', applied);
+  await S.ensureColumn(pool, db, 'idx_free_float', 'in_top_mcap',
+    'ADD COLUMN in_top_mcap TINYINT(1) NOT NULL DEFAULT 0 AFTER in_top_turnover', applied);
   // Rows written before the columns existed have no success timestamp; the
   // generator's age check would read them as 999 days old and drop the whole
   // universe, so seed them from the value that did exist.
@@ -136,12 +150,20 @@ async function floatFor(ticker, s) {
   //
   // Even before the outage the column was useless here: value/volume came back
   // exactly equal to the close, so it was volume x close all along.
+  // EVERY candidate, not the top N by turnover. Ranking by market cap needs
+  // shares outstanding, and shares outstanding only exists after the fetch —
+  // so membership is decided afterwards, from stored data, rather than
+  // pre-filtering to a set that can never contain a large but quiet name.
   const [rows] = await pool.query(`
-    SELECT stock_code, AVG(close_price * volume) v FROM idx_stock_prices
-     WHERE date >= DATE_SUB((SELECT MAX(date) FROM idx_stock_prices), INTERVAL 20 DAY)
-       AND volume > 0 AND close_price > 0
-     GROUP BY stock_code HAVING v > 0 ORDER BY v DESC LIMIT ?`, [TOP_N]);
-  console.log(`top ${rows.length} by 20d turnover`);
+    SELECT p.stock_code, AVG(p.close_price * p.volume) v,
+           MAX(p.close_price) * 0 + SUBSTRING_INDEX(GROUP_CONCAT(p.close_price ORDER BY p.date DESC), ',', 1) last_close
+      FROM idx_stock_prices p
+     WHERE p.date >= DATE_SUB((SELECT MAX(date) FROM idx_stock_prices), INTERVAL 20 DAY)
+       AND p.volume > 0 AND p.close_price > 0
+     GROUP BY p.stock_code HAVING v > 0 ORDER BY v DESC`);
+  console.log(`${rows.length} candidates with 20d price history`);
+  const lastClose = new Map(rows.map(r => [r.stock_code, Number(r.last_close)]));
+  const turnoverOf = new Map(rows.map(r => [r.stock_code, Number(r.v)]));
 
   const s = await yahooSession();
   if (!s.crumb || s.crumb.length > 40) { console.error('no Yahoo crumb'); process.exit(1); }
@@ -155,14 +177,17 @@ async function floatFor(ticker, s) {
     if (res.ok) {
       await pool.query(
         `INSERT INTO idx_free_float
-           (stock_code, float_shares, shares_outstanding, float_pct, source,
+           (stock_code, float_shares, shares_outstanding, float_pct, market_cap, avg_turnover, source,
             fetch_status, last_attempt_at, last_success_at, last_error)
-         VALUES (?,?,?,?, 'YAHOO', 'VALID', NOW(), NOW(), NULL)
+         VALUES (?,?,?,?,?,?, 'YAHOO', 'VALID', NOW(), NOW(), NULL)
          ON DUPLICATE KEY UPDATE float_shares=VALUES(float_shares),
            shares_outstanding=VALUES(shares_outstanding), float_pct=VALUES(float_pct),
+           market_cap=VALUES(market_cap), avg_turnover=VALUES(avg_turnover),
            source=VALUES(source), fetch_status='VALID',
            last_attempt_at=NOW(), last_success_at=NOW(), last_error=NULL`,
-        [r.stock_code, Math.round(res.fl), Math.round(res.so), res.pct.toFixed(4)]);
+        [r.stock_code, Math.round(res.fl), Math.round(res.so), res.pct.toFixed(4),
+         Math.round(res.so * (lastClose.get(r.stock_code) || 0)) || null,
+         Math.round(turnoverOf.get(r.stock_code) || 0) || null]);
       stored++;
     } else {
       // KEEP THE OLD VALUE, MARK IT. Deleting would lose history and leaving it
@@ -191,6 +216,28 @@ async function floatFor(ticker, s) {
     }
     await sleep(320);
   }
+
+  // ── membership, decided from stored data ────────────────────────────────
+  // The universe is the UNION of the two rankings, not one of them: a large but
+  // quietly traded name is exactly the case the Float Map is most interesting
+  // for, and a turnover-only cut would never let it in.
+  await pool.query('UPDATE idx_free_float SET in_top_turnover = 0, in_top_mcap = 0');
+  await pool.query(
+    `UPDATE idx_free_float SET in_top_turnover = 1 WHERE stock_code IN (
+       SELECT * FROM (SELECT stock_code FROM idx_free_float
+         WHERE fetch_status = 'VALID' AND avg_turnover > 0
+         ORDER BY avg_turnover DESC LIMIT ?) x)`, [TOP_N]);
+  await pool.query(
+    `UPDATE idx_free_float SET in_top_mcap = 1 WHERE stock_code IN (
+       SELECT * FROM (SELECT stock_code FROM idx_free_float
+         WHERE fetch_status = 'VALID' AND market_cap > 0
+         ORDER BY market_cap DESC LIMIT ?) x)`, [TOP_N]);
+  const [[mem]] = await pool.query(
+    `SELECT SUM(in_top_turnover) t, SUM(in_top_mcap) m,
+            SUM(in_top_turnover = 1 OR in_top_mcap = 1) u,
+            SUM(in_top_mcap = 1 AND in_top_turnover = 0) mcap_only
+       FROM idx_free_float`);
+  console.log(`universe: ${mem.u} = ${mem.t} by turnover + ${mem.m} by market cap (${mem.mcap_only} large but quietly traded)`);
 
   const [[agg]] = await pool.query(
     `SELECT COUNT(*) n, MIN(float_pct) mn, MAX(float_pct) mx, AVG(float_pct) av FROM idx_free_float`);
