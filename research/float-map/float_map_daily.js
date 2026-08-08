@@ -151,7 +151,7 @@ const MIGRATIONS = [
   const [floats] = await pool.query(
     `SELECT stock_code, float_pct, float_shares, fetch_status, last_success_at,
             DATEDIFF(NOW(), last_success_at) age_days,
-            in_top_turnover, in_top_mcap
+            in_top_turnover, in_top_mcap, last_error
        FROM idx_free_float
 `).catch(async () => {
     // Older table shape, before per-ticker status existed.
@@ -164,7 +164,7 @@ const MIGRATIONS = [
   const floatOf = new Map(floats.map(f => [f.stock_code, {
     shares: Number(f.float_shares), pct: Number(f.float_pct),
     status: f.fetch_status || 'VALID',
-    asOf: f.last_success_at, ageDays: Number(f.age_days ?? 999),
+    asOf: f.last_success_at, ageDays: Number(f.age_days ?? 999), lastError: f.last_error || null,
     // EVERY ticker with a valid, fresh float — not just the two top-100 lists.
     // The fetch already paid for all of them, and the convergence gate below
     // is what keeps a meaningless map out of the ranking, so narrowing the
@@ -204,16 +204,40 @@ const MIGRATIONS = [
   // ── the map, per ticker ──────────────────────────────────────────────────
   const rows = [];
   const skipped = {};
+  // WHY a ticker is absent, per ticker. The counts alone tell a reader that 8
+  // names were dropped; they do not tell the reader searching for LPPF that
+  // LPPF is one of them, which is the only form of that fact anyone can use.
+  const excluded = [];
   for (const [tk, allBars] of series) {
     const ff = floatOf.get(tk);
-    if (ff.status !== 'VALID') { skipped.floatInvalid = (skipped.floatInvalid || 0) + 1; continue; }
-    if (ff.ageDays > FLOAT_MAX_AGE_DAYS) { skipped.floatStale = (skipped.floatStale || 0) + 1; continue; }
-    if (allBars.length < M.LOOKBACK) { skipped.shortHistory = (skipped.shortHistory || 0) + 1; continue; }
+    if (ff.status !== 'VALID') {
+      skipped.floatInvalid = (skipped.floatInvalid || 0) + 1;
+      excluded.push({ ticker: tk, reason: 'FLOAT_' + ff.status, detail: ff.lastError || null });
+      continue;
+    }
+    if (ff.ageDays > FLOAT_MAX_AGE_DAYS) {
+      skipped.floatStale = (skipped.floatStale || 0) + 1;
+      excluded.push({ ticker: tk, reason: 'FLOAT_STALE', detail: ff.ageDays + ' days since the last successful fetch' });
+      continue;
+    }
+    if (allBars.length < M.LOOKBACK) {
+      skipped.shortHistory = (skipped.shortHistory || 0) + 1;
+      excluded.push({ ticker: tk, reason: 'SHORT_HISTORY', detail: allBars.length + ' sessions, needs ' + M.LOOKBACK });
+      continue;
+    }
     const win = allBars.slice(-M.LOOKBACK);
-    if (win[win.length - 1].d !== session) { skipped.noBarToday = (skipped.noBarToday || 0) + 1; continue; }
+    if (win[win.length - 1].d !== session) {
+      skipped.noBarToday = (skipped.noBarToday || 0) + 1;
+      excluded.push({ ticker: tk, reason: 'NO_BAR_TODAY', detail: 'last bar ' + win[win.length - 1].d });
+      continue;
+    }
 
     const m = M.costMap(win, ff.shares);
-    if (m.error) { skipped[m.error] = (skipped[m.error] || 0) + 1; continue; }
+    if (m.error) {
+      skipped[m.error] = (skipped[m.error] || 0) + 1;
+      excluded.push({ ticker: tk, reason: m.error, detail: null });
+      continue;
+    }
 
     const conf = M.confidenceFor({
       seedRemaining: m.seedRemaining, bars: win.length,
@@ -290,6 +314,7 @@ const MIGRATIONS = [
     },
     confidence: { medianOverall: med(rows.map(r => r.conf.overall)), perTicker: true },
     universe: rows.length, ranked: rankable.length, notRanked: unranked.length,
+    excluded: excluded.sort((a, b) => a.ticker.localeCompare(b.ticker)),
     rankableMaxSeed: RANKABLE_MAX_SEED * 100, stamped, skipped,
     evidence: {
       experiment: 'EXP-2026-08-07-023',

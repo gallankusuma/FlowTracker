@@ -391,14 +391,42 @@ export default function FloatMapPage() {
                 ))}
               </tbody>
             </table>
-            {q && rows.length === 0 && (
-              <div style={{ padding: '28px 18px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 14, lineHeight: 1.6 }}>
-                No ticker matching <b style={{ color: 'var(--text-primary)' }}>{q}</b> in this
-                snapshot. The universe is every name with a valid free float on record
-                ({allRows.length} today) — a ticker can be absent because its float was rejected,
-                its price history is under 250 sessions, or a corporate action was detected.
-              </div>
-            )}
+            {q && rows.length === 0 && (() => {
+              // The system knows exactly why this ticker is missing. Listing
+              // possible reasons instead of the actual one makes the reader
+              // guess about something already recorded.
+              const ex = (data.excluded || []).filter((e: any) => e.ticker.includes(q));
+              return (
+                <div style={{ padding: '24px 18px', color: 'var(--text-muted)', fontSize: 14, lineHeight: 1.7 }}>
+                  {ex.length > 0 ? (
+                    <>
+                      <div style={{ marginBottom: 8 }}>
+                        Excluded from today&apos;s map, with the reason recorded:
+                      </div>
+                      {ex.map((e: any) => (
+                        <div key={e.ticker} style={{ marginBottom: 6 }}>
+                          <b style={{ color: 'var(--text-primary)' }}>{e.ticker}</b>{' '}
+                          <span style={{ color: WARN, fontWeight: 700 }}>{e.reason}</span>
+                          {e.detail && <span> — {e.detail}</span>}
+                        </div>
+                      ))}
+                      <div style={{ marginTop: 10, fontSize: 13 }}>
+                        A map needs a trustworthy free float and 250 sessions of price history.
+                        Without them a number would still be produced, and it would look exactly
+                        like a measured one.
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ textAlign: 'center' }}>
+                      No ticker matching <b style={{ color: 'var(--text-primary)' }}>{q}</b> —
+                      not in the {allRows.length} mapped names, and not among the{' '}
+                      {(data.excluded || []).length} recorded exclusions either, so it was never
+                      a candidate: no traded volume in the last 20 sessions.
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         </div>
 
