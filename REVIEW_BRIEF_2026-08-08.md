@@ -254,3 +254,137 @@ Otherwise we build careful analytics on top of history whose holes are structura
 | — | §2.3, §3.2 | Reviewer's readiness contract and INFO/ADVISORY/DEGRADED/BLOCKING taxonomy adopted as open work |
 | — | §5.3 | Reframed from "install a cron later" to architecture debt with the pipeline-owns-persistence target |
 | — | §8 | Added the hold on Pattern Replay P1 |
+
+---
+
+## 10. Severity sweep — 2026-08-09
+
+Closes §3.2 (the taxonomy) and §5.4 (the canonical constant). Appended rather
+than edited into the sections above, so the reviewed text stays as reviewed.
+
+### 10.1 The constant, derived rather than chosen
+
+§5.4 asked what the tolerance should be and refused to let it be copied. Measured
+from `idx_broker_summary.created_at` against the session each row is dated for,
+every session 2026-07-01 .. 2026-07-31 — the last month the feed was alive:
+
+```
+broker rows for session D land   D 12:30 UTC   19:30 WIB   <- FIRST write of the job
+prices for session D land        D 12:31-12:36 UTC          90-360s LATER
+refresh_ihsg writes the calendar D 13:05 UTC   20:05 WIB
+watchdog + burn-in gate run      D 13:50 UTC   20:50 WIB
+```
+
+**`BROKER_DATA_MAX_LAG_SESSIONS = 0`.** Every consumer runs at least 35 minutes
+after the broker write, the watchdog 80. Any lag at all means the pull did not
+run. The old justification for 2 — "the feed lags by design, Index Alpha
+publishes ~19:00 WIB" — conflated *source* latency with *pipeline* lag: the
+source does publish late in the day, and our copy of it still lands before
+anything reads it.
+
+A strict 0 cannot false-alarm during the nightly write window, and that is
+measured rather than hoped: broker precedes prices, so the freshest-feed
+reference cannot reach session D before the broker table has.
+
+The three literals (gate 1, warning 2, scanner 1) are now one constant, asserted
+by test.
+
+### 10.2 Severity is a level, and the top two bind
+
+`critical` was replaced by `INFO / ADVISORY / DEGRADED / BLOCKING`, plus an
+`affects` list per feed so binding is scoped rather than blunt.
+
+| feed | severity | affects | note |
+|---|---|---|---|
+| `ingest`, `prices`, `ihsg` | BLOCKING | all / engine+broker | unchanged in effect |
+| `broker`, `concentration` | **BLOCKING** | signal-engine | was non-critical — the feed that died |
+| `flow_detail` | DEGRADED | signal-engine | **was not monitored at all** |
+| `signals` | DEGRADED | paper-trader | scoped: cannot reset the V2 streak |
+
+`DEGRADED` labels output and fails the burn-in; `BLOCKING` also stops output.
+Both bind, so nothing touching correctness is warning-only.
+
+`signals` is scoped to paper-trader deliberately. Binding a Python
+paper-trading outage to the V2 burn-in would repeat a scope error this codebase
+has already made twice (TEST_* accounts in the identity hash; an experimental
+account failing official checks).
+
+### 10.3 A second instance of the same defect, in the kill switch
+
+The sweep was scoped to `watchdog.js:433`. `signalState()` had it too, and worse:
+checked live on 2026-08-09 with the broker feed **five sessions dead**, the kill
+switch returned `enabled: true`. The switch whose stated purpose is "produce no
+actionable output on stale inputs" was green through the exact failure it exists
+to catch, for the same reason — it disabled only on `critical`, and broker was
+not critical. Now `enabled: false`, with `signalDate` and `limitedBy` naming the
+feed that limits us.
+
+The lesson is not about this switch. **One boolean was consulted in two places,
+and fixing the place we had found would have left the other reading `true`.**
+
+### 10.4 Found while sweeping, not looked for
+
+1. **A live phantom-session writer.** `runDailyCron` has its own price-write loop
+   that the 2026-08-05 phantom fix never reached — that fix guarded
+   `fetchAndSaveStockPrices` and `/api/stock-prices` and left the third writer
+   open. On Saturday 2026-08-08 a PM2 restart re-armed the startup catch-up, the
+   loop ran with `date = 2026-08-08`, and Yahoo returned Friday's quotes: 245
+   rows byte-identical to 2026-08-07, stamped on a day IDX was shut. Same shape
+   as the F9-F13 availability bug — a fix applied at one call site while a
+   duplicate site kept the defect. Guarded now.
+
+2. **Every restart was firing the full nightly pipeline.** The startup catch-up
+   had no weekday check, and its trigger is `MAX(broker.date) < today` — which,
+   with the feed dead, is *permanently true*. Logs show it firing four times for
+   2026-08-06 and again on Saturday. **Deploying means restarting, so every
+   deploy triggered a pull.** Now gated on a weekday, on the exchange calendar,
+   and on a persistent record of whether today's pull already completed
+   (`nightly_cron` in `ft_system_health` — that job was the only one in the
+   system with no durable trace, which is ironic given the module's thesis).
+
+3. **The watchdog was about to write a NAV for the Saturday.** Its repair targets
+   came from `MAX(idx_stock_prices.date)`, which the phantom bar moved, so the
+   dry run proposed resolving and marking a session that never happened — the
+   watchdog committing the fault it exists to report, in the ledger rather than a
+   price table. Targets now walk the exchange calendar backwards, which makes
+   phantom dates unreachable by construction rather than by cleanup order.
+
+4. **Mid-series holes in the broker series that nothing had ever looked for.**
+   Every broker check reads `MAX(date)` and is blind behind it — the third time
+   this blindness has been found here. `idx_broker_summary` and
+   `idx_concentration` are missing **2024-05-29, 2026-06-15, 2026-06-22,
+   2026-06-29**; `idx_broker_flow_detail` the last three. All four are real
+   sessions with prices and an index bar. Three are consecutive Mondays.
+   Now detected, split recent (BLOCKING) / historical (ADVISORY) so an
+   unrepairable hole cannot fail the burn-in nightly — there is no repair at any
+   severity, the source is the banned account. **This is §5.2's failure mode with
+   confirmed dates: research windows crossing them must report
+   `WINDOW_INCOMPLETE`, not average four observations and call it five.**
+
+### 10.5 Verified live
+
+```
+/api/signal-scanner        HTTP 503  sessionsBehind 5     (via the constant, not a literal)
+/api/system/signal-state   enabled false  signalDate 2026-07-31  limitedBy broker
+watchdog --dry-run         broker/concentration BLOCKING, flow_detail DEGRADED — all FAIL
+burn-in 2026-08-07         FAILED: requiredInputsReady, brokerDataCurrent, noPhantomSessions
+restart 2026-08-09         "Startup catch-up skipped — not a trading session (WEEKEND)"
+```
+
+343 tests across 16 suites, 0 failures. One existing test asserted the opposite —
+*"stale broker feed does NOT disable"* — and passed for as long as it was wrong.
+Inverted and annotated rather than deleted.
+
+### 10.6 Still open after this
+
+- The 2026-08-08 phantom row is **still in the table**. Reported, not deleted:
+  removing production price rows is irreversible and that is a decision, not a
+  repair. The writer that produced it is fixed, so it cannot recur.
+- `signalState` counts `JOB_FAILING:watchdog` as a reason alongside the staleness
+  that *caused* the watchdog to fail — one fault, counted twice. `checkJobRegistry`
+  already skips its own rows for this reason; `signalState` does not. Harmless
+  (both point at a real condition, and it self-clears on one clean run) but it
+  overstates the number of independent problems.
+- Nothing yet consumes `paper-trader` readiness — the consumer is Python and
+  outside this module. Recorded here rather than left implicit, because
+  unenforced detection is the defect this whole sweep is about.

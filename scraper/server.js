@@ -873,18 +873,44 @@ async function fetchYahooPrice(ticker) {
  */
 async function tradingSessionForIngest() {
   const date = getTodayDate();
+  const g = await sessionGuardFor(date);
+  return g.ok ? { date, reason: null } : { date: null, reason: g.reason };
+}
+
+/**
+ * The same judgement, for an ARBITRARY date rather than only today.
+ *
+ * Extracted 2026-08-09 so the nightly cron's own price loop could use it — that
+ * loop accepts a `dateOverride`, so it needed a guard that can judge a date it
+ * was handed rather than one that only ever asks about today.
+ *
+ * A deliberate backfill of a real past session still passes: the calendar
+ * contains that date, so it is affirmed rather than refused. What cannot pass is
+ * a weekend or a date the calendar covers and does not have.
+ *
+ * @returns {{ok: boolean, reason: string|null}}
+ */
+async function sessionGuardFor(date) {
+  // IDX does not trade Saturday or Sunday. Not an inference, and checked first
+  // so it holds even if the calendar is unavailable or somehow contains one.
   const dow = new Date(`${date}T00:00:00Z`).getUTCDay();
-  if (dow === 0 || dow === 6) return { date: null, reason: 'WEEKEND' };
+  if (dow === 0 || dow === 6) return { ok: false, reason: 'WEEKEND' };
   try {
-    const [[cal]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
-    const latest = cal?.d ? toDateStr(cal.d) : null;
-    // Only judge dates the calendar can actually speak for.
-    if (latest && date <= latest) {
+    const [[hi]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+    const [[lo]] = await pool.query('SELECT MIN(date) d FROM idx_ihsg_history');
+    const latest = hi?.d ? toDateStr(hi.d) : null;
+    const earliest = lo?.d ? toDateStr(lo.d) : null;
+    // Only judge dates the calendar can actually speak for. Outside its range —
+    // including today, before refresh_ihsg has run — absence of a bar says
+    // nothing, and the weekday rule above is the whole guard. That is the
+    // conservative direction: a holiday slipping through is one bad row the
+    // watchdog flags, where a wrong refusal loses a real session silently.
+    if (latest && earliest && date <= latest && date >= earliest) {
       const [rows] = await pool.query('SELECT 1 FROM idx_ihsg_history WHERE date=?', [date]);
-      if (!rows.length) return { date: null, reason: 'NOT_A_TRADING_SESSION' };
+      if (!rows.length) return { ok: false, reason: 'NOT_A_TRADING_SESSION' };
     }
   } catch { /* no calendar: the weekday rule already applied */ }
-  return { date, reason: null };
+  return { ok: true, reason: null };
 }
 
 async function fetchAndSaveStockPrices(tickers) {
@@ -2362,25 +2388,57 @@ async function runDailyCron(dateOverride) {
     await delay(500);
   }
   
-  // Also fetch stock prices from Yahoo for all stocks
-  console.log('  📈 Fetching stock prices from Yahoo...');
-  for (const ticker of TOP_STOCKS) {
-    try {
-      const p = await fetchYahooPrice(ticker);
-      if (p) {
-        await pool.query(`
-          INSERT INTO idx_stock_prices (date, stock_code, open_price, high_price, low_price, close_price, volume, prev_close, change_pct)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-          ON DUPLICATE KEY UPDATE close_price = VALUES(close_price), change_pct = VALUES(change_pct), volume = VALUES(volume)
-        `, [date, ticker, p.open, p.high, p.low, p.price, p.volume, p.prevClose, p.changePct]);
-      }
-    } catch (_) { /* skip individual failures */ }
-    await delay(300);
+  // Also fetch stock prices from Yahoo for all stocks.
+  //
+  // THE THIRD PRICE WRITER, and the one the 2026-08-05 phantom-session fix
+  // missed (found 2026-08-09). That fix added tradingSessionForIngest() to
+  // fetchAndSaveStockPrices() and to /api/stock-prices, and this loop — which
+  // writes the same table, from the same source, for every tracked ticker — was
+  // left unguarded. It is not hypothetical: on Saturday 2026-08-08 a PM2 restart
+  // re-armed the startup catch-up, this loop ran with date = 2026-08-08, and
+  // Yahoo returned Friday's last quote for all 245 tickers. The result was a
+  // byte-identical copy of 2026-08-07 stamped on a day IDX was shut — exactly
+  // the phantom bar the guard exists to prevent, written by the one path that
+  // did not have it. Same shape as the F9-F13 availability bug: a fix applied at
+  // one call site while a duplicate site kept the defect.
+  const priceSession = await sessionGuardFor(date);
+  if (!priceSession.ok) {
+    console.log(`  📈 Prices SKIPPED — ${date} is not a trading session (${priceSession.reason}).`);
+    console.log('     Writing it would carry the previous session\'s quotes onto a day the exchange');
+    console.log('     was shut, and every rolling window in this system counts BARS, not dates.');
+  } else {
+    console.log('  📈 Fetching stock prices from Yahoo...');
+    for (const ticker of TOP_STOCKS) {
+      try {
+        const p = await fetchYahooPrice(ticker);
+        if (p) {
+          await pool.query(`
+            INSERT INTO idx_stock_prices (date, stock_code, open_price, high_price, low_price, close_price, volume, prev_close, change_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE close_price = VALUES(close_price), change_pct = VALUES(change_pct), volume = VALUES(volume)
+          `, [date, ticker, p.open, p.high, p.low, p.price, p.volume, p.prevClose, p.changePct]);
+        }
+      } catch (_) { /* skip individual failures */ }
+      await delay(300);
+    }
   }
   
   try { await saveIHSGFactorSnapshot(); console.log('  📊 IHSG factor snapshot saved'); } catch (e) { console.log('  ⚠️ IHSG factor snapshot failed:', e.message); }
 
   results.completed = new Date().toISOString();
+  // PERSISTENT record of the nightly pull. Everything else in this system's
+  // health story is derived from data rather than self-reports, and this job —
+  // the one that produces most of that data — was the only one with no durable
+  // trace at all: `cronStatus` is in-process and dies with the restart. The
+  // startup catch-up below reads this to avoid re-running a pull that already
+  // finished, which it could not previously know.
+  try {
+    await systemHealth.recordJobRun(pool, {
+      job: 'nightly_cron', status: 'OK',
+      durationMs: Date.now() - new Date(results.started || results.completed).getTime(),
+      records: results.totalRecords, dataDate: date,
+    });
+  } catch (_) { /* recording must never break the job it records */ }
   cronRunning = false;
   cronStatus = { lastRun: results.completed, lastResult: results, nextRun: getNextCronTime(), running: false };
   console.log(`\n✅ [CRON] Complete! ${results.totalRecords} total records for ${date}\n`);
@@ -2499,7 +2557,44 @@ function scheduleDailyCron() {
       const [[row]] = await pool.query('SELECT MAX(date) AS d FROM idx_broker_summary');
       const lastDataDate = row?.d ? (row.d instanceof Date ? row.d.toISOString().split('T')[0] : String(row.d).split('T')[0]) : null;
       const today = getTodayDate();
-      if (lastDataDate && lastDataDate < today) {
+      // THE CATCH-UP MUST OBEY THE SAME CALENDAR AS THE SCHEDULE (2026-08-09).
+      //
+      // The interval path below checks `isWeekday`. This one never did, and its
+      // trigger is `MAX(idx_broker_summary.date) < today` — which, with the
+      // broker feed dead since 2026-07-31, is now PERMANENTLY true. So every
+      // single restart after 12:30 UTC fired a full nightly pull, on any day of
+      // the week. The logs show it firing four times for 2026-08-06 and again on
+      // Saturday 2026-08-08, and since deploying means restarting, every deploy
+      // triggered one. That Saturday run is what wrote the phantom bar.
+      //
+      // Refusing on a non-session day rather than pulling for the previous
+      // session on purpose: the scheduled run already covers real sessions, and
+      // a catch-up that invents a date is the failure this is being fixed for.
+      // Did the pull for today ALREADY complete? The trigger below infers that
+      // from the broker feed's newest row, and that inference is exactly what
+      // broke: with the feed dead, `lastDataDate < today` is permanently true,
+      // so it re-ran the entire nightly pipeline on every restart — four times
+      // for 2026-08-06 in the logs, and once more on Saturday 2026-08-08.
+      // Deploying means restarting, so every deploy was firing a full pull.
+      //
+      // Deliberately fail-OPEN: no record means run. A catch-up that skips a day
+      // it should have recovered is a silent hole, which is worse than a
+      // duplicate run of an idempotent job.
+      let alreadyRan = false;
+      try {
+        const [[done]] = await pool.query(
+          `SELECT COUNT(*) n FROM ft_system_health
+            WHERE job_name='nightly_cron' AND status='OK' AND data_date=?`, [today]);
+        alreadyRan = Number(done.n) > 0;
+      } catch { /* no registry yet: fall through and run */ }
+
+      const session = await sessionGuardFor(today);
+      if (!session.ok) {
+        console.log(`   ⏭  [CRON] Startup catch-up skipped — ${today} is not a trading session (${session.reason}).`);
+      } else if (alreadyRan) {
+        lastCronDate = today;
+        console.log(`   ⏭  [CRON] Startup catch-up skipped — the ${today} pull already completed.`);
+      } else if (lastDataDate && lastDataDate < today) {
         // Check if it's after 12:30 UTC (data should be available)
         const now = new Date();
         if (now.getUTCHours() >= 13 || (now.getUTCHours() === 12 && now.getUTCMinutes() >= 30)) {
@@ -6173,9 +6268,14 @@ app.get('/api/signal-scanner', async (req, res) => {
     const [sessRows] = await pool.query(
       'SELECT date FROM idx_ihsg_history WHERE date > ? ORDER BY date ASC', [latestDate]);
     const sessionsBehind = sessRows.length;
-    // One session of lag is ordinary — the feed lands in the evening and this may
-    // be called before it. Two or more means the feed stopped.
-    if (sessionsBehind > 1) {
+    // ONE CANONICAL TOLERANCE. This was a literal `1` while the freshness table
+    // said 2 and the burn-in gate said 1 by a different route — three answers to
+    // one question, none of them derived. systemHealth.BROKER_DATA_MAX_LAG_SESSIONS
+    // is 0, measured from arrival times: the broker pull is the first write of
+    // the 19:30 WIB job, so any lag at all means it did not run. The derivation
+    // is in modules/system_health.js and must be re-done, not edited, if the
+    // pipeline schedule changes.
+    if (sessionsBehind > systemHealth.BROKER_DATA_MAX_LAG_SESSIONS) {
       return res.status(503).json({
         data: [], date: latestDate, source: 'stale-broker-feed',
         stale: true,

@@ -53,7 +53,8 @@ function makePool(spec) {
 const CLOCK = new Date('2026-07-31T12:00:00Z');
 const ALL_FRESH = {
   tables: { idx_stock_prices: '2026-07-31', idx_broker_summary: '2026-07-31',
-            idx_concentration: '2026-07-31', idx_ihsg_history: '2026-07-31' },
+            idx_concentration: '2026-07-31', idx_broker_flow_detail: '2026-07-31',
+            idx_ihsg_history: '2026-07-31', ft_signals: '2026-07-31' },
   lag: { '2026-07-31': 0 },
 };
 
@@ -65,7 +66,7 @@ const ALL_FRESH = {
     test('no blocking reasons when healthy', () => assert.strictEqual(s.reasons.length, 0));
   }
 
-  console.log('\nthe July 2026 failure mode: a critical table goes quietly stale');
+  console.log('\nthe July 2026 failure mode: a BLOCKING table goes quietly stale');
   {
     const spec = JSON.parse(JSON.stringify(ALL_FRESH));
     spec.tables.idx_ihsg_history = '2026-07-24';
@@ -73,19 +74,111 @@ const ALL_FRESH = {
     const s = await sh.signalState(makePool(spec), { today: CLOCK });
     test('stale IHSG DISABLES signals', () => assert.strictEqual(s.enabled, false));
     test('reason is machine-readable and names the table', () =>
-      assert.ok(s.reasons.some(r => r.startsWith('STALE_CRITICAL:ihsg')), JSON.stringify(s.reasons)));
+      assert.ok(s.reasons.some(r => r.startsWith('STALE_BLOCKING:ihsg')), JSON.stringify(s.reasons)));
   }
 
-  console.log('\nnon-critical staleness warns but does not disable');
+  // THIS TEST USED TO ASSERT THE OPPOSITE, and it passed for as long as it was
+  // wrong. It read: "stale broker feed does NOT disable (veto degrades, prices
+  // do not)". That is the same reasoning the CHECKS table carried, and on
+  // 2026-07-31 the broker feed died and this exact behaviour let the scanner
+  // serve eight days of frozen scores with the kill switch green. The premise
+  // was false: /api/signal-scanner takes its DATE from idx_broker_summary, so a
+  // dead broker feed is a stopped clock, not a weakened veto. Kept, inverted,
+  // and annotated rather than deleted — a test that encoded a wrong belief is
+  // worth leaving visible.
+  console.log('\nstale broker feed now BLOCKS (this assertion is inverted from its original)');
   {
     const spec = JSON.parse(JSON.stringify(ALL_FRESH));
     spec.tables.idx_broker_summary = '2026-07-20';
     spec.lag = { '2026-07-31': 0, '2026-07-20': 8 };
     const s = await sh.signalState(makePool(spec), { today: CLOCK });
-    test('stale broker feed does NOT disable (veto degrades, prices do not)', () =>
-      assert.strictEqual(s.enabled, true));
-    test('but it is surfaced as a warning', () =>
-      assert.ok(s.warnings.some(w => w.includes('broker')), JSON.stringify(s.warnings)));
+    test('stale broker feed DISABLES signals (it is the scanner clock)', () =>
+      assert.strictEqual(s.enabled, false));
+    test('reason names broker at BLOCKING', () =>
+      assert.ok(s.reasons.some(r => r.startsWith('STALE_BLOCKING:broker')), JSON.stringify(s.reasons)));
+  }
+
+  console.log('\nDEGRADED labels output without stopping it, and is never merely advisory');
+  {
+    const spec = JSON.parse(JSON.stringify(ALL_FRESH));
+    spec.tables.idx_broker_flow_detail = '2026-07-20';
+    spec.lag = { '2026-07-31': 0, '2026-07-20': 8 };
+    const s = await sh.signalState(makePool(spec), { today: CLOCK });
+    test('a DEGRADED input does not disable output', () => assert.strictEqual(s.enabled, true));
+    test('but it sets the degraded flag, so callers cannot render it as clean', () =>
+      assert.strictEqual(s.degraded, true));
+    test('and it names itself', () =>
+      assert.ok(s.degradedReasons.some(r => r.startsWith('flow_detail')), JSON.stringify(s.degradedReasons)));
+  }
+
+  console.log('\nseverity binding: nothing that affects correctness may be advisory');
+  {
+    test('every declared check carries a severity', () =>
+      assert.ok(sh.CHECKS.every(c => sh.SEVERITY[c.severity]), 'a check has no valid severity'));
+    test('every declared check says who it affects', () =>
+      assert.ok(sh.CHECKS.every(c => Array.isArray(c.affects) && c.affects.length),
+        'a check declares no affected subsystem'));
+    test('DEGRADED and BLOCKING bind; INFO and ADVISORY do not', () => {
+      assert.strictEqual(sh.binds(sh.SEVERITY.BLOCKING), true);
+      assert.strictEqual(sh.binds(sh.SEVERITY.DEGRADED), true);
+      assert.strictEqual(sh.binds(sh.SEVERITY.ADVISORY), false);
+      assert.strictEqual(sh.binds(sh.SEVERITY.INFO), false);
+    });
+    test('the broker pipeline is BLOCKING, which is the whole point of the sweep', () => {
+      for (const key of ['broker', 'concentration']) {
+        const c = sh.CHECKS.find(x => x.key === key);
+        assert.strictEqual(c.severity, sh.SEVERITY.BLOCKING, `${key} is not BLOCKING`);
+      }
+    });
+  }
+
+  console.log('\nBROKER_DATA_MAX_LAG_SESSIONS is one constant, used everywhere');
+  {
+    test('the constant is 0 — derived from arrival times, not copied', () =>
+      assert.strictEqual(sh.BROKER_DATA_MAX_LAG_SESSIONS, 0));
+    test('every broker-pipeline check uses it rather than its own literal', () => {
+      for (const key of ['broker', 'concentration', 'flow_detail']) {
+        const c = sh.CHECKS.find(x => x.key === key);
+        assert.strictEqual(c.maxLag, sh.BROKER_DATA_MAX_LAG_SESSIONS,
+          `${key} has its own tolerance (${c.maxLag}) instead of the canonical one`);
+      }
+    });
+    // The split this replaced: gate 1, warning 2, scanner 1.
+    test('no broker-pipeline check silently tolerates a session of lag', () =>
+      assert.ok(sh.CHECKS.filter(c => /broker|concentration|flow_detail/.test(c.key))
+        .every(c => c.maxLag === 0)));
+  }
+
+  console.log('\nreadiness is scoped, so one subsystem cannot fail another');
+  {
+    const spec = JSON.parse(JSON.stringify(ALL_FRESH));
+    spec.tables.ft_signals = '2026-07-20';
+    spec.lag = { '2026-07-31': 0, '2026-07-20': 8 };
+    const pool = makePool(spec);
+    const vb = await sh.readiness(pool, { subsystems: [sh.SUBSYSTEM.VIRTUAL_BROKER], today: CLOCK });
+    const pt = await sh.readiness(pool, { subsystems: [sh.SUBSYSTEM.PAPER_TRADER], today: CLOCK });
+    test('a dead ft_signals does NOT fail the virtual-broker chain', () =>
+      assert.strictEqual(vb.ready, true, JSON.stringify(vb.degraded.concat(vb.blocking))));
+    test('but it DOES fail the paper-trader it actually feeds', () =>
+      assert.strictEqual(pt.ready, false));
+    test('virtual-broker pulls in signal-engine transitively', () =>
+      assert.ok(vb.subsystems.includes(sh.SUBSYSTEM.SIGNAL_ENGINE), JSON.stringify(vb.subsystems)));
+  }
+
+  console.log('\nreadiness: a stale broker feed fails the burn-in scope');
+  {
+    const spec = JSON.parse(JSON.stringify(ALL_FRESH));
+    spec.tables.idx_broker_summary = '2026-07-30';
+    spec.lag = { '2026-07-31': 0, '2026-07-30': 1 };
+    const r = await sh.readiness(makePool(spec), { subsystems: [sh.SUBSYSTEM.VIRTUAL_BROKER], today: CLOCK });
+    test('ONE session of broker lag is already a failure', () =>
+      assert.strictEqual(r.ready, false, JSON.stringify(r)));
+    test('and it is BLOCKING, not merely degraded', () =>
+      assert.ok(r.blocking.some(b => b.startsWith('broker')), JSON.stringify(r.blocking)));
+    test('signalDate reports the session we can honestly speak for', () =>
+      assert.strictEqual(r.signalDate, '2026-07-30'));
+    test('and names the feed that limits it', () =>
+      assert.strictEqual(r.limitedBy, 'broker'));
   }
 
   console.log('\nthe HK failure mode: a job failing repeatedly and unnoticed');

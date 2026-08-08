@@ -75,6 +75,30 @@ const iso = d => (d instanceof Date
  * job registry rather than any in-process state, so a restart cannot reset a
  * recurring problem's counter back to zero.
  */
+/**
+ * The latest date that is BOTH on the exchange calendar and priced.
+ *
+ * WHY NOT `MAX(date) FROM idx_stock_prices` (found 2026-08-09). Every repair
+ * below took its target from that, and a phantom bar moves it. On Saturday
+ * 2026-08-08 an unguarded price writer stamped Friday's 245 rows onto a day the
+ * exchange was shut; the very next dry run had this watchdog proposing to
+ * resolve and MARK A NAV for that Saturday. The ledger would then carry a
+ * valuation for a session that never happened — the watchdog writing the same
+ * class of fault it exists to report, and doing it inside the accounting
+ * records rather than a price table.
+ *
+ * ^JKSE is the exchange's own index, so a date with no index bar was not a
+ * session. Walking the calendar backwards makes phantom dates unreachable by
+ * construction instead of relying on them being cleaned up first.
+ */
+async function latestPricedSession(pool) {
+  const [rows] = await pool.query(
+    `SELECT c.date d FROM idx_ihsg_history c
+      WHERE EXISTS (SELECT 1 FROM idx_stock_prices p WHERE p.date = c.date)
+      ORDER BY c.date DESC LIMIT 1`);
+  return iso(rows[0]?.d);
+}
+
 async function repairRecurrence(pool, job) {
   const [[r]] = await pool.query(
     `SELECT COUNT(DISTINCT DATE(finished_at)) n FROM ft_system_health
@@ -281,8 +305,9 @@ async function checkForwardStages(pool) {
 
   const [[nav]] = await pool.query(
     `SELECT MAX(mark_date) d FROM ft_strategy_nav`).catch(() => [[{ d: null }]]);
-  const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
-  const priceDate = iso(px.d);
+  // The latest priced SESSION, not the latest priced date — a phantom bar must
+  // not be able to steer this into marking a day the exchange was shut.
+  const priceDate = await latestPricedSession(pool);
   const navDate = iso(nav?.d);
 
   line(`  latest plan ${iso(plan.as_of_date)} (${plan.status}) · latest NAV mark ${navDate || 'none'} · prices ${priceDate}`);
@@ -328,8 +353,8 @@ async function checkVirtualPortfolio(pool) {
   if (!accounts.length) { line('  no active official accounts — nothing to check'); return; }
   const acctIds = accounts.map(a => a.id);
 
-  const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
-  const priceDate = iso(px.d);
+  // Same reason as checkForwardStages: this drives a WRITE into the ledger.
+  const priceDate = await latestPricedSession(pool);
   const [[cal]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
   const sessionDate = iso(cal?.d);
   // COUNT, not MAX. With POSITION marked today and INTRADAY still on yesterday,
@@ -426,13 +451,83 @@ async function checkFreshness(pool) {
   line('\nFeed freshness');
   const rows = await sh.dataFreshness(pool);
   for (const r of rows) {
-    const tag = r.ok ? 'ok  ' : (r.critical ? '**  ' : ' !  ');
-    line(`  ${tag}${String(r.key).padEnd(15)} ${r.latest || '(empty)'}  ${r.detail}`);
+    const tag = r.ok ? 'ok  ' : (r.binds ? '**  ' : ' !  ');
+    line(`  ${tag}${String(r.key).padEnd(15)} ${String(r.severity).padEnd(8)} ${r.latest || '(empty)'}  ${r.detail}`);
     if (!r.ok) {
+      // LEVEL COMES FROM SEVERITY. This line used to read
+      // `level: r.critical ? 'FAIL' : 'WARN'`, and that single boolean is the
+      // whole story of the 2026-07-31 outage: the broker feed was marked
+      // non-critical, so its death printed a WARNING, and a warning binds
+      // nothing — the burn-in gate a hundred lines below wrote passed:1 the
+      // same night. DEGRADED and BLOCKING are failures here, which is what
+      // makes the watchdog's exit code and the burn-in agree about the night.
       report({
-        level: r.critical ? 'FAIL' : 'WARN',
-        what: `${r.key} is stale (${r.table})`,
-        detail: `${r.detail}. Not auto-repaired: this feed is owned by another job, and a watchdog writing it would be a second uncoordinated writer.`,
+        level: r.binds ? 'FAIL' : 'WARN',
+        severity: r.severity,
+        affects: r.affects || [],
+        what: `${r.key} is stale (${r.table}) [${r.severity}]`,
+        detail: `${r.detail}. Affects: ${(r.affects || []).join(', ') || 'nothing declared'}. ` +
+          'Not auto-repaired: this feed is owned by another job, and a watchdog writing it would be a second uncoordinated writer.',
+      });
+    }
+  }
+  return rows;
+}
+
+/* ── check 4b: holes BEHIND the newest row in the broker series ────────────
+   Every check above reads MAX(date) and is structurally blind to a missing
+   session in the middle. That blindness has now been found three times in this
+   codebase — idx_ihsg_history lost 2026-08-03, idx_stock_prices lost nine 2017
+   and 2018 sessions, and this sweep found idx_broker_summary is missing
+   2024-05-29, 2026-06-15, 2026-06-22 and 2026-06-29 outright, with prices and an
+   index bar present for all four. Nothing has ever looked.
+
+   It matters for the same reason the others did: f1 concentration and the flow
+   factors read windows, and a window crossing one of these silently spans one
+   fewer observation than it claims to.
+
+   RECENT holes are a live ingest fault. Old ones are data debt, and scoring them
+   nightly would hold the burn-in hostage to 2024 forever — a check that can
+   never be satisfied is a check people route around. Same split as
+   checkPhantomSessions, and the source for these four is the banned
+   flowtracker.id account, so no repair exists at any severity. */
+async function checkBrokerGaps(pool) {
+  line('\nBroker series — sessions the exchange traded and the broker feed missed');
+  const RECENT_DAYS = 30;
+  const [[cal]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+  const base = iso(cal?.d) || new Date().toISOString().slice(0, 10);
+  const cutoff = (() => {
+    const d = new Date(`${base}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - RECENT_DAYS);
+    return d.toISOString().slice(0, 10);
+  })();
+
+  for (const [table, col] of [['idx_broker_summary', 'date'], ['idx_broker_flow_detail', 'date'],
+                              ['idx_concentration', 'data_date']]) {
+    let gaps;
+    try {
+      gaps = await sh.missingSessions(pool, {
+        table, col, reference: 'idx_ihsg_history', referenceCol: 'date', days: 4000 });
+    } catch (e) { report({ level: 'FAIL', what: `broker gap check failed for ${table}`, detail: e.message }); continue; }
+
+    if (!gaps.missing.length) { line(`  ok  ${table.padEnd(24)} ${gaps.checked} sessions, none missing`); continue; }
+    const recent = gaps.missing.filter(d => d >= cutoff);
+    const old = gaps.missing.filter(d => d < cutoff);
+    line(`  ${recent.length ? '**' : ' !'}  ${table.padEnd(24)} ${gaps.missing.length} missing (${recent.length} recent): ${gaps.missing.join(', ')}`);
+
+    if (recent.length) {
+      report({
+        level: 'FAIL', severity: sh.SEVERITY.BLOCKING, affects: [sh.SUBSYSTEM.SIGNAL_ENGINE],
+        what: `${recent.length} session(s) missing from ${table} inside the last ${RECENT_DAYS} days`,
+        detail: `${recent.join(', ')}. The exchange traded these and the feed has no rows for them. ` +
+          'MAX(date) cannot see a hole, so every freshness check reads green while a window crossing it is short an observation.',
+      });
+    }
+    if (old.length) {
+      report({
+        level: 'WARN', severity: sh.SEVERITY.ADVISORY, affects: [sh.SUBSYSTEM.SIGNAL_ENGINE],
+        what: `${old.length} historical session(s) missing from ${table} (data debt)`,
+        detail: `${old.join(', ')}. Older than ${cutoff}. Not scored against the daily burn-in — and note there is no repair at any severity: the source for these is the permanently banned flowtracker.id account. Research windows crossing them must treat them as incomplete rather than as zero.`,
       });
     }
   }
@@ -517,27 +612,43 @@ async function recordBurnIn(pool) {
   // The checklist the review specified, each answered from data rather than
   // from whether a job claimed success.
   const checks = {};
-  const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
-  checks.priceDataCurrent = iso(px?.d) === sessionDate;
-  // /api/signal-scanner takes its notion of "today" from idx_broker_summary, not
-  // from prices. When that feed died on 2026-07-31 the scanner kept serving 31
-  // July scores under today's date for eight days, and every check here still
-  // passed — priceDataCurrent and calendarCurrent were honestly true, because
-  // prices and the calendar were fine. Nothing asked about the broker feed, so
-  // the gate had a blind spot exactly where the engine had gone blind. All three
-  // burn-in sessions recorded so far ran that way and were marked clean.
+  // "Does the price table have the latest SESSION", which is one question.
+  // Comparing MAX(price date) against it answered two at once: a phantom
+  // Saturday bar made this false while noPhantomSessions was already reporting
+  // the same row, so one fault failed two checks and the failure list said the
+  // prices were behind when they were in fact ahead of the calendar.
+  checks.priceDataCurrent = (await latestPricedSession(pool)) === sessionDate;
+
+  // INPUT READINESS, replacing a hand-rolled broker check (2026-08-09).
   //
-  // One session of lag is normal: the feed lands in the evening, and the watchdog
-  // may run before it. Two or more is the feed being dead. Comparing against the
-  // PREVIOUS exchange session rather than sessionDate is what keeps this from
-  // failing every night for ordinary timing and being switched off as noise.
-  const [[bk]] = await pool.query(
-    'SELECT MAX(date) d FROM idx_broker_summary WHERE date <= ?', [sessionDate]);
-  const [sessRows] = await pool.query(
-    'SELECT date FROM idx_ihsg_history WHERE date <= ? ORDER BY date DESC LIMIT 2',
-    [sessionDate]);
-  const brokerFloor = iso(sessRows[1]?.date ?? sessRows[0]?.date);
-  checks.brokerDataCurrent = !!brokerFloor && !!bk?.d && iso(bk.d) >= brokerFloor;
+  // The check this supersedes was added on 2026-08-08 and was right about the
+  // hole it filled — /api/signal-scanner takes its notion of "today" from
+  // idx_broker_summary, that feed died on 2026-07-31, and nothing here asked.
+  // But it answered the question with its own private tolerance: it compared
+  // against the PREVIOUS exchange session, i.e. a lag of 1, while the freshness
+  // table tolerated 2 and the scanner tolerated 1. Three literals, three
+  // opinions, none of them measured. The comment justifying 1 ("the feed lands
+  // in the evening, and the watchdog may run before it") was simply false: the
+  // broker pull is the FIRST write of the 19:30 WIB job and the watchdog runs at
+  // 20:50 WIB, 80 minutes later.
+  //
+  // So the tolerance now comes from one place, sh.BROKER_DATA_MAX_LAG_SESSIONS,
+  // derived from arrival times, and the question comes from the readiness
+  // contract rather than from a query written here. What the gate asks is the
+  // same thing the scanner asks, because it is literally the same function.
+  //
+  // Scoped to the chain the burn-in is measuring. A stale ft_signals stops
+  // paper_trader.py and is reported as a failure by checkFreshness, but it is
+  // not evidence about the V2 execution chain and must not reset its streak.
+  const ready = await sh.readiness(pool, {
+    subsystems: [sh.SUBSYSTEM.VIRTUAL_BROKER],   // pulls in signal-engine transitively
+  });
+  checks.requiredInputsReady = ready.ready;
+  // Kept as a named check because it is the one the review asked for by name and
+  // the one the failures_json of 2026-08-07 records. It is now derived from the
+  // shared contract instead of a local query.
+  checks.brokerDataCurrent = !ready.blocking.concat(ready.degraded)
+    .some(r => /^(broker|concentration|flow_detail):/.test(r));
   // Excluding the dates already proven not to be sessions, the same subtraction
   // checkIhsgGaps makes. Without it this reported IDX public holidays as missing
   // index bars and failed the burn-in every night, for a fault no refetch can fix.
@@ -640,9 +751,26 @@ async function recordBurnIn(pool) {
   } catch (e) { reconcileProblems = [`reconcile could not run: ${e.message}`]; }
   checks.reconcileClean = reconcileProblems.length === 0;
 
-  checks.watchdogHealthy = !findings.some(f => f.level === 'FAIL' || f.level === 'RECURRING');
+  // SCOPED, for the same reason checks.requiredInputsReady is. A finding that
+  // declares no `affects` is treated as system-wide, which is the safe default:
+  // every existing repair, gap and reconcile finding is unscoped and keeps its
+  // full weight. Only findings that name a subsystem can be excluded, and only
+  // when that subsystem is not one the burn-in measures — today that means a
+  // dead ft_signals fails the watchdog without resetting the V2 streak.
+  const burnInScope = new Set([sh.SUBSYSTEM.VIRTUAL_BROKER, sh.SUBSYSTEM.SIGNAL_ENGINE]);
+  const inScope = f => !f.affects || !f.affects.length || f.affects.some(a => burnInScope.has(a));
+  const blockingFindings = findings.filter(f => (f.level === 'FAIL' || f.level === 'RECURRING') && inScope(f));
+  checks.watchdogHealthy = blockingFindings.length === 0;
 
   const failures = Object.entries(checks).filter(([, v]) => !v).map(([k]) => k);
+  // Name what actually failed readiness, not just that something did.
+  for (const r of ready.blocking) failures.push(`BLOCKING input ${r}`);
+  for (const r of ready.degraded) failures.push(`DEGRADED input ${r}`);
+  const outOfScope = findings.filter(f => (f.level === 'FAIL' || f.level === 'RECURRING') && !inScope(f));
+  if (outOfScope.length) {
+    line(`  (${outOfScope.length} watchdog failure(s) outside the burn-in's subsystems — reported, not scored here:`);
+    for (const f of outOfScope) line(`     ${f.what} [affects ${f.affects.join(', ')}])`);
+  }
   // Name the actual stage status, not just which check failed: "scheduleStageOk"
   // alone does not say whether it was BLOCKED, FAILED or never run.
   for (const st of ['resolve', 'schedule', 'mark']) {
@@ -713,6 +841,7 @@ async function main() {
     const phantomDates = await checkPhantomSessions(pool);
     await checkPriceGaps(pool);
     await checkFreshness(pool);
+    await checkBrokerGaps(pool);
     await checkForwardStages(pool);
     await checkVirtualPortfolio(pool);
     await checkJobRegistry(pool);
@@ -759,7 +888,7 @@ async function main() {
   }
 }
 
-module.exports = { checkIhsgGaps, checkPhantomSessions, checkPriceGaps, checkForwardStages, recordBurnIn, checkVirtualPortfolio, RECUR_THRESHOLD, RECUR_WINDOW };
+module.exports = { checkIhsgGaps, checkPhantomSessions, checkPriceGaps, checkFreshness, checkBrokerGaps, checkForwardStages, recordBurnIn, checkVirtualPortfolio, RECUR_THRESHOLD, RECUR_WINDOW };
 
 if (require.main === module) {
   main().catch(e => {

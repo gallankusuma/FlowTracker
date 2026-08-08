@@ -34,24 +34,158 @@
  * as "produce no actionable output", not as a warning to display.
  */
 
+/**
+ * SEVERITY — what a failed check is ALLOWED to do.
+ *
+ * WHY THIS REPLACED A BOOLEAN (2026-08-09)
+ * ----------------------------------------
+ * Severity used to be one flag, `critical`, and `watchdog.js` turned it into a
+ * report level with `r.critical ? 'FAIL' : 'WARN'`. Because the broker feed was
+ * marked non-critical, the day it died it produced a WARNING — and a warning
+ * binds nothing. The same night, the burn-in gate in the same file wrote
+ * `passed: 1`. The system detected the fault, said so in plain English, and
+ * passed itself anyway, for eight days.
+ *
+ * The defect was never "broker feed stale". It was DETECTION WITHOUT
+ * ENFORCEMENT, and a two-valued flag cannot express the difference between
+ * "worth a look" and "the output is wrong". So severity is now a level, and the
+ * top two levels BIND:
+ *
+ *   INFO      observational. Nothing depends on it.
+ *   ADVISORY  a human should look. Binds nothing, and is allowed to bind
+ *             nothing precisely BECAUSE it does not affect correctness.
+ *   DEGRADED  a real input is missing. Output may still be produced, but it must
+ *             be LABELLED degraded and is not promotable — and the session is
+ *             not clean, so the burn-in fails.
+ *   BLOCKING  correctness is compromised. No actionable output at all, and the
+ *             burn-in fails.
+ *
+ * THE RULE, from the 2026-08-08 review, and it is not negotiable:
+ *
+ *     a condition that affects correctness cannot be WARNING-only
+ *
+ * Which means: nothing that touches correctness may be given INFO or ADVISORY
+ * to keep the dashboard green. If a feed is marked below DEGRADED, the `why`
+ * must say what it is that does NOT depend on it.
+ */
+const SEVERITY = { INFO: 'INFO', ADVISORY: 'ADVISORY', DEGRADED: 'DEGRADED', BLOCKING: 'BLOCKING' };
+const SEVERITY_RANK = { INFO: 0, ADVISORY: 1, DEGRADED: 2, BLOCKING: 3 };
+/** DEGRADED and above BIND — readiness and the burn-in gate must both honour them. */
+const binds = sev => (SEVERITY_RANK[sev] ?? 0) >= SEVERITY_RANK.DEGRADED;
+
+/**
+ * WHO a condition affects. Without this the binding is too blunt in one
+ * direction and too generous in the other.
+ *
+ * `ft_signals` feeds paper_trader.py and nothing else. Marking it DEGRADED and
+ * letting that reset the Virtual Broker V2 streak would repeat a mistake this
+ * codebase has already made twice — throwaway TEST_* accounts entering the
+ * burn-in identity, and an experimental account's NAV failing the official
+ * checks. A Python paper-trading outage is real, and it is not evidence about
+ * the V2 execution chain.
+ */
+const SUBSYSTEM = {
+  SIGNAL_ENGINE:  'signal-engine',   // /api/signal-scanner, AWO factor scoring
+  VIRTUAL_BROKER: 'virtual-broker',  // virtual_portfolio + the burn-in
+  PAPER_TRADER:   'paper-trader',    // paper_trader.py, driven by ft_signals
+};
+
+/**
+ * The virtual broker trades what the signal engine produces, so every input the
+ * engine needs is transitively an input the broker chain needs. Stated once,
+ * here, rather than by repeating SIGNAL_ENGINE in every feed's `affects` — and
+ * it is the reason §4 of the review was right that all three burn-in sessions
+ * were compromised: not because the broker chain read broker tables directly,
+ * but because it acted on scores that did.
+ */
+const SUBSYSTEM_DEPENDS_ON = {
+  [SUBSYSTEM.VIRTUAL_BROKER]: [SUBSYSTEM.SIGNAL_ENGINE],
+};
+
+/**
+ * BROKER_DATA_MAX_LAG_SESSIONS — the one canonical answer to "how many exchange
+ * sessions may broker data lag before a signal built on it is invalid?"
+ *
+ * DERIVED FROM ARRIVAL TIMES, NOT COPIED FROM AN EXISTING LITERAL. Before this
+ * constant existed the codebase held three different answers to the same
+ * question — the burn-in gate used 1, this freshness table used 2, and
+ * /api/signal-scanner used 1 — none of which came from measuring anything.
+ *
+ * What the data says (idx_broker_summary.created_at vs the session it is dated
+ * for, every session 2026-07-01 .. 2026-07-31, the last month the feed was
+ * alive):
+ *
+ *   broker rows for session D land at   D 12:30:0x-12:30:5x UTC  (19:30 WIB)
+ *   the pull completes by               D 12:36     UTC          (~6 minutes)
+ *   price rows for session D land at    D 12:31-12:36 UTC        (90-360s LATER)
+ *   refresh_ihsg writes the calendar    D 13:05     UTC          (20:05 WIB)
+ *   the watchdog and burn-in gate run   D 13:50     UTC          (20:50 WIB)
+ *
+ * So broker data for session D is the FIRST thing the nightly pipeline writes,
+ * and every consumer in this system runs at least 35 minutes — the watchdog, 80
+ * minutes — after it. There is no window in which a healthy pipeline leaves a
+ * consumer looking at an absent broker bar for the current session.
+ *
+ *     => 0. Any lag at all means the pull did not happen.
+ *
+ * Two consequences worth stating, because both were reasons the old values
+ * looked defensible:
+ *
+ *  - "The feed lags by design, Index Alpha publishes ~19:00 WIB" was the stated
+ *    justification for tolerance 2. It is true that the SOURCE publishes late in
+ *    the day; it is not true that our copy of it lags a session, because our
+ *    pull is scheduled after the publication and before every consumer. Source
+ *    latency and pipeline lag are different quantities, and the old comment
+ *    conflated them.
+ *  - A strict 0 cannot false-alarm during the nightly write window, and that is
+ *    a measured property rather than a hope: broker precedes prices by 90-360
+ *    seconds, so the freshest-feed reference cannot reach session D before the
+ *    broker table does.
+ *
+ * IF THE PIPELINE'S SCHEDULE CHANGES, RE-DERIVE THIS. It is a statement about
+ * when jobs run, not a preference. A T+1 source with a morning pull would make
+ * it 1, and that would need the same measurement, not an edit.
+ */
+const BROKER_DATA_MAX_LAG_SESSIONS = 0;
+
 const CHECKS = [
-  // key                 table                  dateCol      maxLagTradingDays  critical
-  { key: 'prices',       table: 'idx_stock_prices',    col: 'date',        maxLag: 1, critical: true,
-    why: 'Every factor, regime and backtest reads prices. Stale prices mean stale everything.' },
-  { key: 'broker',       table: 'idx_broker_summary',  col: 'date',        maxLag: 2, critical: false,
-    why: 'Broker flow lags by design (Index Alpha publishes ~19:00 WIB) and only the veto uses it.' },
-  { key: 'concentration',table: 'idx_concentration',   col: 'data_date',   maxLag: 2, critical: false,
-    why: 'Derived from broker data; the POSFRAC veto degrades gracefully when it is missing.' },
-  { key: 'ihsg',         table: 'idx_ihsg_history',    col: 'date',        maxLag: 1, critical: true,
-    why: 'The 200-day regime filter is the one layer proven to transfer out of sample. Without a fresh IHSG it cannot be evaluated, and defaulting to "invested" is exactly the wrong failure direction.' },
+  { key: 'prices',       table: 'idx_stock_prices',    col: 'date',        maxLag: 1,
+    severity: SEVERITY.BLOCKING,
+    affects: [SUBSYSTEM.SIGNAL_ENGINE, SUBSYSTEM.VIRTUAL_BROKER, SUBSYSTEM.PAPER_TRADER],
+    why: 'Every factor, regime and backtest reads prices, and the NAV mark values positions from them. Stale prices mean stale everything. Tolerance is 1 rather than 0 because broker rows land 90-360s BEFORE prices in the same nightly job, so the freshest-feed reference briefly reaches session D while the price loop is still writing.' },
+
+  { key: 'broker',       table: 'idx_broker_summary',  col: 'date',        maxLag: BROKER_DATA_MAX_LAG_SESSIONS,
+    severity: SEVERITY.BLOCKING,
+    affects: [SUBSYSTEM.SIGNAL_ENGINE],
+    why: 'BLOCKING, and it was the feed marked non-critical when it died. /api/signal-scanner takes its notion of "today" from this table — it is the clock, not merely a factor input — and the f1 concentration family is computed from it. A score dated to a session this table does not cover is not a stale score, it is a confident score built on inputs that do not exist.' },
+
+  { key: 'concentration',table: 'idx_concentration',   col: 'data_date',   maxLag: BROKER_DATA_MAX_LAG_SESSIONS,
+    severity: SEVERITY.BLOCKING,
+    affects: [SUBSYSTEM.SIGNAL_ENGINE],
+    why: 'Broker-derived, and f1 reads dn0..dn4 from it directly. Listed separately from `broker` even though the same outage takes both, because the derivation step can fail on its own: fresh broker rows with no concentration computed from them is a state the engine would otherwise score straight through.' },
+
+  // Added 2026-08-09 by the severity sweep. It was never monitored, and it
+  // feeds live scoring (server.js:6245, the foreign/domestic divergence factor).
+  { key: 'flow_detail',  table: 'idx_broker_flow_detail', col: 'date',     maxLag: BROKER_DATA_MAX_LAG_SESSIONS,
+    severity: SEVERITY.DEGRADED,
+    affects: [SUBSYSTEM.SIGNAL_ENGINE],
+    why: 'The foreign/domestic split. DEGRADED rather than BLOCKING because it is one factor family and not the clock: with it absent the engine can still date and score a session, but it must say the divergence factor is missing rather than report a neutral value as a measurement.' },
+
+  { key: 'ihsg',         table: 'idx_ihsg_history',    col: 'date',        maxLag: 1,
+    severity: SEVERITY.BLOCKING,
+    affects: [SUBSYSTEM.SIGNAL_ENGINE, SUBSYSTEM.VIRTUAL_BROKER],
+    why: 'Two jobs at once: the 200-day regime filter (the one layer proven to transfer out of sample, where defaulting to "invested" is exactly the wrong failure direction) and the exchange session calendar that virtual_portfolio, the gap detectors and the burn-in all take their date axis from. Tolerance 1 is scheduled, not slack: refresh_ihsg runs 13:05 UTC, 35 minutes after the pull that lands prices and broker.' },
+
   // Added 2026-08-03 after finding ft_signals had been stale since 2026-05-30.
   // signal_engine.py had a SyntaxError and, later, an unquoted MySQL reserved
   // word. paper_trader.py kept running eight times a day and logging "Found 0
   // BUY/STRONG_BUY signals", which is indistinguishable from a quiet market.
   // Two months of silence. This check is the whole argument for deriving health
   // from data rather than from whether a job reported an error.
-  { key: 'signals',      table: 'ft_signals',          col: 'signal_date', maxLag: 3, critical: false,
-    why: 'Feeds paper_trader.py. When it goes stale the paper trader still runs and still reports zero trades, which reads as a quiet market rather than a broken pipeline.' },
+  { key: 'signals',      table: 'ft_signals',          col: 'signal_date', maxLag: 3,
+    severity: SEVERITY.DEGRADED,
+    affects: [SUBSYSTEM.PAPER_TRADER],
+    why: 'Feeds paper_trader.py. When it goes stale the paper trader still runs and still reports zero trades, which reads as a quiet market rather than a broken pipeline — so DEGRADED, never advisory. Scoped to paper-trader on purpose: it is not an input to the signal engine or the V2 execution chain, and letting it reset the V2 burn-in would be the same scope error as the TEST_* accounts that once entered the official identity hash.' },
 ];
 
 /**
@@ -139,17 +273,28 @@ async function dataFreshness(pool, today = new Date()) {
     } catch { /* a broken table is reported per-check below */ }
   }
 
+  // `critical` is still emitted alongside `severity` because the Trade Desk
+  // reads it (app/trade-desk/page.tsx). Derived, never authored: one source of
+  // truth, so the two can never disagree the way the gate and the warning did.
+  const decorate = row => ({
+    ...row,
+    critical: row.severity === SEVERITY.BLOCKING,
+    binds: binds(row.severity),
+  });
+
   const out = [];
   if (reference !== null) {
     const drift = weekdaysSince(reference, today);
-    out.push({
-      key: 'ingest', table: '(all monitored feeds)', critical: true,
+    out.push(decorate({
+      key: 'ingest', table: '(all monitored feeds)',
+      severity: SEVERITY.BLOCKING,
+      affects: [SUBSYSTEM.SIGNAL_ENGINE, SUBSYSTEM.VIRTUAL_BROKER, SUBSYSTEM.PAPER_TRADER],
       why: 'Measured against the clock, not against another table. Every per-table lag below is relative to this bar, so if this is stale everything else is fresh relative to a frozen yardstick and a total outage reads as all-green.',
       latest: reference, lagTradingDays: drift, maxLag: MAX_REFERENCE_WEEKDAYS, rows: null,
       ok: drift <= MAX_REFERENCE_WEEKDAYS,
       detail: drift <= MAX_REFERENCE_WEEKDAYS ? 'fresh'
         : `no feed has produced data for ${drift} weekdays (tolerance ${MAX_REFERENCE_WEEKDAYS})`,
-    });
+    }));
   }
 
   for (const c of CHECKS) {
@@ -157,20 +302,90 @@ async function dataFreshness(pool, today = new Date()) {
       const [r] = await pool.query(`SELECT MAX(${c.col}) AS d, COUNT(*) AS n FROM ${c.table}`);
       const latest = r[0].d;
       if (!latest) {
-        out.push({ ...c, latest: null, lagTradingDays: null, ok: false, detail: 'table is empty' });
+        out.push(decorate({ ...c, latest: null, lagTradingDays: null, ok: false, detail: 'table is empty' }));
         continue;
       }
       const d = latest instanceof Date ? latest.toISOString().slice(0, 10) : String(latest).slice(0, 10);
       const lag = await tradingDayLag(pool, d, reference);
-      out.push({ key: c.key, table: c.table, critical: c.critical, why: c.why,
+      out.push(decorate({ key: c.key, table: c.table, severity: c.severity, affects: c.affects, why: c.why,
                  latest: d, lagTradingDays: lag, maxLag: c.maxLag, rows: Number(r[0].n),
                  ok: lag <= c.maxLag,
-                 detail: lag <= c.maxLag ? 'fresh' : `${lag} trading days behind (tolerance ${c.maxLag})` });
+                 detail: lag <= c.maxLag ? 'fresh'
+                   : `${lag} trading session(s) behind (tolerance ${c.maxLag})` }));
     } catch (e) {
-      out.push({ ...c, latest: null, lagTradingDays: null, ok: false, detail: `query failed: ${e.message}` });
+      out.push(decorate({ ...c, latest: null, lagTradingDays: null, ok: false, detail: `query failed: ${e.message}` }));
     }
   }
   return out;
+}
+
+/**
+ * THE READINESS CONTRACT, from §2.3 of the 2026-08-08 review.
+ *
+ *     SIGNAL_DATE = latest exchange session for which
+ *                   ALL REQUIRED INPUT FAMILIES are current
+ *
+ *     not max(price_date), and not max(broker_date)
+ *
+ * The scanner's original bug was that it HAD a clock — it read
+ * MAX(idx_broker_summary.date) and called that today. When the feed froze, the
+ * clock froze with it and the endpoint kept answering. A clock cannot notice
+ * that it has stopped. A readiness contract can, because it asks a different
+ * question: not "what time is it?" but "is every input I need present for the
+ * session I am about to speak for?"
+ *
+ * `signalDate` here is the oldest of the required feeds' latest dates, which is
+ * the correct answer only while those feeds have no holes BEHIND their newest
+ * row. They do — idx_broker_summary is missing 2026-06-15, 06-22 and 06-29
+ * outright. MAX(date) cannot see a hole, which is the same blindness that let
+ * the IHSG series lose 2026-08-03 while every check stayed green. Hole detection
+ * is `missingSessions`, reported by the watchdog, deliberately NOT folded in
+ * here: this function answers "can we speak for the newest session", and a
+ * window query asking "are the last N sessions complete" is a different question
+ * that Pattern Replay needs and must ask for itself.
+ *
+ * @param {string[]} subsystems  which subsystems to judge; dependencies are
+ *                               resolved through SUBSYSTEM_DEPENDS_ON.
+ */
+async function readiness(pool, { subsystems = Object.values(SUBSYSTEM), today = new Date(), freshness = null } = {}) {
+  const fresh = freshness || await dataFreshness(pool, today);
+
+  const wanted = new Set();
+  const expand = s => {
+    if (wanted.has(s)) return;
+    wanted.add(s);
+    for (const dep of SUBSYSTEM_DEPENDS_ON[s] || []) expand(dep);
+  };
+  for (const s of subsystems) expand(s);
+
+  const relevant = fresh.filter(f => (f.affects || []).some(a => wanted.has(a)));
+  const failed = relevant.filter(f => !f.ok);
+
+  const blocking = failed.filter(f => f.severity === SEVERITY.BLOCKING);
+  const degraded = failed.filter(f => f.severity === SEVERITY.DEGRADED);
+  const advisory = failed.filter(f => !binds(f.severity));
+
+  // The session we can honestly speak for: the oldest "latest" among the
+  // required feeds. A feed with no rows at all makes this null rather than
+  // being skipped — an empty table is not a table that agrees with everyone.
+  let signalDate = null, limitedBy = null;
+  for (const f of relevant) {
+    if (f.key === 'ingest') continue;          // synthetic, has no session of its own
+    if (!f.latest) { signalDate = null; limitedBy = f.key; break; }
+    if (signalDate === null || f.latest < signalDate) { signalDate = f.latest; limitedBy = f.key; }
+  }
+
+  return {
+    ready: blocking.length === 0 && degraded.length === 0,
+    enabled: blocking.length === 0,        // BLOCKING stops output; DEGRADED only labels it
+    degradedMode: blocking.length === 0 && degraded.length > 0,
+    subsystems: [...wanted],
+    signalDate, limitedBy,
+    blocking: blocking.map(f => `${f.key}:${f.detail}`),
+    degraded: degraded.map(f => `${f.key}:${f.detail}`),
+    advisory: advisory.map(f => `${f.key}:${f.detail}`),
+    detail: relevant,
+  };
 }
 
 /**
@@ -412,13 +627,27 @@ async function jobHealth(pool) {
  * @returns {{enabled:boolean, reasons:string[], detail:object[], checkedAt:string}}
  */
 async function signalState(pool, opts = {}) {
-  const reasons = [];
   const fresh = await dataFreshness(pool, opts.today || new Date());
+  const subsystems = opts.subsystems || [SUBSYSTEM.SIGNAL_ENGINE];
+  const ready = await readiness(pool, { subsystems, today: opts.today || new Date(), freshness: fresh });
 
-  for (const f of fresh) {
-    if (f.ok) continue;
-    reasons.push(`${f.critical ? 'STALE_CRITICAL' : 'STALE_NONCRITICAL'}:${f.key}:${f.detail}`);
-  }
+  // SEVERITY DECIDES, NOT A BOOLEAN. This function used to disable only on
+  // `critical` staleness, and the reason given was that "a missing broker feed
+  // degrades the veto, which is a weaker signal than silently trading on a stale
+  // price series". That reasoning did not survive contact with the outage: the
+  // scanner takes its DATE from the broker table, so a dead broker feed is not a
+  // weakened veto, it is a stopped clock. Checked on 2026-08-09 with the feed
+  // five sessions dead, this function still returned enabled:true — the kill
+  // switch was green through the exact failure it exists to catch.
+  const reasons = ready.blocking.map(r => `STALE_BLOCKING:${r}`);
+  const warnings = [
+    ...ready.degraded.map(r => `STALE_DEGRADED:${r}`),
+    ...ready.advisory.map(r => `STALE_ADVISORY:${r}`),
+    // Feeds outside the requested subsystems are still reported, so that
+    // scoping the gate never becomes a way of not hearing about a dead feed.
+    ...fresh.filter(f => !f.ok && !ready.detail.includes(f))
+            .map(f => `OUT_OF_SCOPE:${f.severity}:${f.key}:${f.detail}`),
+  ];
 
   const jobs = await jobHealth(pool);
   for (const j of jobs) {
@@ -430,19 +659,26 @@ async function signalState(pool, opts = {}) {
     reasons.push(`MODEL_VERSION_MISMATCH:${opts.actualModelVersion} != ${opts.expectedModelVersion}`);
   }
 
-  // Only CRITICAL staleness and repeated job failure disable output. A missing
-  // broker feed degrades the veto, which is a weaker signal than silently
-  // trading on a stale price series — so it warns rather than disables.
-  const blocking = reasons.filter(r => r.startsWith('STALE_CRITICAL') || r.startsWith('JOB_FAILING') || r.startsWith('MODEL_VERSION_MISMATCH'));
-
   return {
-    enabled: blocking.length === 0,
-    reasons: blocking,
-    warnings: reasons.filter(r => !blocking.includes(r)),
+    enabled: reasons.length === 0,
+    // DEGRADED does not stop output, but it must travel WITH it. A caller that
+    // renders `enabled` and drops this is back to a warning beside a signal,
+    // which still reads as a signal.
+    degraded: ready.degradedMode,
+    degradedReasons: ready.degraded,
+    signalDate: ready.signalDate,
+    limitedBy: ready.limitedBy,
+    reasons,
+    warnings,
     detail: fresh,
     jobs,
     checkedAt: new Date().toISOString(),
   };
 }
 
-module.exports = { CHECKS, dataFreshness, missingSessions, phantomSessions, recordJobRun, jobHealth, signalState, ensureTable, weekdaysSince, MAX_REFERENCE_WEEKDAYS };
+module.exports = {
+  CHECKS, dataFreshness, missingSessions, phantomSessions, recordJobRun, jobHealth,
+  signalState, readiness, ensureTable, weekdaysSince,
+  MAX_REFERENCE_WEEKDAYS, BROKER_DATA_MAX_LAG_SESSIONS,
+  SEVERITY, SEVERITY_RANK, binds, SUBSYSTEM, SUBSYSTEM_DEPENDS_ON,
+};
