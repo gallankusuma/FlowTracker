@@ -38,6 +38,7 @@ export default function FloatMapPage() {
   const [data, setData] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
   const [sel, setSel] = useState<string | null>(null);
+  const [query, setQuery] = useState('');
 
   /**
    * Match the list's height to the detail panel beside it.
@@ -105,7 +106,12 @@ export default function FloatMapPage() {
   );
   if (!data) return (<><Navbar /><div style={{ padding: 28, color: MUTED }}>loading float map…</div></>);
 
-  const rows = data.rows || [];
+  const allRows = data.rows || [];
+  // Filtering NEVER renumbers. The rank is this ticker's place among all 239
+  // names; renumbering the visible subset would invent a different ordering
+  // that happens to look like the real one.
+  const q = query.trim().toUpperCase();
+  const rows = q ? allRows.filter((r: any) => r.ticker.includes(q)) : allRows;
   const cur = rows.find((r: any) => r.ticker === sel) || rows[0];
   const maxShare = cur ? Math.max(...cur.dist.map((d: any) => d.share)) : 1;
 
@@ -132,9 +138,21 @@ export default function FloatMapPage() {
     }
     return n;
   };
+  /**
+   * Staleness is asked of the JOB, not of the session date, and that removes
+   * the holiday problem entirely rather than working around it.
+   *
+   * The old check counted weekdays since `session`, so an IDX holiday made a
+   * perfectly fresh snapshot read as stale — the cron does not observe the
+   * exchange calendar, it runs Monday to Friday regardless and simply produces
+   * the same session date again. Measuring generatedAt against that schedule
+   * asks the only question that matters: has a scheduled run been missed?
+   */
+  const runsMissed = data.generatedAt
+    ? weekdaysBetween(new Date(data.generatedAt).toISOString().slice(0, 10)) : 99;
   const sessionAge = data.session ? weekdaysBetween(String(data.session).slice(0, 10)) : 99;
   const STALE_AFTER = 2;                       // one missed nightly run is tolerated; two is not
-  const stale = sessionAge > STALE_AFTER;
+  const stale = runsMissed > STALE_AFTER;
 
   const dateStatus = (label: string, value: string | null, expected?: string) => {
     if (!value) return { label, value: '–', tone: WARN, note: 'not recorded' };
@@ -209,7 +227,7 @@ export default function FloatMapPage() {
               {data.generatedAt ? new Date(data.generatedAt).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '–'}
             </div>
             <div style={{ fontSize: 11, color: 'var(--text-muted)' }}>
-              session {sessionStr} · {sessionAge} weekday(s) ago
+              session {sessionStr} · job last ran {runsMissed} weekday(s) ago
             </div>
           </div>
           <div style={{ marginLeft: 'auto' }}>
@@ -232,8 +250,9 @@ export default function FloatMapPage() {
             fontSize: 15, lineHeight: 1.6,
           }}>
             <b style={{ color: BAD }}>⚠ STALE SNAPSHOT — RANKING DISABLED.</b>{' '}
-            The most recent snapshot is built on session <b>{sessionStr}</b>, {sessionAge}{' '}
-            weekdays ago. The nightly job has not produced a current one, so the ordering below would be
+            The nightly job has not run for <b>{runsMissed} scheduled weekdays</b> — its last
+            snapshot is from {data.generatedAt ? new Date(data.generatedAt).toISOString().slice(0, 10) : '–'},
+            built on session <b>{sessionStr}</b>. So the ordering below would be
             yesterday&apos;s answer wearing today&apos;s date. Values are shown greyed for
             reference only. Check <code>/var/log/float-map.log</code> on the VPS.
           </div>
@@ -272,8 +291,35 @@ export default function FloatMapPage() {
 
         {/* ── ranking ─────────────────────────────────────────────────── */}
         <div ref={leftCardRef} style={{ ...card, padding: 0, overflow: 'hidden', opacity: stale ? 0.45 : 1, filter: stale ? 'grayscale(1)' : 'none' }}>
-          <div style={{ padding: '14px 18px 6px', fontSize: 14, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)' }}>
-            RANKED BY RESIDUAL COST GAP{stale && ' — DISABLED'}
+          <div style={{ padding: '14px 18px 10px', display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <span style={{ fontSize: 14, fontWeight: 800, letterSpacing: '0.08em', color: 'var(--text-muted)' }}>
+              RANKED BY RESIDUAL COST GAP{stale && ' — DISABLED'}
+            </span>
+            <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
+              <input
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                placeholder="Cari ticker…"
+                spellCheck={false}
+                style={{
+                  padding: '7px 12px', borderRadius: 8, border: '1px solid var(--border)',
+                  background: 'var(--bg-primary)', color: 'var(--text-primary)',
+                  fontSize: 14, fontWeight: 700, width: 150, outline: 'none',
+                  textTransform: 'uppercase',
+                }} />
+              {q && (
+                <>
+                  <span style={{ fontSize: 13, color: rows.length ? 'var(--text-muted)' : WARN }}>
+                    {rows.length} of {allRows.length}
+                  </span>
+                  <button onClick={() => setQuery('')} style={{
+                    padding: '6px 11px', borderRadius: 7, border: '1px solid var(--border)',
+                    background: 'transparent', color: 'var(--text-muted)', cursor: 'pointer',
+                    fontSize: 13, fontWeight: 700,
+                  }}>Reset</button>
+                </>
+              )}
+            </div>
           </div>
           {/* Was a flat 620px, which stopped short of the bottom on any normal
               screen and left the column looking truncated next to the detail
@@ -345,6 +391,14 @@ export default function FloatMapPage() {
                 ))}
               </tbody>
             </table>
+            {q && rows.length === 0 && (
+              <div style={{ padding: '28px 18px', textAlign: 'center', color: 'var(--text-muted)', fontSize: 14, lineHeight: 1.6 }}>
+                No ticker matching <b style={{ color: 'var(--text-primary)' }}>{q}</b> in this
+                snapshot. The universe is every name with a valid free float on record
+                ({allRows.length} today) — a ticker can be absent because its float was rejected,
+                its price history is under 250 sessions, or a corporate action was detected.
+              </div>
+            )}
           </div>
         </div>
 
