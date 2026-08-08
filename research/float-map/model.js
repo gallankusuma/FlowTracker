@@ -90,13 +90,31 @@ function costMap(bars, floatShares, opts = {}) {
 
   const price = bars[bars.length - 1].c;
   const avgCost = dist.reduce((a, x, i) => a + x * mid(i), 0) / total;
+
+  /**
+   * A bucket is a PRICE BAND, not a point, and the current price usually falls
+   * inside one of them.
+   *
+   * Counting a whole bucket as "in profit" whenever its midpoint sits below the
+   * price is a step function: it moves in jumps the size of a whole band as the
+   * price crosses each midpoint, and it is simply wrong for the band the price
+   * is actually inside. A band Rp1,000-1,100 holding 20% with the price at
+   * Rp1,030 is 6% in profit, not 20% and not 0%.
+   */
+  let profitShares = 0;
+  for (let i = 0; i < nb; i++) {
+    const bandLo = lo + step * i, bandHi = bandLo + step;
+    if (bandHi <= price) profitShares += dist[i];                       // entirely below
+    else if (bandLo >= price) continue;                                 // entirely above
+    else profitShares += dist[i] * ((price - bandLo) / step);           // price crosses it
+  }
   const peakI = dist.indexOf(Math.max(...dist));
   const sum = n => turns.slice(-n).reduce((a, b) => a + b, 0);
 
   const out = {
     price, avgCost,
     avgCostGap: price / avgCost - 1,
-    profitSupply: dist.reduce((a, x, i) => a + (mid(i) < price ? x : 0), 0) / total,
+    profitSupply: profitShares / total,
     distToPeak: (price - mid(peakI)) / price,
     peakLow: mid(peakI) - step / 2,
     peakHigh: mid(peakI) + step / 2,
@@ -115,14 +133,39 @@ function costMap(bars, floatShares, opts = {}) {
   return out;
 }
 
-/** Coarse buckets for a chart. The full 40 is noise on screen. */
+/**
+ * Coarse bands for a chart. The full 40 is noise on screen.
+ *
+ * Each band carries its own low and high. It used to report only
+ * `mid(i)` — the midpoint of the FIRST of the two merged buckets, so the label
+ * sat half a step below the band it named — and with a single point there was
+ * no way to split the band the price falls inside, or even to know where it
+ * begins and ends.
+ *
+ * `hidden` is MEASURED, not inferred by subtracting from 100. The page was
+ * computing it as `100 - shown`, which silently absorbs any arithmetic error
+ * into a number presented as a fact.
+ */
 function chartBuckets(m, everyN = 2, minShare = 0.005) {
-  const out = [];
+  const bands = [];
+  let hidden = 0;
   for (let i = 0; i < m.dist.length; i += everyN) {
-    const s = (m.dist[i] + (m.dist[i + 1] || 0)) / m.totalShares;
-    if (s >= minShare) out.push({ price: Math.round(m.lo + m.step * (i + 0.5)), share: +(s * 100).toFixed(1) });
+    const end = Math.min(m.dist.length, i + everyN);
+    let shares = 0;
+    for (let j = i; j < end; j++) shares += m.dist[j];
+    const share = shares / m.totalShares;
+    const low = m.lo + m.step * i, high = m.lo + m.step * end;
+    if (share >= minShare) {
+      const lowR = Math.round(low), highR = Math.round(high);
+      bands.push({
+        low: lowR, high: highR,
+        midpoint: Math.round((lowR + highR) / 2),
+        share: +(share * 100).toFixed(1),
+      });
+    } else hidden += share;
   }
-  return out.reverse();
+  bands.reverse();
+  return { bands, hidden: +(hidden * 100).toFixed(2) };
 }
 
 /** Cross-sectional OLS residual of y on the given columns, or null if singular. */

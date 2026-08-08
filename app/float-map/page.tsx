@@ -414,13 +414,13 @@ export default function FloatMapPage() {
               {cur.dist.map((d: any) => {
                 const here = d.price <= cur.price && d.price + (cur.dist[0].price - cur.dist[1]?.price || 1) > cur.price;
                 return (
-                  <div key={d.price} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <span style={{ width: 62, textAlign: 'right', color: MUTED }}>{rp(d.price)}</span>
+                  <div key={d.low} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                    <span style={{ width: 62, textAlign: 'right', color: MUTED }} title={`${rp(d.low)} – ${rp(d.high)}`}>{rp(d.midpoint)}</span>
                     <span style={{ flex: 1, background: 'var(--bg-primary)', borderRadius: 3, overflow: 'hidden' }}>
                       <span style={{
                         display: 'block', height: 11,
                         width: `${(d.share / maxShare) * 100}%`,
-                        background: d.price < cur.price ? OK : BAD, opacity: 0.65,
+                        background: d.high <= cur.price ? OK : d.low >= cur.price ? BAD : WARN, opacity: 0.65,
                       }} />
                     </span>
                     <span style={{ width: 38, textAlign: 'right' }}>{d.share}%</span>
@@ -433,9 +433,16 @@ export default function FloatMapPage() {
                   filter into what looks like an arithmetic error. */}
               {(() => {
                 const shown = cur.dist.reduce((a: number, d: any) => a + d.share, 0);
-                const hidden = Math.max(0, 100 - shown);
-                const inProfit = cur.dist.filter((d: any) => d.price < cur.price)
-                  .reduce((a: number, d: any) => a + d.share, 0);
+                // Measured by the model. Deriving it as 100 - shown absorbed any
+                // arithmetic error into a number presented as a fact.
+                const hidden = cur.hiddenShare ?? Math.max(0, 100 - shown);
+                // Same proportional rule the model uses: the band the price
+                // falls inside is split, not assigned whole to one side.
+                const inProfit = cur.dist.reduce((a: number, d: any) => {
+                  if (d.high <= cur.price) return a + d.share;
+                  if (d.low >= cur.price) return a;
+                  return a + d.share * ((cur.price - d.low) / (d.high - d.low));
+                }, 0);
                 return (
                   <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
                     <span style={{ width: 62, textAlign: 'right', color: 'var(--text-muted)', fontWeight: 800 }}>TOTAL</span>

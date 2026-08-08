@@ -163,13 +163,65 @@ t('   ...a singular system returns null rather than nonsense', () => {
 
 console.log('\nfloat map model — the shape the page consumes');
 
-t('chart buckets sum to the whole distribution minus what was filtered out', () => {
+
+
+console.log('\nfloat map model — a bucket is a band, not a point');
+
+t('the price splits the band it falls inside, proportionally', () => {
+  // The reviewer's worked example: a band Rp1,000-1,100 holding 20% with the
+  // price at Rp1,030 is 6% in profit — not 20%, and not 0%.
+  const nb = 10, lo = 500, step = 100;
+  const dist = new Array(nb).fill(0);
+  dist[5] = 20; dist[0] = 80;
+  const price = 1030;
+  let profit = 0;
+  for (let i = 0; i < nb; i++) {
+    const bl = lo + step * i, bh = bl + step;
+    if (bh <= price) profit += dist[i];
+    else if (bl >= price) continue;
+    else profit += dist[i] * ((price - bl) / step);
+  }
+  assert.strictEqual(+profit.toFixed(4), 86, 'got ' + profit);
+});
+
+t('costMap uses that split, so a small price move cannot jump a whole band', () => {
+  // The series must span a real range, or 40 bands cover a couple of rupiah
+  // and a one-rupiah move genuinely crosses most of them — which is what my
+  // first version of this test measured, and it was the test that was wrong.
+  const mk = last => {
+    const b = bars({ n: 250, price: 800, vol: 1e6, drift: 0.001, spread: 0.01 });
+    b[b.length - 1] = { h: last * 1.001, l: last * 0.999, c: last, v: 1e6 };
+    return M.costMap(b, FLOAT);
+  };
+  const base = bars({ n: 250, price: 800, vol: 1e6, drift: 0.001, spread: 0.01 });
+  const mid = base[base.length - 1].c;
+  const a = mk(mid), c = mk(mid * 1.001);
+  assert.ok(!a.error && !c.error, a.error || c.error);
+  const jump = Math.abs(c.profitSupply - a.profitSupply);
+  assert.ok(jump < 0.25, 'a 0.1% price move shifted profitSupply by ' + (jump*100).toFixed(1) + ' points');
+});
+
+t('every band carries its own low, high and midpoint', () => {
   const m = M.costMap(bars({ vol: 2e7, drift: 0.0005 }), FLOAT);
-  const b = M.chartBuckets(m);
-  const sum = b.reduce((a, x) => a + x.share, 0);
-  assert.ok(sum > 80 && sum <= 100.5, `chart buckets total ${sum}%`);
-  // Descending price order, so the chart reads like a price axis.
-  for (let i = 1; i < b.length; i++) assert.ok(b[i].price < b[i - 1].price, 'buckets are not in descending price order');
+  const { bands } = M.chartBuckets(m);
+  assert.ok(bands.length > 0);
+  for (const b of bands) {
+    assert.ok(b.high > b.low, 'band ' + b.low + '-' + b.high + ' is not a range');
+    assert.strictEqual(b.midpoint, Math.round((b.low + b.high) / 2), 'midpoint is not the middle of its own band');
+  }
+  for (let i = 1; i < bands.length; i++) assert.ok(bands[i].midpoint < bands[i-1].midpoint, 'not descending');
+});
+
+t('displayed + hidden = 100%, measured rather than inferred', () => {
+  for (const cfg of [{ vol: 2e7, drift: 0.0005 }, { vol: 1e6 }, { vol: 4e8, spread: 0.05 }]) {
+    const m = M.costMap(bars(cfg), FLOAT);
+    if (m.error) continue;
+    const { bands, hidden } = M.chartBuckets(m);
+    const shown = bands.reduce((a, x) => a + x.share, 0);
+    const tol = 0.05 * bands.length + 0.05;
+    assert.ok(Math.abs(shown + hidden - 100) <= tol,
+      'shown ' + shown.toFixed(2) + ' + hidden ' + hidden + ' = ' + (shown+hidden).toFixed(2));
+  }
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);

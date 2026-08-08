@@ -219,7 +219,8 @@ const MIGRATIONS = [
       seedRemaining: m.seedRemaining, bars: win.length,
       floatStatus: ff.status, floatAgeDays: ff.ageDays, brokerLagSessions,
     });
-    rows.push({ tk, ff, m, conf, dist: M.chartBuckets(m) });
+    const chart = M.chartBuckets(m);
+    rows.push({ tk, ff, m, conf, dist: chart.bands, hiddenShare: chart.hidden });
   }
 
   const resid = M.residualise(rows.map(r => r.m.avgCostGap),
@@ -312,6 +313,8 @@ const MIGRATIONS = [
       seedRemaining: r.conf.seedRemainingPct,
       confidence: r.conf.overall, confidenceData: r.conf.data, confidenceConvergence: r.conf.convergence,
       dist: r.dist,
+      // Measured by the model, not inferred on the page by subtracting from 100.
+      hiddenShare: r.hiddenShare,
     })),
   };
 
