@@ -519,6 +519,25 @@ async function recordBurnIn(pool) {
   const checks = {};
   const [[px]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
   checks.priceDataCurrent = iso(px?.d) === sessionDate;
+  // /api/signal-scanner takes its notion of "today" from idx_broker_summary, not
+  // from prices. When that feed died on 2026-07-31 the scanner kept serving 31
+  // July scores under today's date for eight days, and every check here still
+  // passed — priceDataCurrent and calendarCurrent were honestly true, because
+  // prices and the calendar were fine. Nothing asked about the broker feed, so
+  // the gate had a blind spot exactly where the engine had gone blind. All three
+  // burn-in sessions recorded so far ran that way and were marked clean.
+  //
+  // One session of lag is normal: the feed lands in the evening, and the watchdog
+  // may run before it. Two or more is the feed being dead. Comparing against the
+  // PREVIOUS exchange session rather than sessionDate is what keeps this from
+  // failing every night for ordinary timing and being switched off as noise.
+  const [[bk]] = await pool.query(
+    'SELECT MAX(date) d FROM idx_broker_summary WHERE date <= ?', [sessionDate]);
+  const [sessRows] = await pool.query(
+    'SELECT date FROM idx_ihsg_history WHERE date <= ? ORDER BY date DESC LIMIT 2',
+    [sessionDate]);
+  const brokerFloor = iso(sessRows[1]?.date ?? sessRows[0]?.date);
+  checks.brokerDataCurrent = !!brokerFloor && !!bk?.d && iso(bk.d) >= brokerFloor;
   // Excluding the dates already proven not to be sessions, the same subtraction
   // checkIhsgGaps makes. Without it this reported IDX public holidays as missing
   // index bars and failed the burn-in every night, for a fault no refetch can fix.

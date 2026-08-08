@@ -6156,6 +6156,38 @@ app.get('/api/signal-scanner', async (req, res) => {
     const dates = dateRows.map(r => toStr(r.date));
     const latestDate = dates[0];
 
+    // ── 1b. Refuse to pass off a dead clock as today ─────────────────────────
+    // Everything below is dated by latestDate, which comes from the broker feed
+    // above — NOT from prices. When that feed died on 2026-07-31 this endpoint
+    // went on serving 31 July scores, dated 31 July, for eight days, while
+    // idx_stock_prices stayed current to 7 August. Nothing said a word, and the
+    // snapshots written at the bottom of this handler simply rewrote 31 July
+    // with identical values, so even the row count never moved.
+    //
+    // The clock is deliberately NOT switched to prices. Concentration, flow and
+    // the whole f1 family come from these same broker tables; scoring a date they
+    // do not cover would not produce fresher signals, it would produce confident
+    // ones built on absent inputs — worse than stale, because stale is at least
+    // true of some day. Refusing is the honest option: say which day we can
+    // actually see, and how far behind that is.
+    const [sessRows] = await pool.query(
+      'SELECT date FROM idx_ihsg_history WHERE date > ? ORDER BY date ASC', [latestDate]);
+    const sessionsBehind = sessRows.length;
+    // One session of lag is ordinary — the feed lands in the evening and this may
+    // be called before it. Two or more means the feed stopped.
+    if (sessionsBehind > 1) {
+      return res.status(503).json({
+        data: [], date: latestDate, source: 'stale-broker-feed',
+        stale: true,
+        sessionsBehind,
+        latestBrokerDate: latestDate,
+        latestSessionDate: toStr(sessRows[sessRows.length - 1].date),
+        error: `Broker data stops at ${latestDate}, ${sessionsBehind} exchange sessions behind. ` +
+               `Scores are not computed: concentration and flow factors have no data past that date, ` +
+               `so a score dated today would be built on inputs that do not exist.`,
+      });
+    }
+
     // ── 2. Score EVERY tracked ticker (TOP_STOCKS), not just whichever subset
     // happened to have broker_summary rows on the single latest date — a thin
     // day for a given stock (or it just missed that day's Index Alpha pull)
