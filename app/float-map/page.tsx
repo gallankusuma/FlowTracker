@@ -427,6 +427,27 @@ export default function FloatMapPage() {
                   </div>
                 );
               })}
+              {/* A total, and an honest one: chartBuckets drops anything under
+                  0.5% to keep the chart readable, so the bars do NOT sum to
+                  100%. Printing the sum without saying that turns a deliberate
+                  filter into what looks like an arithmetic error. */}
+              {(() => {
+                const shown = cur.dist.reduce((a: number, d: any) => a + d.share, 0);
+                const hidden = Math.max(0, 100 - shown);
+                const inProfit = cur.dist.filter((d: any) => d.price < cur.price)
+                  .reduce((a: number, d: any) => a + d.share, 0);
+                return (
+                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
+                    <span style={{ width: 62, textAlign: 'right', color: 'var(--text-muted)', fontWeight: 800 }}>TOTAL</span>
+                    <span style={{ flex: 1, fontSize: 12, color: 'var(--text-muted)' }}>
+                      <b style={{ color: OK }}>{inProfit.toFixed(1)}%</b> below price ·{' '}
+                      <b style={{ color: BAD }}>{(shown - inProfit).toFixed(1)}%</b> above
+                      {hidden >= 0.1 && <> · {hidden.toFixed(1)}% in bands under 0.5%, not drawn</>}
+                    </span>
+                    <span style={{ width: 38, textAlign: 'right', fontWeight: 800 }}>{shown.toFixed(1)}%</span>
+                  </div>
+                );
+              })()}
             </div>
 
             <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px solid var(--border)', fontSize: 15, lineHeight: 1.9 }}>
