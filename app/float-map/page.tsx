@@ -380,6 +380,17 @@ export default function FloatMapPage() {
               <Row k="Estimated avg cost" v={rp(cur.avgCost)} />
               <Row k="Residual gap" v={`${cur.avgCostGapResid > 0 ? '+' : ''}${cur.avgCostGapResid}%`}
                    color={cur.avgCostGapResid >= 0 ? OK : BAD} />
+              {/* The number the whole page ranks on, and it was never defined
+                  anywhere on it. */}
+              <div style={{ fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.55, margin: '2px 0 8px' }}>
+                Price is <b>{cur.avgCostGap > 0 ? '+' : ''}{cur.avgCostGap}%</b> from the estimated
+                average cost. A stock that rose is above its holders&apos; cost automatically, so that
+                raw figure is mostly just the recent move — it measured IC 0.0075, indistinguishable
+                from nothing. The <b>residual</b> is what is left after the rest of today&apos;s
+                cross-section explains that gap from 20- and 60-day returns: how far this name sits
+                from the line, above or below what its own move accounts for. That leftover is the
+                only part that sorted forward returns.
+              </div>
               <Row k="Estimated in profit" v={`${cur.profitSupply}%`} color={OK} desc />
               <Row k="Overhead supply" v={`${cur.overheadSupply}%`}
                    color={cur.overheadSupply > 40 ? BAD : WARN} desc />
