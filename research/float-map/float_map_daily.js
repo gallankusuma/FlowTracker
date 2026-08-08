@@ -123,6 +123,18 @@ const MIGRATIONS = [
   if (await S.indexColumns(pool, db, 'idx_float_map_daily', 'uq_day')) {
     throw new Error('legacy uq_day survived the migration — multi-model history is still blocked');
   }
+  // ensureColumn only ADDS — an earlier version created model_commit as
+  // nullable and it stayed that way, so the NOT NULL in the DDL applied to
+  // fresh installs only. A NULL here is distinct from every other NULL in the
+  // unique key, which would mint a new row on every run.
+  const [[mc]] = await pool.query(
+    `SELECT IS_NULLABLE n FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA=? AND TABLE_NAME='idx_float_map_daily' AND COLUMN_NAME='model_commit'`, [db]);
+  if (mc && mc.n === 'YES') {
+    const [bf] = await pool.query("UPDATE idx_float_map_daily SET model_commit='UNSTAMPED' WHERE model_commit IS NULL");
+    await pool.query("ALTER TABLE idx_float_map_daily MODIFY COLUMN model_commit VARCHAR(40) NOT NULL DEFAULT 'UNSTAMPED'");
+    applied.push(`~column model_commit -> NOT NULL (${bf.affectedRows} legacy NULL backfilled)`);
+  }
   if (applied.length) console.log('migrated: ' + applied.join(', '));
 
   // ── inputs, each with its own date ────────────────────────────────────────
@@ -141,7 +153,7 @@ const MIGRATIONS = [
             DATEDIFF(NOW(), last_success_at) age_days,
             in_top_turnover, in_top_mcap
        FROM idx_free_float
-      WHERE fetch_status = 'VALID'`).catch(async () => {
+`).catch(async () => {
     // Older table shape, before per-ticker status existed.
     const [rows] = await pool.query(
       `SELECT stock_code, float_pct, float_shares, 'VALID' fetch_status,
@@ -162,8 +174,13 @@ const MIGRATIONS = [
     inTurnover: !!f.in_top_turnover, inMcap: !!f.in_top_mcap,
   }]));
 
-  // PER-TICKER FRESHNESS. MAX(fetched_at) across the table said CURRENT when a
-  // single ticker refreshed and ninety-eight carried month-old numbers.
+  // COVERAGE OVER EVERY ROW, INCLUDING THE FAILURES.
+  //
+  // The query used to filter to fetch_status='VALID' before counting, so the
+  // denominator excluded exactly the rejections it was supposed to report and
+  // coverage read 100% by construction — it could not have shown anything
+  // else. REJECTED and FETCH_FAILED rows are loaded, counted, and then dropped
+  // from the map, rather than never being seen.
   const coverage = { fresh: 0, stale: 0, rejected: 0, oldestFreshAsOf: null };
   for (const v of floatOf.values()) {
     if (v.status !== 'VALID') coverage.rejected++;
@@ -211,12 +228,18 @@ const MIGRATIONS = [
 
   // Rank only what converged; everything else keeps its numbers and loses its
   // place in the ordering.
-  const rankable = rows.filter(r => r.m.seedRemaining <= RANKABLE_MAX_SEED && r.residual !== null);
+  // No provenance, no ranking. sync_research.sh always stamps the commit, so
+  // UNSTAMPED means this ran from a source nobody can identify — and a ranking
+  // that cannot be traced to the code that produced it is not evidence.
+  const stamped = (modelCommit() || 'UNSTAMPED') !== 'UNSTAMPED';
+  const rankable = stamped
+    ? rows.filter(r => r.m.seedRemaining <= RANKABLE_MAX_SEED && r.residual !== null)
+    : [];
   const unranked = rows.filter(r => !(r.m.seedRemaining <= RANKABLE_MAX_SEED && r.residual !== null));
   rankable.sort((a, b) => b.residual - a.residual);
   rankable.forEach((r, i) => { r.rank = i + 1; });
   unranked.sort((a, b) => a.m.seedRemaining - b.m.seedRemaining);
-  unranked.forEach(r => { r.rank = null; r.notRanked = 'MODEL_NOT_CONVERGED'; });
+  unranked.forEach(r => { r.rank = null; r.notRanked = stamped ? 'MODEL_NOT_CONVERGED' : 'MODEL_COMMIT_UNSTAMPED'; });
   const sorted = [...rankable, ...unranked];
 
   const version = M.MODEL_VERSION, commit = modelCommit() || 'UNSTAMPED', generatedAt = new Date();
@@ -257,9 +280,6 @@ const MIGRATIONS = [
     session, generatedAt: generatedAt.toISOString(),
     priceMaxDate: session,
     brokerMaxDate: bstale.d, brokerLagSessions,
-    // Counted on the exchange calendar server-side so an IDX holiday cannot
-    // read as staleness. Zero on the day it is generated.
-    snapshotAgeSessions: 0,
     freeFloat: {
       maxAgeDays: FLOAT_MAX_AGE_DAYS,
       fresh: coverage.fresh, stale: coverage.stale, rejected: coverage.rejected,
@@ -269,7 +289,7 @@ const MIGRATIONS = [
     },
     confidence: { medianOverall: med(rows.map(r => r.conf.overall)), perTicker: true },
     universe: rows.length, ranked: rankable.length, notRanked: unranked.length,
-    rankableMaxSeed: RANKABLE_MAX_SEED * 100, skipped,
+    rankableMaxSeed: RANKABLE_MAX_SEED * 100, stamped, skipped,
     evidence: {
       experiment: 'EXP-2026-08-07-023',
       rawIC60D: 0.0075, residualIC60D: 0.0378, residualIR: 0.23,
