@@ -31,6 +31,19 @@ const OUT_JSON = process.env.FLOAT_MAP_JSON || '/var/www/flowtracker/data/float-
 /** Beyond this, a stored free float is too old to build a map on. */
 const FLOAT_MAX_AGE_DAYS = 10;
 
+/**
+ * A residual computed on a distribution that is still mostly the day-one seed
+ * is not a measurement of anything, so it does not get a rank.
+ *
+ * Widening the universe to the top 100 by market cap made this urgent rather
+ * than theoretical: large, quietly traded names went straight to ranks 1, 3, 4,
+ * 5 and 7 with 98-99% of their inventory still sitting where the model put it
+ * on day one. They stay in the table — that is the point of including them —
+ * but they are listed as NOT RANKED with the reason, instead of occupying the
+ * top of an ordering they cannot support.
+ */
+const RANKABLE_MAX_SEED = 0.35;
+
 function modelCommit() {
   try { return fs.readFileSync(__dirname + '/.model-commit', 'utf8').trim() || null; }
   catch { return null; }
@@ -191,8 +204,15 @@ const MIGRATIONS = [
     [rows.map(r => r.m.roc20), rows.map(r => r.m.roc60)]);
   rows.forEach((r, i) => { r.residual = resid ? resid[i] : null; });
 
-  const sorted = [...rows].sort((a, b) => (b.residual ?? -9) - (a.residual ?? -9));
-  sorted.forEach((r, i) => { r.rank = i + 1; });
+  // Rank only what converged; everything else keeps its numbers and loses its
+  // place in the ordering.
+  const rankable = rows.filter(r => r.m.seedRemaining <= RANKABLE_MAX_SEED && r.residual !== null);
+  const unranked = rows.filter(r => !(r.m.seedRemaining <= RANKABLE_MAX_SEED && r.residual !== null));
+  rankable.sort((a, b) => b.residual - a.residual);
+  rankable.forEach((r, i) => { r.rank = i + 1; });
+  unranked.sort((a, b) => a.m.seedRemaining - b.m.seedRemaining);
+  unranked.forEach(r => { r.rank = null; r.notRanked = 'MODEL_NOT_CONVERGED'; });
+  const sorted = [...rankable, ...unranked];
 
   const version = M.MODEL_VERSION, commit = modelCommit() || 'UNSTAMPED', generatedAt = new Date();
 
@@ -243,14 +263,15 @@ const MIGRATIONS = [
       oldestFreshAsOf: coverage.oldestFreshAsOf ? new Date(coverage.oldestFreshAsOf).toISOString() : null,
     },
     confidence: { medianOverall: med(rows.map(r => r.conf.overall)), perTicker: true },
-    universe: rows.length, skipped,
+    universe: rows.length, ranked: rankable.length, notRanked: unranked.length,
+    rankableMaxSeed: RANKABLE_MAX_SEED * 100, skipped,
     evidence: {
       experiment: 'EXP-2026-08-07-023',
       rawIC60D: 0.0075, residualIC60D: 0.0378, residualIR: 0.23,
       note: 'Raw avgCostGap is indistinguishable from zero and overlaps 0.61 with 60-day momentum. Only the momentum-residualised value showed forward predictiveness, at a size EXP-011 already called untradeable.',
     },
     rows: sorted.map(r => ({
-      ticker: r.tk, rank: r.rank,
+      ticker: r.tk, rank: r.rank, notRanked: r.notRanked ?? null,
       price: Math.round(r.m.price), avgCost: Math.round(r.m.avgCost),
       avgCostGap: +(r.m.avgCostGap * 100).toFixed(2),
       avgCostGapResid: r.residual === null ? null : +(r.residual * 100).toFixed(2),

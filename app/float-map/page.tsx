@@ -174,7 +174,7 @@ export default function FloatMapPage() {
           <div>
             <div style={{ fontSize: 23, fontWeight: 800 }}>FLOAT COST MAP</div>
             <div style={{ fontSize: 14, color: 'var(--text-muted)', marginTop: 4 }}>
-              session {data.session} · {data.universe} tickers with a free float on record
+              session {data.session} · {data.universe} tickers ({data.ranked} ranked, {data.notRanked} not converged)
               {(data.skipped?.CORPORATE_ACTION ?? 0) > 0 && ` · ${data.skipped.CORPORATE_ACTION} excluded for a detected corporate action`}
             </div>
           </div>
@@ -246,6 +246,12 @@ export default function FloatMapPage() {
           fontSize: 15, lineHeight: 1.6,
         }}>
           <b style={{ color: INFO }}>Ranked on the momentum-residualised gap, not the raw one.</b>{' '}
+          {(data.notRanked ?? 0) > 0 && (
+            <><b style={{ color: WARN }}>{data.notRanked} names are shown but NOT ranked</b> — more than{' '}
+            {data.rankableMaxSeed}% of their estimated distribution is still the model&apos;s day-one
+            assumption, so a residual computed on it would not be measuring anything. Mostly large,
+            quietly traded names.{' '}</>
+          )}
           {data.evidence?.experiment} measured the raw cost gap at IC {data.evidence?.rawIC60D} over
           414 cross-sections — indistinguishable from zero, and 0.61 correlated with 60-day
           momentum. Only after regressing momentum out does it reach IC {data.evidence?.residualIC60D}{' '}
@@ -288,8 +294,12 @@ export default function FloatMapPage() {
               <tbody>
                 {rows.map((r: any) => (
                   <tr key={r.ticker} onClick={() => setSel(r.ticker)}
-                    style={{ cursor: 'pointer', background: r.ticker === sel ? 'rgba(88,166,255,0.08)' : 'transparent' }}>
-                    <td style={{ ...td, color: MUTED }}>{r.rank}</td>
+                    title={r.notRanked ? 'Not ranked: the model has not converged — most of this distribution is still the day-one assumption' : undefined}
+                    style={{ cursor: 'pointer',
+                      background: r.ticker === sel ? 'rgba(88,166,255,0.08)' : 'transparent',
+                      // Unranked rows keep their numbers and lose their standing.
+                      opacity: r.notRanked ? 0.5 : 1 }}>
+                    <td style={{ ...td, color: MUTED }}>{r.rank ?? '–'}</td>
                     <td style={{ ...td, fontWeight: 800 }}>{r.ticker}</td>
                     <td style={{ ...td, fontWeight: 800, color: r.avgCostGapResid >= 0 ? OK : BAD }}>
                       {r.avgCostGapResid === null ? '–' : `${r.avgCostGapResid > 0 ? '+' : ''}${r.avgCostGapResid}%`}
