@@ -393,6 +393,23 @@ export default function FloatMapPage() {
               <Row k="Float rotation 20d / 60d" v={`${cur.rotation20}% / ${cur.rotation60}%`} desc />
             </div>
 
+            {/* The badge was explained only in a title tooltip, which does not
+                exist on touch and was not found on desktop either — it had to
+                be asked about. A legend costs one line. */}
+            <div style={{
+              marginTop: 12, padding: '9px 11px', borderRadius: 7,
+              background: 'var(--bg-primary)', border: '1px solid var(--border)',
+              fontSize: 12, color: 'var(--text-muted)', lineHeight: 1.6,
+            }}>
+              <span style={{ fontSize: 11, fontWeight: 800, color: '#8b949e',
+                border: '1px solid #8b949e55', borderRadius: 4, padding: '0 5px', marginRight: 6 }}>DESC</span>
+              <b>Descriptive only — not validated as a trading signal.</b> EXP-023 measured these
+              at residual IC 0.022 or lower, and float rotation at ~0.01, not significant. Useful
+              for seeing where supply sits; not for deciding to buy. Only the{' '}
+              <b style={{ color: 'var(--text-primary)' }}>residual gap</b> sorted forward returns,
+              and only at IC 0.038 — the same modest size EXP-011 already called untradeable.
+            </div>
+
             <div style={{ marginTop: 12, fontSize: 13, color: 'var(--text-muted)', lineHeight: 1.6 }}>
               <b>Estimated.</b> Nobody outside KSEI knows the real holders. This is inventory
               accounting over the float: each session a share of it changes hands, the old
