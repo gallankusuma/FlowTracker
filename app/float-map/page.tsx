@@ -490,12 +490,34 @@ export default function FloatMapPage() {
                           <b style={{ color: c }}>{v.toFixed(1)}%</b>
                         </span>
                       );
+                      // Which way the weight leans, stated rather than left to
+                      // be worked out from three numbers.
+                      const side = below + above;
+                      const leftPct = side > 0 ? (below / side) * 100 : 50;
+                      const ratio = above > 0.05 ? (below / above) : null;
                       return (
-                        <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'center',
-                                      paddingBottom: 8, marginBottom: 6, borderBottom: '1px solid var(--border)' }}>
-                          {cell(OK, 'below price', below)}
-                          {crossing > 0.05 && cell(WARN, 'band the price is inside', crossing)}
-                          {cell(BAD, 'above price', above)}
+                        <div style={{ paddingBottom: 9, marginBottom: 7, borderBottom: '1px solid var(--border)' }}>
+                          <div style={{ display: 'flex', height: 12, borderRadius: 3, overflow: 'hidden', marginBottom: 7 }}>
+                            <span style={{ width: `${leftPct}%`, background: OK, opacity: 0.75 }} />
+                            <span style={{ width: `${100 - leftPct}%`, background: BAD, opacity: 0.75 }} />
+                          </div>
+                          <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap', alignItems: 'center' }}>
+                            <b style={{ color: leftPct >= 50 ? OK : BAD, fontSize: 15 }}>
+                              {leftPct >= 50 ? '◀ BERAT KE BAWAH HARGA' : 'BERAT KE ATAS HARGA ▶'}
+                              {ratio !== null && ` ${(leftPct >= 50 ? ratio : 1 / ratio).toFixed(1)}×`}
+                            </b>
+                            {cell(OK, 'bawah', below)}
+                            {crossing > 0.05 && cell(WARN, 'di band harga', crossing)}
+                            {cell(BAD, 'atas', above)}
+                          </div>
+                          <div style={{ fontSize: 12, color: 'var(--text-muted)', marginTop: 5, lineHeight: 1.55 }}>
+                            {leftPct >= 50
+                              ? 'Sedikit supply nyangkut di atas harga — lebih sedikit calon penjual break-even saat harga naik.'
+                              : 'Banyak supply nyangkut di atas harga — calon penjual break-even menunggu di setiap pita merah.'}
+                            {' '}<span style={{ fontSize: 11, fontWeight: 800, color: '#8b949e',
+                              border: '1px solid #8b949e55', borderRadius: 4, padding: '0 4px' }}>DESC</span>
+                            {' '}Deskriptif, bukan sinyal — overhead supply diukur pada residual IC 0.022.
+                          </div>
                         </div>
                       );
                     })()}
