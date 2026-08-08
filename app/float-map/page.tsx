@@ -472,6 +472,33 @@ export default function FloatMapPage() {
                         example — and two numbers from one snapshot would
                         contradict each other. Profit comes from the model;
                         the chart reports only how much of itself it drew. */}
+                    {/* A quick read of the bars by side of the price. This is
+                        CHART COVERAGE, not economics: the crossing band is
+                        listed on its own rather than split, because splitting
+                        it at this resolution is what disagreed with the model.
+                        Below + crossing + above = what was drawn. */}
+                    {(() => {
+                      const below = cur.dist.filter((d: any) => d.high <= cur.price)
+                        .reduce((a: number, d: any) => a + d.share, 0);
+                      const above = cur.dist.filter((d: any) => d.low >= cur.price)
+                        .reduce((a: number, d: any) => a + d.share, 0);
+                      const crossing = shown - below - above;
+                      const cell = (c: string, label: string, v: number) => (
+                        <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ width: 10, height: 10, borderRadius: 3, background: c, opacity: 0.75 }} />
+                          <span style={{ color: 'var(--text-muted)', fontSize: 12 }}>{label}</span>
+                          <b style={{ color: c }}>{v.toFixed(1)}%</b>
+                        </span>
+                      );
+                      return (
+                        <div style={{ display: 'flex', gap: 18, flexWrap: 'wrap', alignItems: 'center',
+                                      paddingBottom: 8, marginBottom: 6, borderBottom: '1px solid var(--border)' }}>
+                          {cell(OK, 'below price', below)}
+                          {crossing > 0.05 && cell(WARN, 'band the price is inside', crossing)}
+                          {cell(BAD, 'above price', above)}
+                        </div>
+                      );
+                    })()}
                     <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
                       <span style={{ width: 96, textAlign: 'right', color: 'var(--text-muted)', fontWeight: 800 }}>IN PROFIT</span>
                       <span style={{ flex: 1, fontSize: 12, color: 'var(--text-muted)' }}>
