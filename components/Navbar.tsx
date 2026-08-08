@@ -70,7 +70,7 @@ export default function Navbar() {
     const isGreen = !!(item as any).badgeColor;
     return (
       <span style={{
-        fontSize: 8, fontWeight: 800, padding: "1px 5px", borderRadius: 4,
+        fontSize: 10, fontWeight: 800, padding: "1px 5px", borderRadius: 4,
         background: isGreen ? "rgba(63,185,80,0.15)" : "rgba(47,129,247,0.15)",
         color:      isGreen ? "#3fb950"               : "#58a6ff",
         border:     `1px solid ${isGreen ? "rgba(63,185,80,0.4)" : "rgba(47,129,247,0.3)"}`,
@@ -82,8 +82,8 @@ export default function Navbar() {
   const navLinkStyle = (isActive: boolean): React.CSSProperties => ({
     textDecoration: "none",
     display: "flex", alignItems: "center", gap: 5,
-    padding: "8px 11px",
-    fontSize: 11, fontWeight: isActive ? 700 : 500,
+    padding: "11px 14px",
+    fontSize: 14, fontWeight: isActive ? 700 : 500,
     color: isActive ? "#58a6ff" : "var(--text-secondary)",
     borderBottom: isActive ? "2px solid #58a6ff" : "2px solid transparent",
     whiteSpace: "nowrap",
@@ -101,20 +101,20 @@ export default function Navbar() {
       }}>
 
         {/* ── Row 1: Logo + Controls ── */}
-        <div style={{ maxWidth: 1400, margin: "0 auto", padding: "0 20px" }}>
-          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", height: 48 }}>
+        <div style={{ maxWidth: "none", padding: "0 32px" }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", height: 58, gap: 12, minWidth: 0 }}>
 
-            <Link href="/" style={{ textDecoration: "none", display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
+            <Link href="/" style={{ textDecoration: "none", display: "flex", alignItems: "center", gap: 10, flexShrink: 0, minWidth: 0 }}>
               <div style={{
-                width: 30, height: 30,
+                width: 36, height: 36,
                 background: "linear-gradient(135deg, #2f81f7, #39d2f5)",
                 borderRadius: 7, display: "flex", alignItems: "center", justifyContent: "center",
-                fontSize: 15, fontWeight: 800, color: "#fff",
+                fontSize: 19, fontWeight: 800, color: "#fff",
                 boxShadow: "0 0 14px rgba(47,129,247,0.4)"
               }}>F</div>
               <div>
-                <div style={{ fontSize: 13, fontWeight: 800, color: "var(--text-primary)", letterSpacing: "0.08em" }}>FLOWTRACKER</div>
-                <div style={{ fontSize: 8, color: "var(--accent-cyan)", letterSpacing: "0.15em", fontWeight: 600, marginTop: -1 }}>UNCOVER THE HIDDEN MOVES</div>
+                <div style={{ fontSize: 16, fontWeight: 800, color: "var(--text-primary)", letterSpacing: "0.08em" }}>FLOWTRACKER</div>
+                <div style={{ fontSize: 10, color: "var(--accent-cyan)", letterSpacing: "0.15em", fontWeight: 600, marginTop: -1 }}>UNCOVER THE HIDDEN MOVES</div>
               </div>
             </Link>
 
@@ -129,16 +129,16 @@ export default function Navbar() {
               <div style={{
                 display: "flex", alignItems: "center", gap: 7, cursor: "pointer",
                 padding: "5px 10px", borderRadius: 7, border: "1px solid var(--border)",
-                fontSize: 12, color: "var(--text-secondary)"
+                fontSize: 15, color: "var(--text-secondary)"
               }}>
                 <span style={{
                   width: 22, height: 22, borderRadius: "50%",
                   background: "linear-gradient(135deg,#2f81f7,#39d2f5)",
                   display: "flex", alignItems: "center", justifyContent: "center",
-                  fontSize: 10, fontWeight: 700, color: "#fff"
+                  fontSize: 13, fontWeight: 700, color: "#fff"
                 }}>G</span>
                 <span className="hidden-sm">gallankusuma41</span>
-                <span style={{ fontSize: 9 }}>▾</span>
+                <span style={{ fontSize: 11 }}>▾</span>
               </div>
 
               {/* Hamburger — mobile only */}
@@ -149,7 +149,7 @@ export default function Navbar() {
                   display: "none", background: "none",
                   border: "1px solid var(--border)", borderRadius: 6,
                   padding: "5px 8px", cursor: "pointer",
-                  color: "var(--text-primary)", fontSize: 16, lineHeight: 1,
+                  color: "var(--text-primary)", fontSize: 20, lineHeight: 1,
                 }}
               >
                 {mobileOpen ? "✕" : "☰"}
@@ -160,7 +160,11 @@ export default function Navbar() {
 
         {/* ── Row 2: Nav items ── */}
         <div style={{ borderTop: "1px solid var(--border)", background: "rgba(0,0,0,0.15)" }} className="nav-row">
-          <div style={{ maxWidth: 1400, margin: "0 auto", padding: "0 20px", display: "flex", alignItems: "stretch" }}>
+          {/* The scroll belongs on THIS element, not its parent: this is the flex
+              container that grows past the viewport once the type is larger, so
+              putting overflow on the wrapper left it free to push the page. */}
+          <div style={{ maxWidth: "none", padding: "0 32px", display: "flex", alignItems: "stretch",
+                        overflowX: "auto", overflowY: "hidden" }}>
 
             {/* Primary items */}
             {PRIMARY_ITEMS.map(item => {
@@ -170,7 +174,7 @@ export default function Navbar() {
                   onMouseEnter={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = "var(--text-primary)"; }}
                   onMouseLeave={e => { if (!isActive) (e.currentTarget as HTMLElement).style.color = "var(--text-secondary)"; }}
                 >
-                  <span style={{ fontSize: 13 }}>{item.icon}</span>
+                  <span style={{ fontSize: 16 }}>{item.icon}</span>
                   {item.label}
                   <Badge item={item} />
                 </Link>
@@ -183,8 +187,8 @@ export default function Navbar() {
                 onClick={() => setMoreOpen(o => !o)}
                 style={{
                   display: "flex", alignItems: "center", gap: 5,
-                  padding: "8px 11px", background: "none", border: "none", cursor: "pointer",
-                  fontSize: 11, fontWeight: isMoreActive ? 700 : 500,
+                  padding: "11px 14px", background: "none", border: "none", cursor: "pointer",
+                  fontSize: 14, fontWeight: isMoreActive ? 700 : 500,
                   color: isMoreActive ? "#58a6ff" : "var(--text-secondary)",
                   borderBottom: isMoreActive ? "2px solid #58a6ff" : "2px solid transparent",
                   whiteSpace: "nowrap", letterSpacing: "0.04em",
@@ -195,7 +199,7 @@ export default function Navbar() {
               >
                 ≡ More
                 <span style={{
-                  display: "inline-block", fontSize: 9,
+                  display: "inline-block", fontSize: 11,
                   transform: moreOpen ? "rotate(180deg)" : "rotate(0deg)",
                   transition: "transform 0.2s ease",
                 }}>▾</span>
@@ -223,7 +227,7 @@ export default function Navbar() {
                         style={{
                           display: "flex", alignItems: "center", gap: 12,
                           padding: "11px 18px", textDecoration: "none",
-                          fontSize: 13, fontWeight: isActive ? 700 : 400,
+                          fontSize: 16, fontWeight: isActive ? 700 : 400,
                           color: isActive ? "#58a6ff" : isStockbit ? "#3fb950" : "var(--text-primary)",
                           background: isActive ? "rgba(47,129,247,0.08)" : "transparent",
                           transition: "background 0.12s",
@@ -232,7 +236,7 @@ export default function Navbar() {
                         onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)"; }}
                         onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = isActive ? "rgba(47,129,247,0.08)" : "transparent"; }}
                       >
-                        <span style={{ fontSize: 17, minWidth: 22, textAlign: "center" }}>{item.icon}</span>
+                        <span style={{ fontSize: 21, minWidth: 22, textAlign: "center" }}>{item.icon}</span>
                         <span style={{ flex: 1 }}>{item.label}</span>
                         <Badge item={item} />
                       </Link>
@@ -267,13 +271,13 @@ export default function Navbar() {
                     style={{
                       display: "flex", alignItems: "center", gap: 14,
                       padding: "13px 24px", textDecoration: "none",
-                      fontSize: 14, fontWeight: isActive ? 700 : 400,
+                      fontSize: 18, fontWeight: isActive ? 700 : 400,
                       color: isActive ? "#58a6ff" : "var(--text-primary)",
                       background: isActive ? "rgba(47,129,247,0.08)" : "transparent",
                       borderLeft: isActive ? "3px solid #58a6ff" : "3px solid transparent",
                     }}
                   >
-                    <span style={{ fontSize: 18 }}>{item.icon}</span>
+                    <span style={{ fontSize: 23 }}>{item.icon}</span>
                     {item.label}
                     <Badge item={item} />
                   </Link>
