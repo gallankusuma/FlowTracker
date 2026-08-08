@@ -271,6 +271,9 @@ const FACTORS = ['profitSupply', 'avgCostGap', 'distToPeak', 'rotation20', 'rota
         tk, ...m, fwd,
         roc20: c0 / win[win.length - 20].c - 1,
         roc60: c0 / win[win.length - 60].c - 1,
+        // The seed sits at the FIRST bar of the window, so a map that has not
+        // converged is partly a statement about the price 250 sessions ago.
+        roc250: c0 / win[0].c - 1,
       });
     }
     if (rows.length >= MIN_NAMES) perDate.push({ date: rd, rows });
@@ -317,6 +320,12 @@ const FACTORS = ['profitSupply', 'avgCostGap', 'distToPeak', 'rotation20', 'rota
 
   report('RAW — does the metric sort forward returns at all?', (f, h) =>
     perDate.map(p => spearman(p.rows.map(r => r[f]), p.rows.map(r => r.fwd[h]))));
+
+  report('RESIDUALISED on ROC20 + ROC60 + ROC250 — does it survive removing the LONG lookback the unconverged seed encodes?', (f, h) =>
+    perDate.map(p => {
+      const res = residualise(p.rows.map(r => r[f]), [p.rows.map(r => r.roc20), p.rows.map(r => r.roc60), p.rows.map(r => r.roc250)]);
+      return res ? spearman(res, p.rows.map(r => r.fwd[h])) : null;
+    }));
 
   report('RESIDUALISED on ROC20 + ROC60 — is there anything momentum does not already have?', (f, h) =>
     perDate.map(p => {

@@ -7,8 +7,11 @@
  * That is why this runs over the WHOLE cross-section in one pass: a residual
  * only exists relative to the other names on the same day.
  *
- * The model itself lives in model.js so the generator and the IC experiment
- * cannot drift, and so it can be tested as pure arithmetic (test_model.js).
+ * The model lives in model.js so it can be tested as pure arithmetic
+ * (test_model.js). EXP-023's script is deliberately NOT migrated onto it — it
+ * is the archived reproduction code for an experiment already run, and
+ * rewriting it would change what that result was produced by. Every FUTURE IC
+ * experiment must import model.js instead of copying the loop.
  *
  * Writes:
  *   idx_float_map_daily                        history, keyed by MODEL IDENTITY
@@ -21,6 +24,7 @@ const mysql = require('/var/www/flowtracker-scraper/node_modules/mysql2/promise'
 const fs = require('fs');
 const path = require('path');
 const M = require('./model');
+const S = require('./schema');
 
 const OUT_JSON = process.env.FLOAT_MAP_JSON || '/var/www/flowtracker/data/float-map.json';
 
@@ -47,7 +51,7 @@ CREATE TABLE IF NOT EXISTS idx_float_map_daily (
   session_date DATE NOT NULL,
   stock_code VARCHAR(12) NOT NULL,
   model_version VARCHAR(32) NOT NULL,
-  model_commit VARCHAR(40) NULL,
+  model_commit VARCHAR(40) NOT NULL DEFAULT 'UNSTAMPED',
   turnover_coefficient DECIMAL(6,4) NOT NULL,
   generated_at TIMESTAMP NOT NULL,
   price DECIMAL(20,4) NOT NULL,
@@ -68,13 +72,13 @@ CREATE TABLE IF NOT EXISTS idx_float_map_daily (
   confidence TINYINT NOT NULL,
   distribution_json TEXT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  UNIQUE KEY uq_day_model (session_date, stock_code, model_version)
+  UNIQUE KEY uq_day_model (session_date, stock_code, model_version, model_commit)
 )`;
 
 /** Additive upgrades for a table created by the first version of this script. */
 const MIGRATIONS = [
   ['model_version', "ADD COLUMN model_version VARCHAR(32) NOT NULL DEFAULT 'FLOAT_MAP_V1' AFTER stock_code"],
-  ['model_commit', 'ADD COLUMN model_commit VARCHAR(40) NULL AFTER model_version'],
+  ['model_commit', "ADD COLUMN model_commit VARCHAR(40) NOT NULL DEFAULT 'UNSTAMPED' AFTER model_version"],
   ['turnover_coefficient', 'ADD COLUMN turnover_coefficient DECIMAL(6,4) NOT NULL DEFAULT 0.75 AFTER model_commit'],
   ['generated_at', 'ADD COLUMN generated_at TIMESTAMP NULL AFTER turnover_coefficient'],
   ['float_as_of', 'ADD COLUMN float_as_of TIMESTAMP NULL AFTER float_pct'],
@@ -91,20 +95,22 @@ const MIGRATIONS = [
   });
   const db = process.env.DB_NAME || 'erp_manufacturing';
   await pool.query(DDL);
+  const applied = [];
   for (const [col, ddl] of MIGRATIONS) {
-    const [[c]] = await pool.query(
-      `SELECT COUNT(*) n FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA=? AND TABLE_NAME='idx_float_map_daily' AND COLUMN_NAME=?`, [db, col]);
-    if (!Number(c.n)) await pool.query(`ALTER TABLE idx_float_map_daily ${ddl}`);
+    await S.ensureColumn(pool, db, 'idx_float_map_daily', col, ddl, applied);
   }
-  // Replace the old day-only key so a second model cannot overwrite the first.
-  const [[k]] = await pool.query(
-    `SELECT COUNT(*) n FROM information_schema.STATISTICS
-      WHERE TABLE_SCHEMA=? AND TABLE_NAME='idx_float_map_daily' AND INDEX_NAME='uq_day_model'`, [db]);
-  if (!Number(k.n)) {
-    await pool.query('ALTER TABLE idx_float_map_daily DROP INDEX uq_day').catch(() => {});
-    await pool.query('ALTER TABLE idx_float_map_daily ADD UNIQUE KEY uq_day_model (session_date, stock_code, model_version)');
+  // THE COMMIT IS IN THE KEY, not just in a column. With only
+  // (session, ticker, model_version), a source change that forgot to bump the
+  // version would rerun the same session and ON DUPLICATE KEY UPDATE would
+  // overwrite the earlier commit's row — destroying the exact thing recording
+  // the commit was for.
+  await S.dropIndex(pool, db, 'idx_float_map_daily', 'uq_day', applied);
+  await S.ensureUniqueIndex(pool, db, 'idx_float_map_daily', 'uq_day_model',
+    ['session_date', 'stock_code', 'model_version', 'model_commit'], applied);
+  if (await S.indexColumns(pool, db, 'idx_float_map_daily', 'uq_day')) {
+    throw new Error('legacy uq_day survived the migration — multi-model history is still blocked');
   }
+  if (applied.length) console.log('migrated: ' + applied.join(', '));
 
   // ── inputs, each with its own date ────────────────────────────────────────
   const [[cal]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
@@ -184,7 +190,7 @@ const MIGRATIONS = [
   const sorted = [...rows].sort((a, b) => (b.residual ?? -9) - (a.residual ?? -9));
   sorted.forEach((r, i) => { r.rank = i + 1; });
 
-  const version = M.MODEL_VERSION, commit = modelCommit(), generatedAt = new Date();
+  const version = M.MODEL_VERSION, commit = modelCommit() || 'UNSTAMPED', generatedAt = new Date();
 
   const conn = await pool.getConnection();
   try {
@@ -198,7 +204,7 @@ const MIGRATIONS = [
            confidence_data, confidence_convergence, confidence, distribution_json)
          VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
          ON DUPLICATE KEY UPDATE
-           model_commit=VALUES(model_commit), generated_at=VALUES(generated_at),
+           generated_at=VALUES(generated_at),
            price=VALUES(price), avg_cost=VALUES(avg_cost), avg_cost_gap=VALUES(avg_cost_gap),
            avg_cost_gap_resid=VALUES(avg_cost_gap_resid), profit_supply=VALUES(profit_supply),
            dist_to_peak=VALUES(dist_to_peak), peak_low=VALUES(peak_low), peak_high=VALUES(peak_high),
@@ -218,10 +224,13 @@ const MIGRATIONS = [
   const med = arr => { const s = [...arr].sort((a, b) => a - b); return s[Math.floor(s.length / 2)] ?? 0; };
 
   const payload = {
-    modelVersion: version, modelCommit: commit, turnoverCoefficient: M.TURNOVER_K,
+    modelVersion: version, modelCommit: commit === 'UNSTAMPED' ? null : commit, turnoverCoefficient: M.TURNOVER_K,
     session, generatedAt: generatedAt.toISOString(),
     priceMaxDate: session,
     brokerMaxDate: bstale.d, brokerLagSessions,
+    // Counted on the exchange calendar server-side so an IDX holiday cannot
+    // read as staleness. Zero on the day it is generated.
+    snapshotAgeSessions: 0,
     freeFloat: {
       maxAgeDays: FLOAT_MAX_AGE_DAYS,
       fresh: coverage.fresh, stale: coverage.stale, rejected: coverage.rejected,

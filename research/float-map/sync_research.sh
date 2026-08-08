@@ -29,13 +29,17 @@ if [ -n "$DIRTY" ]; then
   exit 1
 fi
 
+# THE INVARIANTS ARE A DEPLOYMENT GATE. Syntax-checking the generator proves it
+# parses, not that it still conserves the float or refuses a corporate action.
+echo "running model invariants"
+node "$HERE/test_model.js" | tail -2
 echo "deploying $COMMIT to $HOST:$DEST"
 ssh "$HOST" "mkdir -p $DEST"
-for f in model.js test_model.js float_fetch.js float_cost_map.js float_map_daily.js exp023_float_map_ic.js; do
+for f in schema.js model.js test_model.js float_fetch.js float_cost_map.js float_map_daily.js exp023_float_map_ic.js; do
   scp -q "$HERE/$f" "$HOST:$DEST/$f"
   echo "  $f"
 done
 echo "$COMMIT" | ssh "$HOST" "cat > $DEST/.model-commit"
 
 echo "verifying"
-ssh "$HOST" "cd $DEST && node -c float_map_daily.js && echo '  syntax ok' && echo \"  .model-commit = \$(cat .model-commit)\""
+ssh "$HOST" "cd $DEST && node test_model.js | tail -1 && node -c float_map_daily.js && echo '  syntax ok' && echo \"  .model-commit = \$(cat .model-commit)\""

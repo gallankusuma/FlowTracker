@@ -175,7 +175,7 @@ export default function FloatMapPage() {
             <div style={{ fontSize: 23, fontWeight: 800 }}>FLOAT COST MAP</div>
             <div style={{ fontSize: 14, color: 'var(--text-muted)', marginTop: 4 }}>
               session {data.session} · {data.universe} tickers with a free float on record
-              {data.skippedCorporateAction > 0 && ` · ${data.skippedCorporateAction} excluded for a detected corporate action`}
+              {(data.skipped?.CORPORATE_ACTION ?? 0) > 0 && ` · ${data.skipped.CORPORATE_ACTION} excluded for a detected corporate action`}
             </div>
           </div>
           <div>
@@ -252,8 +252,8 @@ export default function FloatMapPage() {
           (IR {data.evidence?.residualIR}), the same modest size as the strongest factor this
           project has ever found, which it also called untradeable. The raw column is kept
           visible and muted so the two can be compared, never so the raw one can be sorted on.
-          {data.brokerLagDays > 2 && (
-            <> Broker flow is <b>{data.brokerLagDays} days behind</b> prices, which is why
+          {(data.brokerLagSessions ?? 0) > 1 && (
+            <> Broker flow is <b>{data.brokerLagSessions} sessions behind</b> prices, which is why
             confidence is not full.</>
           )}
         </div>

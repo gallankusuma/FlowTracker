@@ -22,6 +22,7 @@
 require('/var/www/flowtracker-scraper/node_modules/dotenv').config({ path: '/var/www/flowtracker-scraper/.env' });
 
 const mysql = require('/var/www/flowtracker-scraper/node_modules/mysql2/promise');
+const S = require('./schema');
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 const TOP_N = Number(process.argv[2] || 100);
 
@@ -101,6 +102,28 @@ async function floatFor(ticker, s) {
   });
   await pool.query(DDL);
   await pool.query(REJECT_DDL);
+
+  // R1 CREATED THIS TABLE WITHOUT THE STATUS COLUMNS, and CREATE TABLE IF NOT
+  // EXISTS does nothing to a table that is already there — so on the live
+  // database the INSERT below would have gone straight to
+  // "Unknown column 'fetch_status'". Each ALTER is read back before use.
+  const db = process.env.DB_NAME || 'erp_manufacturing';
+  const applied = [];
+  await S.ensureColumn(pool, db, 'idx_free_float', 'fetch_status',
+    "ADD COLUMN fetch_status ENUM('VALID','STALE','REJECTED','FETCH_FAILED') NOT NULL DEFAULT 'VALID' AFTER source", applied);
+  await S.ensureColumn(pool, db, 'idx_free_float', 'last_attempt_at',
+    'ADD COLUMN last_attempt_at TIMESTAMP NULL AFTER fetch_status', applied);
+  await S.ensureColumn(pool, db, 'idx_free_float', 'last_success_at',
+    'ADD COLUMN last_success_at TIMESTAMP NULL AFTER last_attempt_at', applied);
+  await S.ensureColumn(pool, db, 'idx_free_float', 'last_error',
+    'ADD COLUMN last_error VARCHAR(160) NULL AFTER last_success_at', applied);
+  // Rows written before the columns existed have no success timestamp; the
+  // generator's age check would read them as 999 days old and drop the whole
+  // universe, so seed them from the value that did exist.
+  await pool.query('UPDATE idx_free_float SET last_success_at = fetched_at, last_attempt_at = fetched_at WHERE last_success_at IS NULL');
+  await S.assertColumns(pool, db, 'idx_free_float',
+    ['fetch_status', 'last_attempt_at', 'last_success_at', 'last_error']);
+  if (applied.length) console.log('migrated: ' + applied.join(', '));
 
   // TRADED NOTIONAL FROM close_price x volume, NOT idx_stock_prices.value.
   //
