@@ -33,7 +33,12 @@ function costMap(bars, floatShares, opts = {}) {
   if (!Array.isArray(bars) || bars.length < 60) return { error: 'SHORT_HISTORY' };
   for (const b of bars) {
     if (![b.h, b.l, b.c, b.v].every(Number.isFinite)) return { error: 'BAD_BAR' };
-    if (b.h < b.l || b.c <= 0) return { error: 'BAD_BAR' };
+    // A negative volume from a bad ingest makes t negative, which ADDS to old
+    // inventory and subtracts from the day's band — the total still conserves,
+    // so nothing downstream notices, and the distribution is quietly wrong.
+    if (b.v < 0) return { error: 'NEGATIVE_VOLUME' };
+    if (b.h <= 0 || b.l <= 0 || b.c <= 0) return { error: 'BAD_BAR' };
+    if (b.h < b.l || b.c < b.l || b.c > b.h) return { error: 'BAD_BAR' };
   }
   for (let i = 1; i < bars.length; i++) {
     const a = bars[i - 1].c, b = bars[i].c;
@@ -68,7 +73,7 @@ function costMap(bars, floatShares, opts = {}) {
   for (const b of bars) {
     const raw = b.v / floatShares;
     turns.push(raw);
-    const t = Math.min(1, raw * k);
+    const t = Math.max(0, Math.min(1, raw * k));   // fail closed either way
     seedRemaining *= (1 - t);
     for (let i = 0; i < nb; i++) dist[i] *= (1 - t);
 
@@ -156,10 +161,11 @@ function chartBuckets(m, everyN = 2, minShare = 0.005) {
     const share = shares / m.totalShares;
     const low = m.lo + m.step * i, high = m.lo + m.step * end;
     if (share >= minShare) {
-      const lowR = Math.round(low), highR = Math.round(high);
+      // Exact boundaries. Rounding here collapsed a narrow band like
+      // 100.1-100.4 into 100-100, and the page can round for display without
+      // the model having to lose the number.
       bands.push({
-        low: lowR, high: highR,
-        midpoint: Math.round((lowR + highR) / 2),
+        low, high, midpoint: (low + high) / 2,
         share: +(share * 100).toFixed(1),
       });
     } else hidden += share;

@@ -443,7 +443,8 @@ export default function FloatMapPage() {
                 const here = d.price <= cur.price && d.price + (cur.dist[0].price - cur.dist[1]?.price || 1) > cur.price;
                 return (
                   <div key={d.low} style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                    <span style={{ width: 62, textAlign: 'right', color: MUTED }} title={`${rp(d.low)} – ${rp(d.high)}`}>{rp(d.midpoint)}</span>
+                    {/* The question is what share sits in a price RANGE, not at a point. */}
+                    <span style={{ width: 118, textAlign: 'right', color: MUTED, fontSize: 12 }}>{rp(d.low)}–{rp(d.high)}</span>
                     <span style={{ flex: 1, background: 'var(--bg-primary)', borderRadius: 3, overflow: 'hidden' }}>
                       <span style={{
                         display: 'block', height: 11,
@@ -461,25 +462,30 @@ export default function FloatMapPage() {
                   filter into what looks like an arithmetic error. */}
               {(() => {
                 const shown = cur.dist.reduce((a: number, d: any) => a + d.share, 0);
-                // Measured by the model. Deriving it as 100 - shown absorbed any
-                // arithmetic error into a number presented as a fact.
                 const hidden = cur.hiddenShare ?? Math.max(0, 100 - shown);
-                // Same proportional rule the model uses: the band the price
-                // falls inside is split, not assigned whole to one side.
-                const inProfit = cur.dist.reduce((a: number, d: any) => {
-                  if (d.high <= cur.price) return a + d.share;
-                  if (d.low >= cur.price) return a;
-                  return a + d.share * ((cur.price - d.low) / (d.high - d.low));
-                }, 0);
                 return (
-                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 6, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
-                    <span style={{ width: 62, textAlign: 'right', color: 'var(--text-muted)', fontWeight: 800 }}>TOTAL</span>
-                    <span style={{ flex: 1, fontSize: 12, color: 'var(--text-muted)' }}>
-                      <b style={{ color: OK }}>{inProfit.toFixed(1)}%</b> below price ·{' '}
-                      <b style={{ color: BAD }}>{(shown - inProfit).toFixed(1)}%</b> above
-                      {hidden >= 0.1 && <> · {hidden.toFixed(1)}% in bands under 0.5%, not drawn</>}
-                    </span>
-                    <span style={{ width: 38, textAlign: 'right', fontWeight: 800 }}>{shown.toFixed(1)}%</span>
+                  <div style={{ marginTop: 6, paddingTop: 8, borderTop: '1px solid var(--border)' }}>
+                    {/* THE CHART DOES NOT RECOMPUTE ECONOMICS.
+                        It merges two model buckets into each band, so splitting
+                        a merged band by price gives a different answer from the
+                        40-bucket model — 6.0% against 10.8% in the reviewer's
+                        example — and two numbers from one snapshot would
+                        contradict each other. Profit comes from the model;
+                        the chart reports only how much of itself it drew. */}
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <span style={{ width: 96, textAlign: 'right', color: 'var(--text-muted)', fontWeight: 800 }}>IN PROFIT</span>
+                      <span style={{ flex: 1, fontSize: 12, color: 'var(--text-muted)' }}>
+                        from the 40-bucket model, not from these bands
+                      </span>
+                      <span style={{ textAlign: 'right', fontWeight: 800, color: OK }}>{cur.profitSupply}%</span>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginTop: 2 }}>
+                      <span style={{ width: 96, textAlign: 'right', color: 'var(--text-muted)', fontWeight: 800 }}>CHART</span>
+                      <span style={{ flex: 1, fontSize: 12, color: 'var(--text-muted)' }}>
+                        {shown.toFixed(1)}% drawn · {hidden.toFixed(1)}% in bands under 0.5%, not drawn
+                      </span>
+                      <span style={{ textAlign: 'right', fontWeight: 800 }}>{(shown + hidden).toFixed(1)}%</span>
+                    </div>
                   </div>
                 );
               })()}

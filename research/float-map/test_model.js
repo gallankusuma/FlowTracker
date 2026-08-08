@@ -92,7 +92,10 @@ t('   ...and a move just under the threshold does NOT', () => {
   // The negative control: a detector that rejects everything would pass above.
   const b = bars({ vol: 1e6 });
   b[100].c *= 1.30; b[100].h *= 1.30; b[100].l *= 1.30;
-  b[101].c = b[100].c;                                    // no snap-back
+  // Move the whole bar, not just its close: the stricter validation caught
+  // this fixture producing c outside its own h/l, which was the fixture being
+  // wrong rather than the check being strict.
+  b[101].c = b[100].c; b[101].h = b[100].h; b[101].l = b[100].l;
   const m = M.costMap(b, FLOAT);
   assert.ok(!m.error, `a 30% move was rejected as a corporate action: ${m.error}`);
 });
@@ -201,13 +204,33 @@ t('costMap uses that split, so a small price move cannot jump a whole band', () 
   assert.ok(jump < 0.25, 'a 0.1% price move shifted profitSupply by ' + (jump*100).toFixed(1) + ' points');
 });
 
+t('negative volume and malformed OHLC are refused', () => {
+  // A negative volume conserves the total while corrupting the distribution,
+  // so nothing downstream can detect it.
+  const neg = bars({ vol: 1e6 }); neg[100].v = -5e6;
+  assert.strictEqual(M.costMap(neg, FLOAT).error, 'NEGATIVE_VOLUME');
+  const outOfRange = bars({ vol: 1e6 }); outOfRange[50].c = outOfRange[50].h * 2;
+  assert.strictEqual(M.costMap(outOfRange, FLOAT).error, 'BAD_BAR', 'close above high was accepted');
+  const zero = bars({ vol: 1e6 }); zero[50].l = 0;
+  assert.strictEqual(M.costMap(zero, FLOAT).error, 'BAD_BAR', 'a zero low was accepted');
+});
+
+t('band boundaries are exact, not pre-rounded', () => {
+  // Rounding in the model turned a narrow band like 100.1-100.4 into 100-100.
+  const m = M.costMap(bars({ n: 250, price: 100, vol: 2e7, spread: 0.002 }), FLOAT);
+  const { bands } = M.chartBuckets(m);
+  assert.ok(bands.some(b => !Number.isInteger(b.low) || !Number.isInteger(b.high)),
+    'every boundary came back an integer — the model is still rounding');
+  for (const b of bands) assert.ok(b.high > b.low, `band ${b.low}-${b.high} collapsed`);
+});
+
 t('every band carries its own low, high and midpoint', () => {
   const m = M.costMap(bars({ vol: 2e7, drift: 0.0005 }), FLOAT);
   const { bands } = M.chartBuckets(m);
   assert.ok(bands.length > 0);
   for (const b of bands) {
     assert.ok(b.high > b.low, 'band ' + b.low + '-' + b.high + ' is not a range');
-    assert.strictEqual(b.midpoint, Math.round((b.low + b.high) / 2), 'midpoint is not the middle of its own band');
+    assert.ok(Math.abs(b.midpoint - (b.low + b.high) / 2) < 1e-9, 'midpoint is not the middle of its own band');
   }
   for (let i = 1; i < bands.length; i++) assert.ok(bands[i].midpoint < bands[i-1].midpoint, 'not descending');
 });
