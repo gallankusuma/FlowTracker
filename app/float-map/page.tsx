@@ -16,7 +16,7 @@
  */
 
 import Navbar from '@/components/Navbar';
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 const OK = '#3fb950', WARN = '#e3b341', BAD = '#f85149', MUTED = '#8b949e', INFO = '#58a6ff';
 
@@ -292,8 +292,29 @@ export default function FloatMapPage() {
                 <th style={th}>CONF</th><th style={th}>SEED LEFT</th>
               </tr></thead>
               <tbody>
-                {rows.map((r: any) => (
-                  <tr key={r.ticker} onClick={() => setSel(r.ticker)}
+                {rows.map((r: any, i: number) => (
+                  <React.Fragment key={r.ticker}>
+                  {/* The ranked list simply stopped and the rows below went dim
+                      with a dash, which reads as a rendering fault rather than
+                      a decision. Say what changed, where it changes. */}
+                  {!r.rank && rows[i - 1]?.rank ? (
+                    <tr>
+                      <td colSpan={10} style={{
+                        padding: '12px 12px', borderTop: `2px solid ${WARN}55`,
+                        borderBottom: '1px solid var(--border)',
+                        background: 'rgba(227,179,65,0.06)', fontSize: 13, lineHeight: 1.55,
+                      }}>
+                        <b style={{ color: WARN }}>▼ BELOW HERE: NOT RANKED ({data.notRanked})</b>{' '}
+                        <span style={{ color: 'var(--text-muted)' }}>
+                          More than {data.rankableMaxSeed}% of these distributions is still the
+                          model&apos;s day-one assumption, so a residual computed on them would not
+                          be measuring anything. Their numbers are shown; their position is not
+                          meaningful, so they have no rank.
+                        </span>
+                      </td>
+                    </tr>
+                  ) : null}
+                  <tr onClick={() => setSel(r.ticker)}
                     title={r.notRanked ? 'Not ranked: the model has not converged — most of this distribution is still the day-one assumption' : undefined}
                     style={{ cursor: 'pointer',
                       background: r.ticker === sel ? 'rgba(88,166,255,0.08)' : 'transparent',
@@ -320,6 +341,7 @@ export default function FloatMapPage() {
                       {r.seedRemaining}%
                     </td>
                   </tr>
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>
