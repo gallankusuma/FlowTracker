@@ -16,6 +16,20 @@ function test(name, fn) {
   catch (e) { fail++; console.log(`  ✗ ${name}\n    ${e.message}`); }
 }
 
+/**
+ * The async form, and it must be AWAITED at the call site.
+ *
+ * `test()` above cannot be used for a promise-returning assertion: it calls fn(),
+ * gets a pending promise back, and counts a pass before the assertion has run —
+ * so a failing async test would report ✓ and a rejection would surface as an
+ * unhandled rejection rather than a failure. A test harness that cannot fail is
+ * worth less than no harness, since it produces confidence rather than evidence.
+ */
+async function atest(name, fn) {
+  try { await fn(); pass++; console.log(`  ✓ ${name}`); }
+  catch (e) { fail++; console.log(`  ✗ ${name}\n    ${e.message}`); }
+}
+
 // Minimal fake pool: returns canned rows per query shape.
 function makePool(spec) {
   return {
@@ -179,6 +193,69 @@ const ALL_FRESH = {
       assert.strictEqual(r.signalDate, '2026-07-30'));
     test('and names the feed that limits it', () =>
       assert.strictEqual(r.limitedBy, 'broker'));
+  }
+
+  // ── review P1: freshness must be time-aware, not merely session-aware ──────
+  // A tolerance of 0 is right for a post-close consumer and wrong for one that
+  // can be opened at 10:00 WIB, when today's EOD pull is nine hours away.
+  console.log('\nP1 — expectedBrokerSession is the last session whose pipeline window CLOSED');
+  {
+    // Calendar: Friday 07 Aug is newest, Thursday 06 Aug before it.
+    const calPool = {
+      async query(sql) {
+        if (/ORDER BY date DESC LIMIT 2/i.test(sql)) return [[{ date: '2026-08-07' }, { date: '2026-08-06' }]];
+        return [[]];
+      },
+    };
+    const at = s => new Date(s);
+    // Cutoff for 07 Aug is 12:30 UTC + 30min grace = 13:00 UTC.
+    await atest('intraday, before the cutoff -> the PREVIOUS session is expected', async () =>
+      assert.strictEqual(await sh.expectedBrokerSession(calPool, at('2026-08-07T03:00:00Z')), '2026-08-06'));
+    await atest('one minute before the deadline is still the previous session', async () =>
+      assert.strictEqual(await sh.expectedBrokerSession(calPool, at('2026-08-07T12:59:00Z')), '2026-08-06'));
+    await atest('after the cutoff -> today is expected', async () =>
+      assert.strictEqual(await sh.expectedBrokerSession(calPool, at('2026-08-07T13:00:00Z')), '2026-08-07'));
+    await atest('at the watchdog hour it is unambiguously today', async () =>
+      assert.strictEqual(await sh.expectedBrokerSession(calPool, at('2026-08-07T13:50:00Z')), '2026-08-07'));
+    // Measured against the session's own date, so a weekend does not reset it.
+    await atest('over the weekend Friday stays expected, not Thursday', async () =>
+      assert.strictEqual(await sh.expectedBrokerSession(calPool, at('2026-08-09T04:00:00Z')), '2026-08-07'));
+    await atest('no calendar -> null rather than a guess', async () =>
+      assert.strictEqual(await sh.expectedBrokerSession({ async query() { return [[]]; } }), null));
+  }
+
+  // ── review P2: incident cardinality ───────────────────────────────────────
+  console.log('\nP2 — one upstream fault must not read as three problems');
+  {
+    const spec = JSON.parse(JSON.stringify(ALL_FRESH));
+    spec.tables.idx_broker_summary = '2026-07-20';
+    spec.lag = { '2026-07-31': 0, '2026-07-20': 8 };
+    spec.jobs = [{ job_name: 'watchdog', status: 'FAILED', finished_at: null, error: 'burn-in failed' }];
+    spec.failCounts = { watchdog: 3 };
+    const s = await sh.signalState(makePool(spec), { today: CLOCK });
+    test('the watchdog failing BECAUSE inputs are stale is not a separate reason', () =>
+      assert.ok(!s.reasons.some(r => r.startsWith('JOB_FAILING:watchdog')), JSON.stringify(s.reasons)));
+    test('it is reported as a symptom instead', () =>
+      assert.ok(s.symptoms.some(r => r.startsWith('JOB_FAILING:watchdog')), JSON.stringify(s.symptoms)));
+    test('root cause names the stale inputs', () => {
+      assert.strictEqual(s.rootCause.code, 'INPUT_DATA_STALE');
+      assert.ok(s.rootCause.inputs.includes('broker'), JSON.stringify(s.rootCause));
+    });
+    test('the consequences are listed as symptoms, not causes', () =>
+      assert.ok(s.symptoms.some(r => r.startsWith('SCANNER_BLOCKED')), JSON.stringify(s.symptoms)));
+    test('it still DISABLES — dedupe is about counting, never about severity', () =>
+      assert.strictEqual(s.enabled, false));
+  }
+  {
+    // The demotion must be conditional. A monitor that breaks on its own, with
+    // every input fresh, is a real and independent failure.
+    const spec = JSON.parse(JSON.stringify(ALL_FRESH));
+    spec.jobs = [{ job_name: 'watchdog', status: 'FAILED', finished_at: null, error: 'crashed' }];
+    spec.failCounts = { watchdog: 4 };
+    const s = await sh.signalState(makePool(spec), { today: CLOCK });
+    test('a watchdog failing with NO stale input stays a reason', () =>
+      assert.ok(s.reasons.some(r => r.startsWith('JOB_FAILING:watchdog')), JSON.stringify(s.reasons)));
+    test('and it disables', () => assert.strictEqual(s.enabled, false));
   }
 
   console.log('\nthe HK failure mode: a job failing repeatedly and unnoticed');

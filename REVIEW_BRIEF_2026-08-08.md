@@ -392,3 +392,124 @@ Inverted and annotated rather than deleted.
 - Nothing yet consumes `paper-trader` readiness — the consumer is Python and
   outside this module. Recorded here rather than left implicit, because
   unenforced detection is the defect this whole sweep is about.
+
+---
+
+## 11. Review of the sweep — all three items applied
+
+Verdict was *approve the direction, no new features, fix two small hardenings*.
+Both were already on my own open list in §10.6, which is the useful signal: the
+review found no defect I had not found, and framed two of them better than I had.
+
+### 11.1 P1 — freshness must be time-aware, not merely session-aware
+
+**The review is right, and it is worth being precise about what was wrong.** This
+was NOT producing false 503s. `/api/signal-scanner` takes its session axis from
+`idx_ihsg_history`, and `refresh_ihsg` does not write session D until 20:05 WIB —
+so at 10:00 WIB the calendar does not yet contain today, `sessionsBehind`
+computes to 0, and no morning refusal has ever occurred.
+
+That is the problem. **It was correct by cron timing, not by contract.** Move
+refresh_ihsg earlier, or point the axis at any source that knows about today
+intraday, and the endpoint starts refusing every morning — a behaviour change
+with no code change, which is the shape of bug this codebase has already written
+down once, about the resolve/refresh_ihsg ordering: *"an ordering that exists
+only in a crontab is one edit away from being wrong, silently."*
+
+Implemented as the review specified:
+
+```
+brokerDate === latestRequiredCompletedSession(asOfTime)
+
+  before the cutoff:  previous completed session
+  after  the cutoff:  today's completed session
+```
+
+`expectedBrokerSession(pool, asOf)`, cutoff 12:30 UTC + 30 min grace = 13:00 UTC.
+The grace is derived like the constant it accompanies: the pull completes by
+12:36 in every observed session, so 13:00 leaves 24 minutes of slack while still
+landing 50 minutes before the watchdog runs — a dead pull is still caught the
+same night. The deadline is measured against *the session's own date*, so a
+weekend does not reset it: on Sunday, Friday's data is still expected.
+
+The scanner now reports both dates, so the refusal says what it wanted as well as
+what it has:
+```
+latestBrokerDate 2026-07-31   expectedBrokerDate 2026-08-07   sessionsBehind 5
+```
+
+### 11.2 P2 — incident cardinality
+
+Adopted exactly as framed. One upstream fault no longer reads as three problems:
+
+```
+rootCause  INPUT_DATA_STALE  inputs [broker, concentration]
+symptoms   JOB_FAILING:watchdog
+           SCANNER_BLOCKED:/api/signal-scanner returns 503
+           BURN_IN_BLOCKED:no session can be recorded clean
+reasons    STALE_BLOCKING:broker, STALE_BLOCKING:concentration
+```
+
+The demotion is **conditional, never blanket**: a watchdog failing with every
+input fresh has broken on its own, and stays a first-class reason. Tested both
+ways. Dedupe changes counting, never severity — `enabled` is still `false`.
+
+`watchdog.js` already refused to do this to itself (`checkJobRegistry` skips its
+own rows as circular). This applies the same rule where it was missing.
+
+### 11.3 P2 — completeness as a reusable primitive
+
+Built as `assertCompleteSessions()` in `modules/system_health.js`, not inside
+Pattern Replay — same reasoning as `phantomSessions()` being the one definition
+both the detector and the purge script call. If each consumer writes its own,
+they will disagree about what a session is, and the one that gets it wrong is the
+one nobody reads.
+
+```js
+assertCompleteSessions(pool, { table, col, startSession|count, endSession, requiredFields })
+→ { complete, expectedSessions, observedSessions, missingSessions, window }
+```
+
+**Tested against the real defect rather than a fixture** — `test_completeness.js`,
+now in `npm run test:integration`. A 5-session window ending 2026-06-26:
+
+```json
+{"complete":false,"expectedSessions":5,"observedSessions":4,
+ "missingSessions":["2026-06-22"],"window":{"from":"2026-06-22","to":"2026-06-26"}}
+```
+
+and the control that makes it evidence rather than a tautology — **prices over
+the same window are complete**, so the primitive discriminates instead of
+reporting holes everywhere. A window longer than the calendar returns
+`CALENDAR_SHORTER_THAN_WINDOW` rather than silently shortening, which is the §5.2
+failure mode at the primitive level.
+
+One scope limit stated in the code rather than discovered later: this answers
+"does the dataset have usable rows for every canonical session", **not** per-ticker
+completeness — a session where 3 of 245 tickers reported counts as observed.
+
+### 11.4 Also fixed: the test harness could not fail
+
+Adding the first async assertions exposed that `test()` is synchronous — it calls
+`fn()`, receives a pending promise, and counts a pass before the assertion runs.
+Every async test would have reported ✓ regardless, and a rejection would have
+surfaced as an unhandled rejection rather than a failure. Added `atest()`, and
+proved it fails on both a false assertion and a throw before trusting it.
+
+Worth recording because it is the same disease as the rest of this brief: a check
+that cannot report failure is worse than no check, since it manufactures
+confidence instead of evidence.
+
+### 11.5 Accepted without change
+
+- **Burn-in 0/10 is the correct state.** No attempt will be made to make it
+  runnable before the feed is replaced. Neutralising a missing broker input, or
+  carrying the last known one forward, would return us precisely to the
+  pre-audit condition this whole exercise removed.
+- **Broker replacement is a P0 project dependency**, and the acceptance
+  criterion is per-broker × per-ticker × per-session with the full buy/sell
+  value/lot/avg and net columns. A market-wide foreign net-buy figure or a daily
+  broker leaderboard does **not** replace the information content — dn0..dn4,
+  concentration and top-accumulation cannot be reconstructed from either.
+
+356 tests across 17 suites, 0 failures. Verified live.

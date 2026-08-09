@@ -148,6 +148,165 @@ const SUBSYSTEM_DEPENDS_ON = {
  */
 const BROKER_DATA_MAX_LAG_SESSIONS = 0;
 
+/**
+ * The UTC minute by which session D's broker pull must have finished, plus the
+ * grace that separates "slow" from "did not run".
+ *
+ * The pull starts 12:30 UTC and completes by 12:36 in every observed session.
+ * 30 minutes of grace puts the deadline at 13:00 UTC — 24 minutes of slack on
+ * the observed worst case, and still 50 minutes before the watchdog runs at
+ * 13:50, so a dead pull is caught the same night rather than the next.
+ */
+const BROKER_PIPELINE_CUTOFF_UTC_MINUTES = 12 * 60 + 30;
+const BROKER_PIPELINE_GRACE_MINUTES = 30;
+
+const toIso = d => (d instanceof Date
+  ? `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  : d ? String(d).slice(0, 10) : null);
+
+/**
+ * THE SESSION BROKER DATA IS ACTUALLY EXPECTED FOR, AS OF A GIVEN MOMENT.
+ *
+ * WHY THIS IS NOT `latest exchange session` (2026-08-09, review P1).
+ * A tolerance of 0 is correct for a consumer that runs after the pipeline. It is
+ * NOT correct for one that can be called at 10:00 WIB, while today's session is
+ * still trading and today's EOD pull is not due for another nine hours. Asking
+ * `brokerDate === latestExchangeSession` there would report a dead feed for a
+ * session whose data nobody has promised yet.
+ *
+ * The contract is therefore not
+ *
+ *     brokerDate === latestExchangeSession
+ *
+ * but
+ *
+ *     brokerDate === latestRequiredCompletedSession(asOfTime)
+ *
+ *      before the cutoff:  the previous completed session
+ *      after  the cutoff:  today's completed session
+ *
+ * WHAT SAVED US UNTIL NOW, AND WHY THAT IS NOT GOOD ENOUGH. /api/signal-scanner
+ * takes its session axis from `idx_ihsg_history`, and `refresh_ihsg` does not
+ * write session D until 20:05 WIB. So intraday the calendar does not yet contain
+ * today, `sessionsBehind` computes to 0, and no false refusal occurs. That is a
+ * real property of the current schedule and it is why no morning 503 has ever
+ * been seen — but it is an accident of cron timing, not a contract. Move
+ * refresh_ihsg earlier, or point the axis at any source that knows about today
+ * intraday, and the endpoint starts refusing every morning. This codebase has
+ * already written down that lesson once, about the resolve/refresh_ihsg ordering:
+ * "an ordering that exists only in a crontab is one edit away from being wrong,
+ * silently."
+ *
+ * @returns {Promise<string|null>} ISO date, or null if there is no calendar.
+ */
+async function expectedBrokerSession(pool, asOf = new Date()) {
+  const [rows] = await pool.query(
+    'SELECT date FROM idx_ihsg_history ORDER BY date DESC LIMIT 2');
+  if (!rows.length) return null;
+  const latest = toIso(rows[0].date);
+  const previous = rows[1] ? toIso(rows[1].date) : latest;
+
+  // Has session `latest` had its pipeline window? Measured against `latest`
+  // itself rather than against the wall clock's own date, so this stays correct
+  // over a weekend or a holiday: on Sunday, Friday's cutoff is long past and
+  // Friday's data is rightly expected.
+  const deadline = Date.parse(`${latest}T00:00:00Z`) +
+    (BROKER_PIPELINE_CUTOFF_UTC_MINUTES + BROKER_PIPELINE_GRACE_MINUTES) * 60000;
+  return asOf.getTime() >= deadline ? latest : previous;
+}
+
+/**
+ * A REUSABLE COMPLETENESS CONTRACT (2026-08-09, review P2).
+ *
+ * "5D" must mean FIVE CONSECUTIVE CANONICAL EXCHANGE SESSIONS, not five rows
+ * that happened to be available. The difference is not pedantry: this sweep
+ * proved `idx_broker_summary` is missing 2024-05-29, 2026-06-15, 06-22 and
+ * 06-29 — real sessions with prices and an index bar — so a window crossing one
+ * of them silently spans four observations while still being labelled five.
+ *
+ * Deliberately NOT built inside Pattern Replay. If each consumer writes its own
+ * check, they will disagree about what a session is, and the one that gets it
+ * wrong will be the one nobody reads. Same reasoning as `phantomSessions` being
+ * the single definition that both the detector and the purge script call.
+ *
+ * Intended callers: Pattern Replay, research windows, backtests, signal-history
+ * validation, broker factor computation.
+ *
+ * SCOPE, STATED HONESTLY. This answers "does this dataset have usable rows for
+ * every canonical session in the window". It does NOT answer per-ticker
+ * completeness — a session where 3 of 245 tickers reported counts as observed.
+ * That is a different question and a caller needing it must ask it separately;
+ * saying so here is cheaper than someone later assuming this covered it.
+ *
+ * @param {string}  table          dataset to check
+ * @param {string}  col            its session-date column
+ * @param {string}  [startSession] ISO date, inclusive. Omit and pass `count`.
+ * @param {string}  [endSession]   ISO date, inclusive. Defaults to the newest session.
+ * @param {number}  [count]        window length in sessions, counted back from endSession
+ * @param {string[]}[requiredFields] a session counts as observed only if at least
+ *                                 one of its rows has all of these non-null
+ */
+async function assertCompleteSessions(pool, {
+  table, col, startSession = null, endSession = null, count = null,
+  requiredFields = [], calendar = 'idx_ihsg_history', calendarCol = 'date',
+} = {}) {
+  if (!table || !col) throw new Error('assertCompleteSessions: table and col are required');
+
+  if (!endSession) {
+    const [[e]] = await pool.query(`SELECT MAX(${calendarCol}) d FROM ${calendar}`);
+    endSession = toIso(e?.d);
+  }
+  if (!endSession) {
+    return { complete: false, expectedSessions: 0, observedSessions: 0, missingSessions: [],
+             window: null, reason: 'NO_CALENDAR' };
+  }
+
+  // The canonical session list. The calendar is the exchange's own index series,
+  // so this is the axis, not an approximation of it.
+  let sessions;
+  if (startSession) {
+    const [rows] = await pool.query(
+      `SELECT ${calendarCol} d FROM ${calendar} WHERE ${calendarCol} BETWEEN ? AND ? ORDER BY ${calendarCol}`,
+      [startSession, endSession]);
+    sessions = rows.map(r => toIso(r.d));
+  } else {
+    const n = Number(count);
+    if (!Number.isFinite(n) || n <= 0) throw new Error('assertCompleteSessions: pass startSession or a positive count');
+    const [rows] = await pool.query(
+      `SELECT ${calendarCol} d FROM ${calendar} WHERE ${calendarCol} <= ? ORDER BY ${calendarCol} DESC LIMIT ?`,
+      [endSession, n]);
+    sessions = rows.map(r => toIso(r.d)).reverse();
+  }
+
+  if (!sessions.length) {
+    return { complete: false, expectedSessions: 0, observedSessions: 0, missingSessions: [],
+             window: { from: startSession, to: endSession }, reason: 'NO_SESSIONS_IN_WINDOW' };
+  }
+
+  // A window the calendar cannot fully cover is INCOMPLETE, not shortened. Asking
+  // for 5 sessions and silently returning 4 is the exact defect this exists to
+  // stop, so a short calendar is reported rather than absorbed.
+  const shortBy = count && sessions.length < Number(count) ? Number(count) - sessions.length : 0;
+
+  const notNull = requiredFields.length
+    ? ' AND ' + requiredFields.map(f => `${f} IS NOT NULL`).join(' AND ')
+    : '';
+  const [present] = await pool.query(
+    `SELECT DISTINCT ${col} d FROM ${table} WHERE ${col} IN (?)${notNull}`, [sessions]);
+  const have = new Set(present.map(r => toIso(r.d)));
+
+  const missingSessions = sessions.filter(s => !have.has(s));
+  return {
+    complete: missingSessions.length === 0 && shortBy === 0,
+    expectedSessions: count ? Number(count) : sessions.length,
+    observedSessions: sessions.length - missingSessions.length,
+    missingSessions,
+    window: { from: sessions[0], to: sessions[sessions.length - 1], sessions: sessions.length },
+    ...(shortBy ? { reason: 'CALENDAR_SHORTER_THAN_WINDOW', shortBy } : {}),
+    ...(requiredFields.length ? { requiredFields } : {}),
+  };
+}
+
 const CHECKS = [
   { key: 'prices',       table: 'idx_stock_prices',    col: 'date',        maxLag: 1,
     severity: SEVERITY.BLOCKING,
@@ -649,9 +808,29 @@ async function signalState(pool, opts = {}) {
             .map(f => `OUT_OF_SCOPE:${f.severity}:${f.key}:${f.detail}`),
   ];
 
+  // INCIDENT CARDINALITY (2026-08-09, review P2).
+  //
+  // With the broker feed dead this returned three reasons — broker stale,
+  // concentration stale, and JOB_FAILING:watchdog — for ONE upstream fault. The
+  // watchdog fails *because* the inputs it checks are stale, so counting its
+  // failure as an independent problem inflates a single incident into several
+  // and makes an operator triage three things that are one thing.
+  //
+  // watchdog.js already refuses to do this to itself: checkJobRegistry skips its
+  // own rows because "the watchdog recording last night's failure and then
+  // reporting that record as a fresh finding is circular". Same rule, applied
+  // where it was missing.
+  //
+  // A monitor failing with NO stale input to explain it is still a real,
+  // independent reason — it means the monitor broke on its own — so the
+  // demotion is conditional, never blanket.
+  const symptoms = [];
   const jobs = await jobHealth(pool);
   for (const j of jobs) {
-    if (j.consecutiveFailures >= 3) reasons.push(`JOB_FAILING:${j.job_name}:${j.consecutiveFailures} consecutive failures`);
+    if (j.consecutiveFailures < 3) continue;
+    const entry = `JOB_FAILING:${j.job_name}:${j.consecutiveFailures} consecutive failures`;
+    if (reasons.length && /^watchdog/.test(String(j.job_name))) symptoms.push(entry);
+    else reasons.push(entry);
   }
 
   if (opts.expectedModelVersion && opts.actualModelVersion &&
@@ -659,8 +838,23 @@ async function signalState(pool, opts = {}) {
     reasons.push(`MODEL_VERSION_MISMATCH:${opts.actualModelVersion} != ${opts.expectedModelVersion}`);
   }
 
+  if (ready.blocking.length) {
+    symptoms.push('SCANNER_BLOCKED:/api/signal-scanner returns 503');
+    symptoms.push('BURN_IN_BLOCKED:no session can be recorded clean');
+  }
+
+  // One named cause, with the consequences hanging off it, rather than a flat
+  // list in which cause and effect look alike.
+  const rootCause = ready.blocking.length
+    ? { code: 'INPUT_DATA_STALE',
+        inputs: ready.blocking.map(b => b.split(':')[0]),
+        detail: ready.blocking }
+    : (reasons.length ? { code: reasons[0].split(':')[0], detail: [reasons[0]] } : null);
+
   return {
     enabled: reasons.length === 0,
+    rootCause,
+    symptoms,
     // DEGRADED does not stop output, but it must travel WITH it. A caller that
     // renders `enabled` and drops this is back to a warning beside a signal,
     // which still reads as a signal.
@@ -679,6 +873,8 @@ async function signalState(pool, opts = {}) {
 module.exports = {
   CHECKS, dataFreshness, missingSessions, phantomSessions, recordJobRun, jobHealth,
   signalState, readiness, ensureTable, weekdaysSince,
+  expectedBrokerSession, assertCompleteSessions,
   MAX_REFERENCE_WEEKDAYS, BROKER_DATA_MAX_LAG_SESSIONS,
+  BROKER_PIPELINE_CUTOFF_UTC_MINUTES, BROKER_PIPELINE_GRACE_MINUTES,
   SEVERITY, SEVERITY_RANK, binds, SUBSYSTEM, SUBSYSTEM_DEPENDS_ON,
 };

@@ -6265,8 +6265,23 @@ app.get('/api/signal-scanner', async (req, res) => {
     // ones built on absent inputs — worse than stale, because stale is at least
     // true of some day. Refusing is the honest option: say which day we can
     // actually see, and how far behind that is.
+    // TIME-AWARE, not merely session-aware (review P1, 2026-08-09).
+    //
+    // The tolerance is 0 sessions, and that is right for a consumer running
+    // after the nightly pipeline. This endpoint is not one: a human can open it
+    // at 10:00 WIB while the session is still trading and today's EOD pull is
+    // nine hours away. Comparing against the LATEST session would call the feed
+    // dead for a session nobody has promised data for yet.
+    //
+    // So the comparison is against the latest session whose pipeline window has
+    // actually closed. Until now this happened to be safe only because
+    // refresh_ihsg does not write today's index bar until 20:05 WIB, so the
+    // calendar did not yet know about today — correct by cron timing rather than
+    // by contract, and one schedule edit away from a 503 every morning.
+    const expectedSession = await systemHealth.expectedBrokerSession(pool);
     const [sessRows] = await pool.query(
-      'SELECT date FROM idx_ihsg_history WHERE date > ? ORDER BY date ASC', [latestDate]);
+      'SELECT date FROM idx_ihsg_history WHERE date > ? AND date <= ? ORDER BY date ASC',
+      [latestDate, expectedSession || latestDate]);
     const sessionsBehind = sessRows.length;
     // ONE CANONICAL TOLERANCE. This was a literal `1` while the freshness table
     // said 2 and the burn-in gate said 1 by a different route — three answers to
@@ -6281,8 +6296,10 @@ app.get('/api/signal-scanner', async (req, res) => {
         stale: true,
         sessionsBehind,
         latestBrokerDate: latestDate,
+        expectedBrokerDate: expectedSession,
         latestSessionDate: toStr(sessRows[sessRows.length - 1].date),
-        error: `Broker data stops at ${latestDate}, ${sessionsBehind} exchange sessions behind. ` +
+        error: `Broker data stops at ${latestDate}, ${sessionsBehind} exchange session(s) behind ` +
+               `${expectedSession}, which is the newest session whose EOD pipeline window has closed. ` +
                `Scores are not computed: concentration and flow factors have no data past that date, ` +
                `so a score dated today would be built on inputs that do not exist.`,
       });
