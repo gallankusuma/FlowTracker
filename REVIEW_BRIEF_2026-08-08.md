@@ -377,9 +377,13 @@ Inverted and annotated rather than deleted.
 
 ### 10.6 Still open after this
 
-- The 2026-08-08 phantom row is **still in the table**. Reported, not deleted:
-  removing production price rows is irreversible and that is a decision, not a
-  repair. The writer that produced it is fixed, so it cannot recur.
+- ~~The 2026-08-08 phantom row is still in the table.~~ **Purged on user
+  approval**, 245 rows, backup `/root/backups/phantom-prices-2026-08-09-0056.sql`
+  (replayable INSERTs, verified before any DELETE). `verify_strategy_book.js`
+  still passes 17/17 — the flagship strategy takes its date axis from
+  `idx_ihsg_history`, so phantom price dates were never visited, exactly as the
+  2026-08-04 purge established. The watchdog now reports "every date looks like a
+  real session", and the burn-in fails on **one** root cause instead of two.
 - `signalState` counts `JOB_FAILING:watchdog` as a reason alongside the staleness
   that *caused* the watchdog to fail — one fault, counted twice. `checkJobRegistry`
   already skips its own rows for this reason; `signalState` does not. Harmless
