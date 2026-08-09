@@ -216,6 +216,121 @@ async function expectedBrokerSession(pool, asOf = new Date()) {
 }
 
 /**
+ * THE CENTRAL BROKER-FRESHNESS PRIMITIVE.
+ *
+ * WHY A LAG NUMBER WAS NOT ENOUGH (2026-08-09, review of R2-A).
+ * Everything so far asked one question — how many sessions BEHIND is the feed —
+ * and that question cannot express two states that are not lateness at all:
+ *
+ *   latestBrokerDate  >  expected      a bar for a session that has not closed
+ *   latestBrokerDate  not a session    a bar for a day the exchange never traded
+ *
+ * Both currently read as PERFECTLY FRESH, and that is measured, not feared:
+ * `tradingDayLag` ends in `weekdaysSince(fromDate, referenceDate)`, which
+ * returns 0 for any date at or beyond the reference. So lag is 0, `lag <=
+ * maxLag` holds at tolerance 0, and the feed is reported CURRENT.
+ *
+ * The second case is not hypothetical either. `idx_stock_prices` carried 75
+ * non-session dates — weekends and holidays with carried-forward quotes — and
+ * one more appeared on 2026-08-08 from an unguarded writer. Nothing structurally
+ * prevents the same class of row in the broker tables, and if one lands as
+ * MAX(date) every freshness check in this file currently calls it fresh.
+ *
+ * A future or non-session bar is WORSE than a stale one. Stale is at least true
+ * of some day; these are true of no day, and they present as the healthiest
+ * possible state.
+ *
+ *   latestBrokerDate  <  expected   -> STALE       (refuse)
+ *   latestBrokerDate  == expected   -> CURRENT
+ *   latestBrokerDate  >  expected   -> FUTURE      (refuse — invalid, not fresh)
+ *   latestBrokerDate  not a session -> NON_SESSION (refuse)
+ *
+ * One primitive, so the scanner, Flow Analyzer, the burn-in gate and the
+ * watchdog cannot each grow their own opinion — which is exactly how the three
+ * disagreeing lag literals happened.
+ */
+const BROKER_FRESHNESS = {
+  CURRENT: 'CURRENT', STALE: 'STALE', FUTURE: 'FUTURE',
+  NON_SESSION: 'NON_SESSION', NO_DATA: 'NO_DATA',
+};
+
+async function brokerFreshness(pool, { asOf = new Date(), table = 'idx_broker_summary', col = 'date' } = {}) {
+  const [[row]] = await pool.query(`SELECT MAX(${col}) AS d FROM ${table}`);
+  const latest = toIso(row?.d);
+  const expected = await expectedBrokerSession(pool, asOf);
+
+  if (!latest) {
+    return { state: BROKER_FRESHNESS.NO_DATA, valid: false, latest: null, expected,
+             sessionsBehind: null, detail: `${table} is empty` };
+  }
+  if (!expected) {
+    return { state: BROKER_FRESHNESS.NO_DATA, valid: false, latest, expected: null,
+             sessionsBehind: null, detail: 'no exchange calendar to judge against' };
+  }
+
+  // A WEEKEND BAR IS NEVER VALID, and this is checked without the calendar
+  // because the calendar can never help here: it will never contain a Saturday,
+  // so "absent from the calendar" cannot distinguish a weekend from a date the
+  // calendar simply has not reached yet.
+  const dow = new Date(`${latest}T00:00:00Z`).getUTCDay();
+  if (dow === 0 || dow === 6) {
+    return { state: BROKER_FRESHNESS.NON_SESSION, valid: false, latest, expected, sessionsBehind: null,
+             detail: `${latest} is a weekend. IDX does not trade Saturday or Sunday, so no broker data can legitimately be dated to it` };
+  }
+
+  // FUTURE means later than the exchange's own calendar day, measured in WIB.
+  //
+  // NOT "later than `expected`" — that was this function's first rule and it was
+  // WRONG in a way the tests caught. Broker data lands 12:30 UTC while the
+  // pipeline deadline is 13:00, so for thirty minutes every evening the feed
+  // legitimately holds a session that `expected` has not advanced to yet. That
+  // rule would have refused the freshest possible data, nightly.
+  const wib = new Date(asOf.getTime() + 7 * 3600 * 1000);
+  const todayWib = wib.toISOString().slice(0, 10);
+  if (latest > todayWib) {
+    return { state: BROKER_FRESHNESS.FUTURE, valid: false, latest, expected, sessionsBehind: 0,
+             detail: `${latest} is dated after today (${todayWib} WIB). A bar for a session that has not happened is invalid, not fresh` };
+  }
+
+  // Within the calendar's own range, absence is proof: the index traded on every
+  // real session, so a weekday the index has no bar for was a holiday.
+  const [calRows] = await pool.query(
+    'SELECT 1 AS ok FROM idx_ihsg_history WHERE date = ? LIMIT 1', [latest]);
+  const [[calBounds]] = await pool.query(
+    'SELECT MIN(date) lo, MAX(date) hi FROM idx_ihsg_history');
+  const lo = toIso(calBounds?.lo), hi = toIso(calBounds?.hi);
+  // Beyond the newest calendar row the absence of a bar proves nothing — the
+  // calendar refreshes 35 minutes after the broker pull, so it is routinely
+  // behind. Claiming NON_SESSION there would blame the wrong feed.
+  if (lo && hi && latest >= lo && latest <= hi && !calRows.length) {
+    return { state: BROKER_FRESHNESS.NON_SESSION, valid: false, latest, expected, sessionsBehind: null,
+             detail: `${latest} is a weekday the exchange did not trade — the index has no bar for it, so no broker data can legitimately be dated to it` };
+  }
+
+  // Ahead of `expected` but not ahead of today: the evening window above.
+  if (latest > expected) {
+    return { state: BROKER_FRESHNESS.CURRENT, valid: true, latest, expected, sessionsBehind: 0,
+             detail: `current (${latest} landed ahead of the ${expected} deadline)` };
+  }
+
+  if (latest === expected) {
+    return { state: BROKER_FRESHNESS.CURRENT, valid: true, latest, expected, sessionsBehind: 0, detail: 'current' };
+  }
+
+  const [behind] = await pool.query(
+    'SELECT COUNT(*) n FROM idx_ihsg_history WHERE date > ? AND date <= ?', [latest, expected]);
+  const sessionsBehind = Number(behind[0]?.n) || 0;
+  return {
+    state: sessionsBehind > BROKER_DATA_MAX_LAG_SESSIONS ? BROKER_FRESHNESS.STALE : BROKER_FRESHNESS.CURRENT,
+    valid: sessionsBehind <= BROKER_DATA_MAX_LAG_SESSIONS,
+    latest, expected, sessionsBehind,
+    detail: sessionsBehind > BROKER_DATA_MAX_LAG_SESSIONS
+      ? `${sessionsBehind} exchange session(s) behind ${expected} (tolerance ${BROKER_DATA_MAX_LAG_SESSIONS})`
+      : 'current',
+  };
+}
+
+/**
  * A REUSABLE COMPLETENESS CONTRACT (2026-08-09, review P2).
  *
  * "5D" must mean FIVE CONSECUTIVE CANONICAL EXCHANGE SESSIONS, not five rows
@@ -520,9 +635,29 @@ async function readiness(pool, { subsystems = Object.values(SUBSYSTEM), today = 
   const relevant = fresh.filter(f => (f.affects || []).some(a => wanted.has(a)));
   const failed = relevant.filter(f => !f.ok);
 
-  const blocking = failed.filter(f => f.severity === SEVERITY.BLOCKING);
-  const degraded = failed.filter(f => f.severity === SEVERITY.DEGRADED);
-  const advisory = failed.filter(f => !binds(f.severity));
+  const blocking = failed.filter(f => f.severity === SEVERITY.BLOCKING)
+    .map(f => `${f.key}:${f.detail}`);
+  const degraded = failed.filter(f => f.severity === SEVERITY.DEGRADED)
+    .map(f => `${f.key}:${f.detail}`);
+  const advisory = failed.filter(f => !binds(f.severity))
+    .map(f => `${f.key}:${f.detail}`);
+
+  // VALIDITY, not just lateness. The lag checks above cannot see a broker bar
+  // dated to a session that has not closed, or to a day the exchange never
+  // traded: both make `weekdaysSince` return 0 and therefore read as perfectly
+  // fresh. Asked separately, and only when the broker feed is actually required
+  // by one of the subsystems being judged.
+  let brokerState = null;
+  if ([...wanted].some(s => s === SUBSYSTEM.SIGNAL_ENGINE)) {
+    try {
+      brokerState = await brokerFreshness(pool, { asOf: today });
+      if (!brokerState.valid && brokerState.state !== BROKER_FRESHNESS.STALE) {
+        // STALE is already reported by the lag check; adding it here would
+        // double-count one fault, which is the incident-cardinality mistake.
+        blocking.push(`broker:${brokerState.state}:${brokerState.detail}`);
+      }
+    } catch { /* the lag checks still stand if this cannot run */ }
+  }
 
   // The session we can honestly speak for: the oldest "latest" among the
   // required feeds. A feed with no rows at all makes this null rather than
@@ -540,9 +675,10 @@ async function readiness(pool, { subsystems = Object.values(SUBSYSTEM), today = 
     degradedMode: blocking.length === 0 && degraded.length > 0,
     subsystems: [...wanted],
     signalDate, limitedBy,
-    blocking: blocking.map(f => `${f.key}:${f.detail}`),
-    degraded: degraded.map(f => `${f.key}:${f.detail}`),
-    advisory: advisory.map(f => `${f.key}:${f.detail}`),
+    blocking,
+    degraded,
+    advisory,
+    brokerFreshness: brokerState,
     detail: relevant,
   };
 }
@@ -873,7 +1009,7 @@ async function signalState(pool, opts = {}) {
 module.exports = {
   CHECKS, dataFreshness, missingSessions, phantomSessions, recordJobRun, jobHealth,
   signalState, readiness, ensureTable, weekdaysSince,
-  expectedBrokerSession, assertCompleteSessions,
+  expectedBrokerSession, assertCompleteSessions, brokerFreshness, BROKER_FRESHNESS,
   MAX_REFERENCE_WEEKDAYS, BROKER_DATA_MAX_LAG_SESSIONS,
   BROKER_PIPELINE_CUTOFF_UTC_MINUTES, BROKER_PIPELINE_GRACE_MINUTES,
   SEVERITY, SEVERITY_RANK, binds, SUBSYSTEM, SUBSYSTEM_DEPENDS_ON,

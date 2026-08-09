@@ -50,6 +50,23 @@ function makePool(spec) {
       if (/MAX\(date\) AS d FROM idx_ihsg_history/i.test(sql)) {
         return [[{ d: spec.tables.idx_ihsg_history ?? null }]];
       }
+      // ── the exchange calendar, for brokerFreshness/expectedBrokerSession ──
+      // spec.sessions is the canonical session list, newest last.
+      if (/FROM idx_ihsg_history ORDER BY date DESC LIMIT 2/i.test(sql)) {
+        const s = spec.sessions || [];
+        return [s.slice(-2).reverse().map(d => ({ date: d }))];
+      }
+      if (/SELECT 1 AS ok FROM idx_ihsg_history WHERE date = \?/i.test(sql)) {
+        return [(spec.sessions || []).includes(params[0]) ? [{ ok: 1 }] : []];
+      }
+      if (/MIN\(date\) lo, MAX\(date\) hi FROM idx_ihsg_history/i.test(sql)) {
+        const s = spec.sessions || [];
+        return [[{ lo: s[0] ?? null, hi: s[s.length - 1] ?? null }]];
+      }
+      if (/COUNT\(\*\) n FROM idx_ihsg_history WHERE date > \? AND date <= \?/i.test(sql)) {
+        const s = spec.sessions || [];
+        return [[{ n: s.filter(d => d > params[0] && d <= params[1]).length }]];
+      }
       // Reference scan: MAX(col) AS d, without the COUNT.
       const ref = sql.match(/MAX\((\w+)\) AS d FROM (\w+)/i);
       if (ref) return [[{ d: spec.tables[ref[2]] ?? null }]];
@@ -70,6 +87,8 @@ const ALL_FRESH = {
             idx_concentration: '2026-07-31', idx_broker_flow_detail: '2026-07-31',
             idx_ihsg_history: '2026-07-31', ft_signals: '2026-07-31' },
   lag: { '2026-07-31': 0 },
+  // Canonical exchange sessions, newest last. 2026-07-31 is a Friday.
+  sessions: ['2026-07-27', '2026-07-28', '2026-07-29', '2026-07-30', '2026-07-31'],
 };
 
 (async () => {
@@ -222,6 +241,86 @@ const ALL_FRESH = {
       assert.strictEqual(await sh.expectedBrokerSession(calPool, at('2026-08-09T04:00:00Z')), '2026-08-07'));
     await atest('no calendar -> null rather than a guess', async () =>
       assert.strictEqual(await sh.expectedBrokerSession({ async query() { return [[]]; } }), null));
+  }
+
+  // ── HEALTH FINAL: a bar can be INVALID rather than merely late ────────────
+  // Both states below made weekdaysSince() return 0, so the old lag checks
+  // called them "fresh" — the healthiest possible reading for data that is true
+  // of no day at all.
+  console.log('\nHEALTH FINAL — future and non-session broker dates must REFUSE');
+  {
+    const base = () => JSON.parse(JSON.stringify(ALL_FRESH));
+    const at = s => new Date(s);
+
+    await atest('a broker bar dated AFTER today is FUTURE, not fresh', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-08-14';   // a week ahead
+      const r = await sh.brokerFreshness(makePool(spec), { asOf: at('2026-07-31T13:50:00Z') });
+      assert.strictEqual(r.state, sh.BROKER_FRESHNESS.FUTURE, JSON.stringify(r));
+      assert.strictEqual(r.valid, false);
+    });
+
+    await atest('a WEEKEND broker bar is NON_SESSION even though the calendar can never contain it', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-08-01';   // Saturday
+      const r = await sh.brokerFreshness(makePool(spec), { asOf: at('2026-08-03T13:50:00Z') });
+      assert.strictEqual(r.state, sh.BROKER_FRESHNESS.NON_SESSION, JSON.stringify(r));
+      assert.strictEqual(r.valid, false);
+    });
+
+    await atest('a WEEKDAY the index did not trade is NON_SESSION (holiday)', async () => {
+      const spec = base();
+      spec.sessions = ['2026-07-27', '2026-07-28', '2026-07-30', '2026-07-31']; // 07-29 absent
+      spec.tables.idx_broker_summary = '2026-07-29';
+      const r = await sh.brokerFreshness(makePool(spec), { asOf: at('2026-07-31T13:50:00Z') });
+      assert.strictEqual(r.state, sh.BROKER_FRESHNESS.NON_SESSION, JSON.stringify(r));
+    });
+
+    // The regression the first version of this rule caused. Broker lands 12:30
+    // UTC, the deadline is 13:00, so for half an hour the feed legitimately
+    // holds a session `expected` has not reached. Refusing there would reject
+    // the freshest data in the system, every single evening.
+    await atest('landing BEFORE the deadline is CURRENT, not FUTURE', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-07-31';
+      const r = await sh.brokerFreshness(makePool(spec), { asOf: at('2026-07-31T12:40:00Z') });
+      assert.strictEqual(r.state, sh.BROKER_FRESHNESS.CURRENT, JSON.stringify(r));
+      assert.strictEqual(r.valid, true);
+    });
+
+    await atest('an ordinary current feed is CURRENT', async () => {
+      const r = await sh.brokerFreshness(makePool(base()), { asOf: at('2026-07-31T13:50:00Z') });
+      assert.strictEqual(r.state, sh.BROKER_FRESHNESS.CURRENT, JSON.stringify(r));
+    });
+
+    await atest('a genuinely late feed is still STALE', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-07-28';
+      const r = await sh.brokerFreshness(makePool(spec), { asOf: at('2026-07-31T13:50:00Z') });
+      assert.strictEqual(r.state, sh.BROKER_FRESHNESS.STALE, JSON.stringify(r));
+      assert.strictEqual(r.sessionsBehind, 3);
+    });
+
+    // The point of the whole exercise: readiness must inherit it, so the
+    // scanner, Flow Analyzer and the burn-in all refuse without asking twice.
+    await atest('readiness REFUSES on an invalid broker bar, not just a late one', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-08-14';
+      const r = await sh.readiness(makePool(spec), {
+        subsystems: [sh.SUBSYSTEM.SIGNAL_ENGINE], today: at('2026-07-31T13:50:00Z') });
+      assert.strictEqual(r.enabled, false, JSON.stringify(r.blocking));
+      assert.ok(r.blocking.some(b => b.includes('FUTURE')), JSON.stringify(r.blocking));
+    });
+
+    await atest('one fault is not counted twice — STALE is reported by the lag check alone', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-07-28';
+      spec.lag = { '2026-07-31': 0, '2026-07-28': 3 };
+      const r = await sh.readiness(makePool(spec), {
+        subsystems: [sh.SUBSYSTEM.SIGNAL_ENGINE], today: at('2026-07-31T13:50:00Z') });
+      const brokerReasons = r.blocking.filter(b => b.startsWith('broker:'));
+      assert.strictEqual(brokerReasons.length, 1, JSON.stringify(r.blocking));
+    });
   }
 
   // ── review P2: incident cardinality ───────────────────────────────────────
