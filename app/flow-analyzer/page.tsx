@@ -6,13 +6,31 @@ import { useState, useEffect, useRef, useMemo } from "react";
 
 type FlowRow = {
   ticker: string;
-  lastVal: string;
-  days: number[];
-  dailyChange: number;
-  price: number;
+  turnover: string;
+  turnoverRaw: number;
+  buyValue: string;
+  // null = NO OBSERVATION. Not 0, which means "observed, and balanced".
+  // The API used to collapse both into 0 and the UI then padded short arrays
+  // with more zeros, so absent data arrived looking like measured neutrality.
+  days: (number | null)[];
+  observedDays: number;
+  priceAtSnapshot: number | null;
+  dailyChangeAtSnapshot: number | null;
+  currentPrice: number | null;
+  sinceFlowPct: number | null;
 };
 
-type SortKey = "ticker" | "lastVal" | "day4" | "day3" | "day2" | "day1" | "day0" | "dailyChange" | "price";
+type FlowMeta = {
+  analysisDate?: string; flowDate?: string; priceDate?: string; latestPriceDate?: string;
+  concentrationSource?: string; priceSource?: string; source?: string;
+  metric?: { name: string; definition: string; positive: string; negative: string };
+  window?: { dates: string[]; complete: boolean | null; missingSessions: string[] };
+  degraded?: string[];
+};
+
+type StaleInfo = { blocking: string[]; signalDate?: string; limitedBy?: string; message?: string };
+
+type SortKey = "ticker" | "turnover" | "day4" | "day3" | "day2" | "day1" | "day0" | "dailyChange" | "price";
 type SortDir = "asc" | "desc";
 
 /**
@@ -70,7 +88,11 @@ export default function FlowAnalyzer() {
   const [limit, setLimit]           = useState(20);
   const [data, setData]             = useState<FlowRow[]>([]);
   const [loading, setLoading]       = useState(true);
-  const [meta, setMeta]             = useState<{ date?: string; source?: string }>({});
+  const [meta, setMeta]             = useState<FlowMeta>({});
+  // A refused stale feed is its own state. Rendering it as an empty table is
+  // exactly the confusion this release exists to remove.
+  const [stale, setStale]           = useState<StaleInfo | null>(null);
+  const [loadError, setLoadError]   = useState<string | null>(null);
   const [selectedTicker, setSelectedTicker] = useState<string | null>(null);
   const detailRef = useRef<HTMLDivElement>(null);
 
@@ -90,10 +112,24 @@ export default function FlowAnalyzer() {
 
   useEffect(() => {
     setLoading(true);
+    // A 503 here is a MEANING, not a failure to render. The old code called
+    // .json() on any response and dropped the body into an empty table, so a
+    // refused stale feed looked identical to a quiet market.
     fetch(`${API_BASE}/api/flow-analyzer`)
-      .then(r => r.json())
-      .then(json => { setData(json.data || []); setMeta({ date: json.date, source: json.source }); })
-      .catch(() => setData([]))
+      .then(async r => ({ ok: r.ok, status: r.status, json: await r.json().catch(() => ({})) }))
+      .then(({ ok, status, json }) => {
+        if (status === 503) {
+          setStale({ blocking: json.blocking || [], signalDate: json.signalDate,
+                     limitedBy: json.limitedBy, message: json.message });
+          setData([]); setMeta({});
+          return;
+        }
+        if (!ok) { setLoadError(json.error || `HTTP ${status}`); setData([]); return; }
+        setStale(null); setLoadError(null);
+        setData(json.data || []);
+        setMeta(json);
+      })
+      .catch(e => { setLoadError(String(e?.message || e)); setData([]); })
       .finally(() => setLoading(false));
   }, []);
 
@@ -108,21 +144,24 @@ export default function FlowAnalyzer() {
     const mnV = parseFloat(filterMinVal), mxV = parseFloat(filterMaxVal);
     const mn0 = parseFloat(filterMinDay0), mx0 = parseFloat(filterMaxDay0);
     const mnC = parseFloat(filterMinChg),  mxC = parseFloat(filterMaxChg);
-    if (!isNaN(mnV)) rows = rows.filter(r => parseLastVal(r.lastVal) >= mnV);
-    if (!isNaN(mxV)) rows = rows.filter(r => parseLastVal(r.lastVal) <= mxV);
-    if (!isNaN(mn0)) rows = rows.filter(r => (r.days[4] ?? 0) >= mn0);
-    if (!isNaN(mx0)) rows = rows.filter(r => (r.days[4] ?? 0) <= mx0);
-    if (!isNaN(mnC)) rows = rows.filter(r => r.dailyChange >= mnC);
-    if (!isNaN(mxC)) rows = rows.filter(r => r.dailyChange <= mxC);
+    if (!isNaN(mnV)) rows = rows.filter(r => parseLastVal(r.turnover) >= mnV);
+    if (!isNaN(mxV)) rows = rows.filter(r => parseLastVal(r.turnover) <= mxV);
+    // An UNOBSERVED value cannot satisfy a numeric range. `?? 0` would have made
+    // every unknown day count as exactly 0.00% and quietly pass filters like
+    // "day0 <= 5", which is the missing-becomes-zero bug wearing a filter.
+    if (!isNaN(mn0)) rows = rows.filter(r => r.days[4] !== null && r.days[4]! >= mn0);
+    if (!isNaN(mx0)) rows = rows.filter(r => r.days[4] !== null && r.days[4]! <= mx0);
+    if (!isNaN(mnC)) rows = rows.filter(r => r.dailyChangeAtSnapshot !== null && r.dailyChangeAtSnapshot >= mnC);
+    if (!isNaN(mxC)) rows = rows.filter(r => r.dailyChangeAtSnapshot !== null && r.dailyChangeAtSnapshot <= mxC);
 
     const dayIdx: Record<string, number> = { day0: 4, day1: 3, day2: 2, day3: 1, day4: 0 };
     rows.sort((a, b) => {
       let va: number | string = 0, vb: number | string = 0;
       if (sortKey === "ticker")      { va = a.ticker;      vb = b.ticker; }
-      else if (sortKey === "lastVal"){ va = parseLastVal(a.lastVal); vb = parseLastVal(b.lastVal); }
+      else if (sortKey === "turnover"){ va = parseLastVal(a.turnover); vb = parseLastVal(b.turnover); }
       else if (sortKey in dayIdx)    { va = a.days[dayIdx[sortKey]] ?? 0; vb = b.days[dayIdx[sortKey]] ?? 0; }
-      else if (sortKey === "dailyChange") { va = a.dailyChange; vb = b.dailyChange; }
-      else if (sortKey === "price")  { va = a.price;       vb = b.price; }
+      else if (sortKey === "dailyChange") { va = a.dailyChangeAtSnapshot ?? 0; vb = b.dailyChangeAtSnapshot ?? 0; }
+      else if (sortKey === "price")  { va = a.priceAtSnapshot ?? 0; vb = b.priceAtSnapshot ?? 0; }
       if (va < vb) return sortDir === "asc" ? -1 : 1;
       if (va > vb) return sortDir === "asc" ? 1 : -1;
       return 0;
@@ -188,7 +227,9 @@ export default function FlowAnalyzer() {
             background: meta.source === "database" ? "var(--accent-green)" : "var(--accent-blue)", display: "inline-block",
           }} />
           <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-secondary)", letterSpacing: "0.06em" }}>
-            {loading ? "⏳ LOADING..." : `DATA PER [${(meta.date||"").toUpperCase()}] · SOURCE: ${(meta.source||"N/A").toUpperCase()}`}
+            {loading ? "⏳ LOADING..."
+              : stale ? "⛔ FLOW DATA STALE — NOTHING RENDERED"
+              : `FLOW ${(meta.flowDate||"—")} · PRICE ${(meta.priceDate||"—")} · SRC ${(meta.concentrationSource||"N/A").toUpperCase()}`}
           </span>
           {selectedTicker && (
             <span style={{ fontSize: 11, color: "var(--accent-cyan)", fontWeight: 700 }}>🔍 {selectedTicker}</span>
@@ -221,8 +262,8 @@ export default function FlowAnalyzer() {
           }}>
             {[
               { label: "SEARCH TICKER",    val: filterTicker,   set: (v: string) => setFilterTicker(v.toUpperCase()),  ph: "BBCA",  w: 110, type: "text"   },
-              { label: "LAST VAL MIN (B)", val: filterMinVal,   set: setFilterMinVal,   ph: "e.g. 10",  w: 105, type: "number", hint: "1B=1" },
-              { label: "LAST VAL MAX (B)", val: filterMaxVal,   set: setFilterMaxVal,   ph: "e.g. 999", w: 105, type: "number" },
+              { label: "TURNOVER MIN (B)", val: filterMinVal,   set: setFilterMinVal,   ph: "e.g. 10",  w: 105, type: "number", hint: "1B=1" },
+              { label: "TURNOVER MAX (B)", val: filterMaxVal,   set: setFilterMaxVal,   ph: "e.g. 999", w: 105, type: "number" },
               { label: "DAY 0 MIN (%)",    val: filterMinDay0,  set: setFilterMinDay0,  ph: "-100", w: 90,  type: "number" },
               { label: "DAY 0 MAX (%)",    val: filterMaxDay0,  set: setFilterMaxDay0,  ph: "100",  w: 90,  type: "number" },
               { label: "DAILY CHG MIN (%)",val: filterMinChg,   set: setFilterMinChg,   ph: "-20",  w: 100, type: "number" },
@@ -247,19 +288,65 @@ export default function FlowAnalyzer() {
           </div>
         )}
 
+        {/* Refusal is a first-class state, shown instead of the table.
+            The scanner already returns 503 on a dead broker feed; this page used
+            to read the same frozen tables and render numbers anyway. */}
+        {stale && (
+          <div className="card" style={{ marginBottom: 16, borderLeft: "4px solid var(--accent-red)", padding: "16px 20px" }}>
+            <div style={{ fontWeight: 800, fontSize: 14, color: "var(--accent-red)", marginBottom: 6 }}>
+              ⛔ FLOW DATA STALE — no numbers are shown
+            </div>
+            <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.6 }}>
+              {stale.message || "Required broker inputs are not current."}
+            </div>
+            {stale.blocking?.length > 0 && (
+              <ul style={{ margin: "8px 0 0 18px", fontSize: 12, color: "var(--text-muted)" }}>
+                {stale.blocking.map((b, i) => <li key={i}>{b}</li>)}
+              </ul>
+            )}
+            {stale.signalDate && (
+              <div style={{ marginTop: 8, fontSize: 12, color: "var(--text-muted)" }}>
+                Newest session all required inputs agree on: <strong>{stale.signalDate}</strong>
+                {stale.limitedBy ? ` (limited by ${stale.limitedBy})` : ""}
+              </div>
+            )}
+          </div>
+        )}
+
+        {loadError && !stale && (
+          <div className="card" style={{ marginBottom: 16, borderLeft: "4px solid var(--accent-red)", padding: "12px 20px", fontSize: 12 }}>
+            ⚠️ Failed to load Flow Analyzer: {loadError}
+          </div>
+        )}
+
+        {/* Incomplete window is a warning, not a refusal: the values shown are
+            real, the WINDOW they span is not five consecutive sessions. */}
+        {!stale && meta.window?.complete === false && (
+          <div className="card" style={{ marginBottom: 16, borderLeft: "4px solid var(--accent-amber, #d29922)", padding: "12px 20px", fontSize: 12 }}>
+            ⚠️ <strong>5D FLOW INCOMPLETE</strong> — missing exchange session(s): {meta.window.missingSessions.join(", ")}.
+            The five columns are the five most recent broker rows, which is not the same as five consecutive sessions.
+          </div>
+        )}
+
         {/* Table */}
+        {!stale && (
         <div className="card" style={{ overflow: "hidden", marginBottom: selectedTicker ? 0 : 16 }}>
           <div style={{ overflowX: "auto" }}>
             <table className="data-table" style={{ minWidth: 900 }}>
               <thead>
                 <tr>
                   <Th k="ticker">TICKER</Th>
-                  <Th k="lastVal">LAST VAL</Th>
-                  <th colSpan={5} style={{ textAlign: "center", borderLeft: "1px solid var(--border)" }}>
-                    TOP 3 BROKER CONCENTRATION (%)
+                  <Th k="turnover">TURNOVER</Th>
+                  {/* Named for what the number is. "Concentration" hid the sign:
+                      +100, -90, +80 nets to +90, so this is directional dominance
+                      among the largest flows, not how concentrated they are. */}
+                  <th colSpan={5} style={{ textAlign: "center", borderLeft: "1px solid var(--border)" }}
+                      title={meta.metric?.definition}>
+                    TOP-3 SIGNED FLOW (%) <span style={{ fontWeight: 400, opacity: 0.7 }}>· + buyer-dominant / − seller-dominant</span>
                   </th>
-                  <Th k="dailyChange" style={{ borderLeft: "1px solid var(--border)" }}>DAILY CHANGE</Th>
-                  <Th k="price">MARKET PRICE</Th>
+                  <Th k="dailyChange" style={{ borderLeft: "1px solid var(--border)" }}>CHG @ FLOW</Th>
+                  <Th k="price">PRICE @ FLOW</Th>
+                  <th>CURRENT <span style={{ fontWeight: 400, opacity: 0.7 }}>(live)</span></th>
                   <th style={{ textAlign: "center" }}>DETAIL</th>
                 </tr>
                 <tr style={{ background: "rgba(255,255,255,0.02)" }}>
@@ -287,7 +374,12 @@ export default function FlowAnalyzer() {
                 ) : (
                   displayed.map((row, i) => {
                     const isSelected = selectedTicker === row.ticker;
-                    const days5 = row.days.length >= 5 ? row.days : [...Array(5 - row.days.length).fill(0), ...row.days];
+                    // NO ZERO-PADDING. A short array means sessions were not observed;
+                    // filling the gap with 0 fabricated "balanced flow" for days that
+                    // have no data at all. Pad with null and render it as a dash.
+                    const days5: (number | null)[] = row.days.length >= 5
+                      ? row.days
+                      : [...Array(5 - row.days.length).fill(null), ...row.days];
                     return (
                       <tr key={row.ticker} onClick={() => handleRowClick(row.ticker)} style={{
                         animation: `slide-up ${0.05 * i + 0.1}s ease both`,
@@ -300,21 +392,37 @@ export default function FlowAnalyzer() {
                             {row.ticker}
                           </span>
                         </td>
-                        <td style={{ color: "var(--text-secondary)", fontSize: 12 }}>{row.lastVal}</td>
+                        <td style={{ color: "var(--text-secondary)", fontSize: 12 }}>{row.turnover}</td>
                         {days5.map((d, di) => (
-                          <td key={di} style={{ textAlign: "center", fontWeight: 700, fontSize: 13, color: pctColor(d), background: pctBg(d), borderLeft: "1px solid var(--border)" }}>
-                            {d > 0 ? "+" : ""}{d.toFixed(2)}%
+                          <td key={di} title={d === null ? "No observation for this session" : undefined}
+                            style={{ textAlign: "center", fontWeight: 700, fontSize: 13,
+                                     color: d === null ? "var(--text-muted)" : pctColor(d),
+                                     background: d === null ? "transparent" : pctBg(d),
+                                     borderLeft: "1px solid var(--border)" }}>
+                            {d === null ? "—" : `${d > 0 ? "+" : ""}${d.toFixed(2)}%`}
                           </td>
                         ))}
                         <td style={{ borderLeft: "1px solid var(--border)" }}>
-                          <span style={{ fontWeight: 700, fontSize: 13, color: row.dailyChange > 0 ? "var(--accent-green)" : "var(--accent-red)" }}>
-                            {row.dailyChange > 0 ? "+" : ""}{row.dailyChange.toFixed(2)}%
+                          <span style={{ fontWeight: 700, fontSize: 13, color: (row.dailyChangeAtSnapshot ?? 0) > 0 ? "var(--accent-green)" : "var(--accent-red)" }}>
+                            {row.dailyChangeAtSnapshot === null ? "—"
+                              : `${row.dailyChangeAtSnapshot > 0 ? "+" : ""}${row.dailyChangeAtSnapshot.toFixed(2)}%`}
                           </span>
                         </td>
                         <td>
                           <span style={{ fontWeight: 600, color: "var(--text-primary)" }}>
-                            {row.price > 0 ? `Rp ${row.price.toLocaleString("id-ID")}` : "—"}
+                            {row.priceAtSnapshot ? `Rp ${row.priceAtSnapshot.toLocaleString("id-ID")}` : "—"}
                           </span>
+                        </td>
+                        <td title="Live quote — a DIFFERENT as-of date from the flow columns">
+                          <span style={{ fontWeight: 600, color: "var(--text-secondary)" }}>
+                            {row.currentPrice ? `Rp ${row.currentPrice.toLocaleString("id-ID")}` : "—"}
+                          </span>
+                          {row.sinceFlowPct !== null && (
+                            <span style={{ marginLeft: 6, fontSize: 11, fontWeight: 700,
+                                           color: row.sinceFlowPct > 0 ? "var(--accent-green)" : "var(--accent-red)" }}>
+                              {row.sinceFlowPct > 0 ? "+" : ""}{row.sinceFlowPct.toFixed(2)}%
+                            </span>
+                          )}
                         </td>
                         <td style={{ textAlign: "center" }}>
                           <span style={{
@@ -364,6 +472,7 @@ export default function FlowAnalyzer() {
             </div>
           </div>
         </div>
+        )}
 
         {/* Detail panel */}
         {selectedTicker && (

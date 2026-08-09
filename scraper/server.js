@@ -1101,112 +1101,199 @@ app.get('/api/stock-prices', async (req, res) => {
   });
 });
 
-// ─── FLOW ANALYZER — Top broker concentration per stock ──────────────────────
-// PRIMARY: uses pre-pulled FT.id concentration (exact match)
-// FALLBACK: calculates from raw broker data if FT.id data not available
+// ─── FLOW ANALYZER R2-A — signed top-3 broker flow per stock ─────────────────
+//
+// WHAT R2-A CHANGES, AND WHAT IT DELIBERATELY DOES NOT (2026-08-09 review).
+//
+// The signed-flow formula itself is untouched. Every change here is to the DATA
+// CONTRACT: which session the numbers are for, what happens when an input is
+// absent, and what the response is allowed to claim about where the values came
+// from. Model semantics — canonical 5-session windows, RG vs RG+NG versioning —
+// are R2-B, because those move concentration VALUES and therefore F1/F2 and
+// strategy comparability.
+//
+// The three defects that made the old page untrustworthy for a same-session
+// read, all verified in the code it replaces:
+//
+//  1. THREE CLOCKS PRESENTED AS ONE. `latestDate` came from
+//     MAX(idx_broker_summary.date), `concDate` separately from
+//     MAX(idx_concentration.data_date), and price from a LIVE Yahoo quote —
+//     then the response emitted a single `date` and the UI rendered
+//     "DATA PER <date>". With the broker feed frozen on 31 July and Yahoo
+//     current, a +18% flow from July sat in the same row as today's price and
+//     looked like one observation.
+//  2. NO READINESS GATE. /api/signal-scanner refuses at 503 when the broker
+//     feed is stale; this endpoint read the same frozen tables and rendered
+//     numbers anyway. Two screens, same dead input, opposite answers.
+//  3. MISSING BECAME ZERO. `hasFTData` was true if ANY ticker had a row, the
+//     fallback was then skipped entirely, and every ticker absent from the map
+//     got [0,0,0,0,0]. `v ?? 0` did the same to NULL columns. Zero is not
+//     absence — it reads as "balanced flow", a real and different claim.
 app.get('/api/flow-analyzer', async (req, res) => {
   try {
-    const [dateRows] = await pool.query('SELECT DISTINCT date FROM idx_broker_summary ORDER BY date DESC LIMIT 5');
-    if (dateRows.length === 0) return res.json({ data: [], source: 'empty' });
-
     const toStr = d => (d instanceof Date ? d.toISOString().split('T')[0] : String(d).split('T')[0]);
-    const dates      = dateRows.map(r => r.date);
-    const latestDate = toStr(dates[0]);
 
-    // Get top stocks by total BUY VALUE on latest date (matches FT.id LAST VAL)
+    // ── 1. READINESS, before anything is read ────────────────────────────────
+    // Same contract and same constant as the scanner, so the two cannot
+    // disagree about whether the broker pipeline is alive.
+    const ready = await systemHealth.readiness(pool, {
+      subsystems: [systemHealth.SUBSYSTEM.SIGNAL_ENGINE],
+    });
+    if (!ready.enabled) {
+      return res.status(503).json({
+        data: [], stale: true, source: 'stale-broker-feed',
+        error: 'FLOW_DATA_STALE',
+        blocking: ready.blocking,
+        signalDate: ready.signalDate,
+        limitedBy: ready.limitedBy,
+        message: `Flow Analyzer needs current broker and concentration data. ` +
+          `Blocking: ${ready.blocking.join('; ')}. Numbers are not rendered on inputs this stale — ` +
+          `a flow reading dated today from a feed that stopped is worse than no reading.`,
+      });
+    }
+    // DEGRADED does not stop output, but it must travel with it.
+    const degraded = ready.degradedMode ? ready.degraded : [];
+
+    // ── 2. ONE as-of date for flow AND concentration ─────────────────────────
+    // The newest session BOTH tables actually have. Taking each table's own
+    // MAX independently is what let the two drift apart silently.
+    const [[alignRow]] = await pool.query(`
+      SELECT MAX(b.date) AS d
+      FROM (SELECT DISTINCT date FROM idx_broker_summary) b
+      WHERE EXISTS (SELECT 1 FROM idx_concentration c WHERE c.data_date = b.date)
+    `);
+    const [[brokerMaxRow]] = await pool.query('SELECT MAX(date) d FROM idx_broker_summary');
+    const analysisDate = alignRow?.d ? toStr(alignRow.d) : (brokerMaxRow?.d ? toStr(brokerMaxRow.d) : null);
+    if (!analysisDate) return res.json({ data: [], source: 'empty' });
+
+    // The five dates the stored dn0..dn4 actually came from. Still "last five
+    // broker rows", not five canonical sessions — correcting that moves values
+    // and is R2-B. What R2-A can do without touching a number is SAY so, so the
+    // window is never silently assumed contiguous.
+    const [dateRows] = await pool.query(
+      'SELECT DISTINCT date FROM idx_broker_summary WHERE date <= ? ORDER BY date DESC LIMIT 5', [analysisDate]);
+    const windowDates = dateRows.map(r => toStr(r.date)).reverse();  // H-4 .. H0
+    let windowComplete = null, windowMissing = [];
+    try {
+      const c = await systemHealth.assertCompleteSessions(pool, {
+        table: 'idx_broker_summary', col: 'date', endSession: analysisDate, count: 5,
+      });
+      windowComplete = c.complete;
+      windowMissing = c.missingSessions;
+    } catch { /* completeness is reported, never a precondition, in R2-A */ }
+
+    // ── 3. Turnover, not "LAST VAL" ──────────────────────────────────────────
+    // This column was SUM(buy_val) while idx_concentration.last_val — the field
+    // the liquidity filter uses — is SUM(buy_val + sell_val). Two different
+    // quantities under one ambiguous label. Named for what it is.
     const [stockRows] = await pool.query(`
-      SELECT stock_code, SUM(buy_val) as total_val
+      SELECT stock_code,
+             SUM(buy_val + sell_val) AS turnover,
+             SUM(buy_val)            AS buy_value
       FROM idx_broker_summary WHERE date = ?
-      GROUP BY stock_code ORDER BY total_val DESC
-    `, [latestDate]);
-
+      GROUP BY stock_code ORDER BY turnover DESC
+    `, [analysisDate]);
     const tickers = stockRows.map(r => r.stock_code);
 
-    // ── PRIMARY: Check FT.id pre-pulled concentration ────────────────────────
-    // Use MAX(data_date) from idx_concentration — may be newer than broker summary date
-    const [[concDateRow]] = await pool.query('SELECT MAX(data_date) d FROM idx_concentration');
-    const concDate = concDateRow?.d ? toStr(concDateRow.d) : latestDate;
     const [concRows] = await pool.query(
       'SELECT stock_code, dn0, dn1, dn2, dn3, dn4 FROM idx_concentration WHERE data_date = ?',
-      [concDate]
+      [analysisDate]
     );
     const concMap = Object.fromEntries(concRows.map(r => [r.stock_code, r]));
-    const hasFTData = concRows.length > 0;
 
-    // ── FALLBACK: Calculate from raw broker data ──────────────────────────────
-    const calcConc = {};
-    if (!hasFTData) {
-      for (const stock of stockRows) {
-        const ticker = stock.stock_code;
-        calcConc[ticker] = [];
-        for (const d of dates) {
-          const [brokers] = await pool.query(`
-            SELECT (buy_val - sell_val) AS net
-            FROM idx_broker_summary WHERE date = ? AND stock_code = ?
-            ORDER BY ABS(buy_val - sell_val) DESC LIMIT 3
-          `, [d, ticker]);
-          const [totRow] = await pool.query(`
-            SELECT SUM(ABS(buy_val - sell_val)) AS total_net
-            FROM idx_broker_summary WHERE date = ? AND stock_code = ?
-          `, [d, ticker]);
-          const net = brokers.reduce((a, b) => a + Number(b.net), 0);
-          const tot = Number(totRow[0]?.total_net) || 1;
-          calcConc[ticker].push((net / tot) * 100);
-        }
-        calcConc[ticker].reverse();
-      }
-    }
-
-    // ── Prices from Yahoo Finance ─────────────────────────────────────────────
+    // ── 4. Price AT THE SNAPSHOT, plus current price as a separate quantity ───
+    // The snapshot price comes from the EOD session series so it shares the
+    // flow's as-of date. The live quote is still useful — as its own column,
+    // with the move since the snapshot made explicit rather than implied by
+    // sitting next to a July flow number.
+    const [snapPrices] = await pool.query(
+      `SELECT stock_code, close_price, change_pct FROM idx_stock_prices WHERE date = ?`, [analysisDate]);
+    const snapMap = Object.fromEntries(snapPrices.map(r => [r.stock_code, r]));
+    const [[pxMaxRow]] = await pool.query('SELECT MAX(date) d FROM idx_stock_prices');
+    const latestPriceDate = pxMaxRow?.d ? toStr(pxMaxRow.d) : null;
     const yfMap = await fetchYahooPrices(tickers);
-    const [vwapLatest] = await pool.query(`
-      SELECT stock_code, ROUND(SUM(buy_avg * buy_lot) / NULLIF(SUM(buy_lot), 0), 0) AS vwap
-      FROM idx_broker_summary WHERE date = ? AND buy_avg > 0 GROUP BY stock_code
-    `, [latestDate]);
-    const [vwapPrev] = dates.length > 1 ? await pool.query(`
-      SELECT stock_code, ROUND(SUM(buy_avg * buy_lot) / NULLIF(SUM(buy_lot), 0), 0) AS vwap
-      FROM idx_broker_summary WHERE date = ? AND buy_avg > 0 GROUP BY stock_code
-    `, [toStr(dates[1])]) : [[]];
-    const vwapMap     = Object.fromEntries(vwapLatest.map(r => [r.stock_code, Number(r.vwap)]));
-    const vwapPrevMap = Object.fromEntries(vwapPrev.map(r  => [r.stock_code, Number(r.vwap)]));
 
-    // ── Build result ──────────────────────────────────────────────────────────
+    // ── 5. Build result — NULL is preserved, never rendered as 0 ─────────────
     const result = [];
     for (const stock of stockRows) {
       const ticker = stock.stock_code;
-      const yf     = yfMap[ticker];
-      const price  = yf?.price || vwapMap[ticker] || 0;
-      const changePct = yf?.changePct !== undefined
-        ? yf.changePct
-        : (vwapPrevMap[ticker] > 0 ? ((vwapMap[ticker] - vwapPrevMap[ticker]) / vwapPrevMap[ticker]) * 100 : 0);
-
-      // ─ Use FT.id concentration (exact) or fallback to calculated ─
-      const ft   = concMap[ticker];
+      const ft = concMap[ticker];
+      // null means "no observation". 0 means "observed, and balanced". The old
+      // code could not express the difference and always chose the second.
       const days = ft
-        ? [ft.dn4, ft.dn3, ft.dn2, ft.dn1, ft.dn0].map(v => v ?? 0)
-        : (calcConc[ticker] || [0, 0, 0, 0, 0]);
+        ? [ft.dn4, ft.dn3, ft.dn2, ft.dn1, ft.dn0].map(v => (v === null || v === undefined ? null : Number(v)))
+        : [null, null, null, null, null];
+
+      const snap = snapMap[ticker];
+      const priceAtSnapshot = snap ? Number(snap.close_price) : null;
+      const yf = yfMap[ticker];
+      const currentPrice = yf?.price ?? null;
+      const sinceFlowPct = (priceAtSnapshot && currentPrice)
+        ? Math.round(((currentPrice - priceAtSnapshot) / priceAtSnapshot) * 10000) / 100
+        : null;
 
       result.push({
         ticker,
-        lastVal:     formatVal(Number(stock.total_val)),
+        turnover:     formatVal(Number(stock.turnover)),
+        turnoverRaw:  Number(stock.turnover),
+        buyValue:     formatVal(Number(stock.buy_value)),
         days,
-        dailyChange: Math.round(changePct * 100) / 100,
-        price,
-        priceSource: yf ? 'yahoo' : 'vwap',
-        concSource:  ft ? 'flowtracker.id' : 'calculated',
+        observedDays: days.filter(v => v !== null).length,
+        // Same as-of as the flow. This is the number to compare against days[].
+        priceAtSnapshot,
+        dailyChangeAtSnapshot: snap?.change_pct === null || snap?.change_pct === undefined
+          ? null : Math.round(Number(snap.change_pct) * 100) / 100,
+        // A DIFFERENT as-of, labelled as such.
+        currentPrice,
+        currentPriceDate: yf ? 'live' : null,
+        sinceFlowPct,
       });
     }
 
     res.json({
-      data:    result,
-      date:    concDate || latestDate,
-      dates:   dates.map(toStr),
-      source:  hasFTData ? 'flowtracker.id+yahoo' : 'calculated+yahoo',
-      ftData:  hasFTData,
+      data: result,
+      // ── 6. Provenance, stated only as far as it can be proven ─────────────
+      // The old response claimed concSource 'flowtracker.id' and source
+      // 'flowtracker.id+yahoo'. That account has been banned and its pull
+      // retired; these values are computed by /api/calc-concentration from our
+      // own broker tables. The old label attributed our own model's output to a
+      // third party, which is the worst kind of provenance error — it makes an
+      // internal heuristic look like an external measurement.
+      analysisDate,
+      flowDate: analysisDate,
+      concentrationDate: analysisDate,
+      priceDate: analysisDate,
+      latestPriceDate,
+      flowSource: 'idx_broker_summary',
+      concentrationSource: 'internal-calc',
+      priceSource: 'idx_stock_prices',
+      currentPriceSource: 'yahoo',
+      metric: {
+        name: 'TOP-3 SIGNED FLOW (%)',
+        definition: 'Signed net flow of the 3 largest ABSOLUTE broker flows, divided by total absolute broker flow.',
+        // Named precisely because the sign matters: +100, -90, +80 sums to +90,
+        // so this measures directional dominance among the largest flows, not
+        // "concentration". And per EXP-016 in this repo, persistent broker
+        // accumulation has historically preceded UNDERperformance — so the UI
+        // must read this as an observation, never as a buy/sell recommendation.
+        positive: 'buyer-dominant flow',
+        negative: 'seller-dominant flow',
+      },
+      // NOT recorded per row yet — the concentration writer blends RG with NG at
+      // a 0.6 heuristic weight and stores no marker of which path ran. Claiming
+      // a model id here would be inventing the provenance this release exists to
+      // fix. Recording it is R2-B item 4.
+      concentrationModel: null,
+      concentrationModelNote: 'per-row model/version not recorded yet (R2-B). Values are internally computed, RG or RG+NG blended.',
+      window: { dates: windowDates, complete: windowComplete, missingSessions: windowMissing },
+      degraded,
+      source: 'internal-calc+idx_stock_prices',
     });
   } catch (err) {
     console.error('Flow analyzer error:', err.message);
-    res.json({ data: [], error: err.message });
+    // 500, not a 200 carrying an error string. A caller that only checks
+    // res.ok would previously render an empty table as a successful "no flow".
+    res.status(500).json({ data: [], error: err.message });
   }
 });
 
