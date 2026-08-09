@@ -2204,6 +2204,43 @@ function delay(ms) {
 }
 
 // ─── Index Alpha API Integration ─────────────────────────────────────────────
+/**
+ * Upstream API failures seen during the current process lifetime, and the last
+ * one persisted so it survives a restart.
+ *
+ * WHY (2026-08-09). fetchIndexAlpha collapsed every HTTP error into an empty
+ * array. The nightly cron then reported "0 total records" — indistinguishable
+ * from a quiet market — while Index Alpha was returning 403 "Account monthly
+ * API limit exceeded" on every call. Nine days of that produced a firm,
+ * documented, and WRONG conclusion: that the broker data source had been lost
+ * with the banned flowtracker.id account. It had not; the quota had run out.
+ *
+ * This is the same disease as every other entry in modules/system_health.js —
+ * a job that fails while reporting success — so it gets the same treatment:
+ * recorded to the durable registry, where the watchdog looks.
+ */
+const apiFailures = new Map();   // service -> { status, detail, count, firstAt, lastAt }
+
+function apiFailure(service, status, detail) {
+  const now = new Date().toISOString();
+  const prev = apiFailures.get(service);
+  apiFailures.set(service, {
+    status, detail,
+    count: (prev?.count || 0) + 1,
+    firstAt: prev?.firstAt || now,
+    lastAt: now,
+  });
+  // Persist the FIRST failure of each burst immediately. Waiting for the run to
+  // finish would lose it if the process dies mid-pull, which is exactly when
+  // the record matters most.
+  if (!prev) {
+    systemHealth.recordJobRun(pool, {
+      job: `api:${service}`, status: 'FAILED',
+      error: `HTTP ${status}: ${detail}`,
+    }).catch(() => { /* recording must never break the pull */ });
+  }
+}
+
 async function fetchIndexAlpha(ticker, fromDate, toDate, investor = 'all', market = null) {
   const marketQs = market ? `&market=${market}` : '';
   const url = `${INDEX_ALPHA_BASE}/stocks/broker-summary?ticker=${ticker}&from=${fromDate}&to=${toDate || fromDate}&investor=${investor}${marketQs}`;
@@ -2218,6 +2255,21 @@ async function fetchIndexAlpha(ticker, fromDate, toDate, investor = 'all', marke
     if (!resp.ok) {
       const text = await resp.text();
       console.log(`    ❌ HTTP ${resp.status}: ${text.slice(0, 100)}`);
+      // THE FAILURE IS RECORDED, NOT JUST LOGGED (2026-08-09).
+      //
+      // Returning [] here made "the upstream account is refusing us" identical
+      // to "there was no trading that day", and the only trace was a console
+      // line. That cost nine days: from 2026-07-31 the API answered
+      //   403 {"detail":"Account monthly API limit exceeded"}
+      // on every request, the cron dutifully reported "0 total records", and
+      // the whole system concluded the broker SOURCE was gone — a conclusion
+      // that reached the review brief and drove a search for a replacement
+      // vendor. The endpoint had been telling us the real reason all along and
+      // this function threw it away.
+      //
+      // A caller still gets [] so no ingest path changes behaviour, but the
+      // reason is now durable and the watchdog can see it.
+      apiFailure('indexalpha', resp.status, text.slice(0, 200));
       return [];
     }
     const json = await resp.json();
@@ -2519,13 +2571,28 @@ async function runDailyCron(dateOverride) {
   // trace at all: `cronStatus` is in-process and dies with the restart. The
   // startup catch-up below reads this to avoid re-running a pull that already
   // finished, which it could not previously know.
+  // ZERO RECORDS IS NOT SUCCESS WHEN THE UPSTREAM WAS REFUSING US.
+  // The run that produced "0 total records for 2026-08-06" recorded itself as
+  // healthy while every single API call came back 403. A job that cannot get
+  // its input has failed, and must say so.
+  const apiErr = apiFailures.get('indexalpha');
+  const pullFailed = results.totalRecords === 0 && !!apiErr;
   try {
     await systemHealth.recordJobRun(pool, {
-      job: 'nightly_cron', status: 'OK',
+      job: 'nightly_cron', status: pullFailed ? 'FAILED' : 'OK',
       durationMs: Date.now() - new Date(results.started || results.completed).getTime(),
       records: results.totalRecords, dataDate: date,
+      error: pullFailed
+        ? `upstream indexalpha refused ${apiErr.count} call(s): HTTP ${apiErr.status}: ${apiErr.detail}`
+        : null,
     });
   } catch (_) { /* recording must never break the job it records */ }
+  if (apiErr) {
+    console.log(`  ⚠️  [CRON] indexalpha returned HTTP ${apiErr.status} on ${apiErr.count} call(s): ${apiErr.detail}`);
+    console.log('     "0 records" here means the API refused us, NOT that the market was quiet.');
+    results.apiFailure = apiErr;
+  }
+  apiFailures.delete('indexalpha');
   cronRunning = false;
   cronStatus = { lastRun: results.completed, lastResult: results, nextRun: getNextCronTime(), running: false };
   console.log(`\n✅ [CRON] Complete! ${results.totalRecords} total records for ${date}\n`);
@@ -2988,8 +3055,30 @@ app.get('/api/indexalpha/pull', requireAdminKey, async (req, res) => {
   }
   
   try {
+    apiFailures.delete('indexalpha');     // scope the report to THIS call
     const saved = await pullStockFromIndexAlpha(ticker, date);
-    res.json({ success: true, ticker, date, recordsSaved: saved, source: 'IndexAlpha' });
+    const err = apiFailures.get('indexalpha');
+    // This is the diagnostic probe, so it must never answer `success: true`
+    // for a call the upstream refused. It did exactly that — 0 records and a
+    // cheerful success flag — which is the shape that let a 403 read as "no
+    // data for that day" for nine days.
+    if (err) {
+      apiFailures.delete('indexalpha');
+      return res.status(502).json({
+        success: false, ticker, date, recordsSaved: 0, source: 'IndexAlpha',
+        upstreamStatus: err.status, upstreamDetail: err.detail,
+        error: `Index Alpha refused the request: HTTP ${err.status}`,
+        interpretation: err.status === 401 || err.status === 403 ? 'API key or account (quota/billing/permissions)'
+          : err.status === 429 ? 'rate limit'
+          : err.status >= 500 ? 'Index Alpha service'
+          : 'unexpected upstream status',
+      });
+    }
+    res.json({
+      success: true, ticker, date, recordsSaved: saved, source: 'IndexAlpha',
+      // 0 rows with no upstream error is a genuine "no data for that day".
+      note: saved === 0 ? 'upstream answered OK with no rows for this ticker/date' : undefined,
+    });
   } catch (err) {
     res.json({ error: err.message });
   }
