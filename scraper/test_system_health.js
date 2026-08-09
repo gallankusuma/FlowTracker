@@ -81,7 +81,14 @@ function makePool(spec) {
 }
 
 // Pinned so these assertions do not start failing as real time passes.
-const CLOCK = new Date('2026-07-31T12:00:00Z');
+//
+// 13:50 UTC = 20:50 WIB, the hour the watchdog actually judges the system —
+// after the 12:30 broker publication and the 13:00 deadline. It used to be
+// 12:00, which made the "healthy baseline" fixture describe an impossible
+// state: every feed dated 2026-07-31 at a moment before 2026-07-31's data could
+// exist. The PREMATURE check caught it, which is the check doing its job on the
+// fixture rather than the fixture proving the check wrong.
+const CLOCK = new Date('2026-07-31T13:50:00Z');
 const ALL_FRESH = {
   tables: { idx_stock_prices: '2026-07-31', idx_broker_summary: '2026-07-31',
             idx_concentration: '2026-07-31', idx_broker_flow_detail: '2026-07-31',
@@ -288,6 +295,35 @@ const ALL_FRESH = {
       assert.strictEqual(r.valid, true);
     });
 
+    // The exemption written for the legitimate 19:30-20:00 WIB window must not
+    // become a door for a bar dated to a session that is still trading. This is
+    // an END-OF-DAY feed; 10:00 WIB data for today cannot be real.
+    await atest('a today-dated bar BEFORE the publication window is PREMATURE', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-07-31';
+      // 03:00 UTC = 10:00 WIB, session still trading.
+      const r = await sh.brokerFreshness(makePool(spec), { asOf: at('2026-07-31T03:00:00Z') });
+      assert.strictEqual(r.state, sh.BROKER_FRESHNESS.PREMATURE, JSON.stringify(r));
+      assert.strictEqual(r.valid, false);
+    });
+
+    await atest('the same bar AFTER publication opens is CURRENT', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-07-31';
+      const r = await sh.brokerFreshness(makePool(spec), { asOf: at('2026-07-31T12:31:00Z') });
+      assert.strictEqual(r.state, sh.BROKER_FRESHNESS.CURRENT, JSON.stringify(r));
+      assert.strictEqual(r.valid, true);
+    });
+
+    await atest('PREMATURE also refuses through readiness', async () => {
+      const spec = base();
+      spec.tables.idx_broker_summary = '2026-07-31';
+      const r = await sh.readiness(makePool(spec), {
+        subsystems: [sh.SUBSYSTEM.SIGNAL_ENGINE], today: at('2026-07-31T03:00:00Z') });
+      assert.strictEqual(r.enabled, false, JSON.stringify(r.blocking));
+      assert.ok(r.blocking.some(b => b.includes('PREMATURE')), JSON.stringify(r.blocking));
+    });
+
     await atest('an ordinary current feed is CURRENT', async () => {
       const r = await sh.brokerFreshness(makePool(base()), { asOf: at('2026-07-31T13:50:00Z') });
       assert.strictEqual(r.state, sh.BROKER_FRESHNESS.CURRENT, JSON.stringify(r));
@@ -320,6 +356,29 @@ const ALL_FRESH = {
         subsystems: [sh.SUBSYSTEM.SIGNAL_ENGINE], today: at('2026-07-31T13:50:00Z') });
       const brokerReasons = r.blocking.filter(b => b.startsWith('broker:'));
       assert.strictEqual(brokerReasons.length, 1, JSON.stringify(r.blocking));
+    });
+  }
+
+  console.log('\nassertCompleteSessions validates SQL identifiers (review P2)');
+  {
+    const pool = makePool(ALL_FRESH);
+    const bad = [
+      { table: 'x; DROP TABLE users--', col: 'date' },
+      { table: 'idx_stock_prices', col: 'date) OR 1=1--' },
+      { table: 'idx_stock_prices', col: 'date', calendar: 'a b' },
+      { table: 'idx_stock_prices', col: 'date', requiredFields: ['ok', 'bad-name'] },
+    ];
+    for (const [i, opts] of bad.entries()) {
+      await atest(`rejects hostile identifier #${i + 1}`, async () => {
+        await assert.rejects(
+          () => sh.assertCompleteSessions(pool, { count: 5, ...opts }),
+          /not a valid SQL identifier/);
+      });
+    }
+    await atest('accepts ordinary identifiers', async () => {
+      // Reaches the query layer rather than throwing on validation.
+      await sh.assertCompleteSessions(pool, {
+        table: 'idx_stock_prices', col: 'date', count: 5, requiredFields: ['close_price'] });
     });
   }
 

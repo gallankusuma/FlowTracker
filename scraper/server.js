@@ -6441,43 +6441,42 @@ app.get('/api/signal-scanner', async (req, res) => {
     // ones built on absent inputs — worse than stale, because stale is at least
     // true of some day. Refusing is the honest option: say which day we can
     // actually see, and how far behind that is.
-    // TIME-AWARE, not merely session-aware (review P1, 2026-08-09).
+    // ONE READINESS CONTRACT, NOT A SECOND IMPLEMENTATION (review, 2026-08-09).
     //
-    // The tolerance is 0 sessions, and that is right for a consumer running
-    // after the nightly pipeline. This endpoint is not one: a human can open it
-    // at 10:00 WIB while the session is still trading and today's EOD pull is
-    // nine hours away. Comparing against the LATEST session would call the feed
-    // dead for a session nobody has promised data for yet.
+    // This endpoint used to count sessions itself:
     //
-    // So the comparison is against the latest session whose pipeline window has
-    // actually closed. Until now this happened to be safe only because
-    // refresh_ihsg does not write today's index bar until 20:05 WIB, so the
-    // calendar did not yet know about today — correct by cron timing rather than
-    // by contract, and one schedule edit away from a 503 every morning.
-    const expectedSession = await systemHealth.expectedBrokerSession(pool);
-    const [sessRows] = await pool.query(
-      'SELECT date FROM idx_ihsg_history WHERE date > ? AND date <= ? ORDER BY date ASC',
-      [latestDate, expectedSession || latestDate]);
-    const sessionsBehind = sessRows.length;
-    // ONE CANONICAL TOLERANCE. This was a literal `1` while the freshness table
-    // said 2 and the burn-in gate said 1 by a different route — three answers to
-    // one question, none of them derived. systemHealth.BROKER_DATA_MAX_LAG_SESSIONS
-    // is 0, measured from arrival times: the broker pull is the first write of
-    // the 19:30 WIB job, so any lag at all means it did not run. The derivation
-    // is in modules/system_health.js and must be re-done, not edited, if the
-    // pipeline schedule changes.
-    if (sessionsBehind > systemHealth.BROKER_DATA_MAX_LAG_SESSIONS) {
+    //     SELECT date FROM idx_ihsg_history
+    //      WHERE date > latestBrokerDate AND date <= expectedSession
+    //
+    // and refuse when the count exceeded the tolerance. That is a correct test
+    // for LATENESS and blind to everything else — which is exactly the hole the
+    // central primitive was built to close, and I left this call site on the old
+    // path while claiming in the commit message that no consumer had its own
+    // definition any more.
+    //
+    // The bypass is concrete: with a Saturday or future-dated broker bar, the
+    // range `date > <invalid>` matches no rows, sessionsBehind computes to 0,
+    // and the scanner passes — while Flow Analyzer and the burn-in, which do go
+    // through readiness(), refuse the same database. Three consumers, one feed,
+    // two verdicts.
+    const ready = await systemHealth.readiness(pool, {
+      subsystems: [systemHealth.SUBSYSTEM.SIGNAL_ENGINE],
+    });
+    if (!ready.enabled) {
+      const bf = ready.brokerFreshness;
       return res.status(503).json({
         data: [], date: latestDate, source: 'stale-broker-feed',
         stale: true,
-        sessionsBehind,
-        latestBrokerDate: latestDate,
-        expectedBrokerDate: expectedSession,
-        latestSessionDate: toStr(sessRows[sessRows.length - 1].date),
-        error: `Broker data stops at ${latestDate}, ${sessionsBehind} exchange session(s) behind ` +
-               `${expectedSession}, which is the newest session whose EOD pipeline window has closed. ` +
-               `Scores are not computed: concentration and flow factors have no data past that date, ` +
-               `so a score dated today would be built on inputs that do not exist.`,
+        brokerState: bf?.state || null,
+        sessionsBehind: bf?.sessionsBehind ?? null,
+        latestBrokerDate: bf?.latest ?? latestDate,
+        expectedBrokerDate: bf?.expected ?? null,
+        signalDate: ready.signalDate,
+        limitedBy: ready.limitedBy,
+        blocking: ready.blocking,
+        error: `Broker inputs are not usable: ${ready.blocking.join('; ')}. ` +
+               `Scores are not computed — concentration and flow factors have no data for the ` +
+               `session a score would be dated to, so the score would be built on inputs that do not exist.`,
       });
     }
 

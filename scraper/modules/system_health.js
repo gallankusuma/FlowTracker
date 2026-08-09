@@ -251,7 +251,7 @@ async function expectedBrokerSession(pool, asOf = new Date()) {
  */
 const BROKER_FRESHNESS = {
   CURRENT: 'CURRENT', STALE: 'STALE', FUTURE: 'FUTURE',
-  NON_SESSION: 'NON_SESSION', NO_DATA: 'NO_DATA',
+  NON_SESSION: 'NON_SESSION', PREMATURE: 'PREMATURE', NO_DATA: 'NO_DATA',
 };
 
 async function brokerFreshness(pool, { asOf = new Date(), table = 'idx_broker_summary', col = 'date' } = {}) {
@@ -307,8 +307,19 @@ async function brokerFreshness(pool, { asOf = new Date(), table = 'idx_broker_su
              detail: `${latest} is a weekday the exchange did not trade — the index has no bar for it, so no broker data can legitimately be dated to it` };
   }
 
-  // Ahead of `expected` but not ahead of today: the evening window above.
+  // Ahead of `expected` but not ahead of today. Correcting the FUTURE rule to
+  // allow the evening window made this branch too permissive in the other
+  // direction: it accepted a bar for TODAY at any hour, including 10:00 WIB,
+  // when this is an END-OF-DAY feed whose earliest legitimate publication is
+  // 12:30 UTC / 19:30 WIB. A today-dated bar before the session has even closed
+  // is not early data, it is implausible data — the same class of fault as a
+  // future date, arriving through the exemption written for the legitimate case.
   if (latest > expected) {
+    const publishFrom = Date.parse(`${latest}T00:00:00Z`) + BROKER_PIPELINE_CUTOFF_UTC_MINUTES * 60000;
+    if (asOf.getTime() < publishFrom) {
+      return { state: BROKER_FRESHNESS.PREMATURE, valid: false, latest, expected, sessionsBehind: 0,
+               detail: `${latest} carries broker data before its EOD publication window opens (${new Date(publishFrom).toISOString()}). This feed is end-of-day; a bar for a session still trading cannot be real` };
+    }
     return { state: BROKER_FRESHNESS.CURRENT, valid: true, latest, expected, sessionsBehind: 0,
              detail: `current (${latest} landed ahead of the ${expected} deadline)` };
   }
@@ -366,6 +377,27 @@ async function assertCompleteSessions(pool, {
   requiredFields = [], calendar = 'idx_ihsg_history', calendarCol = 'date',
 } = {}) {
   if (!table || !col) throw new Error('assertCompleteSessions: table and col are required');
+
+  // IDENTIFIERS ARE VALIDATED, NOT TRUSTED (review P2).
+  //
+  // Table, column and requiredFields are interpolated into SQL because MySQL
+  // cannot parameterise identifiers. Every caller today is internal, so this is
+  // hardening rather than an open hole — but this is deliberately a REUSABLE
+  // primitive, offered to Pattern Replay, research windows and backtests, and
+  // the next caller may well pass something derived from a request. A guard
+  // that only holds while everyone remembers the rule is not a guard.
+  const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
+  for (const [label, value] of [['table', table], ['col', col],
+                                ['calendar', calendar], ['calendarCol', calendarCol]]) {
+    if (!IDENT.test(String(value))) {
+      throw new Error(`assertCompleteSessions: ${label} '${value}' is not a valid SQL identifier`);
+    }
+  }
+  for (const f of requiredFields) {
+    if (!IDENT.test(String(f))) {
+      throw new Error(`assertCompleteSessions: requiredFields entry '${f}' is not a valid SQL identifier`);
+    }
+  }
 
   if (!endSession) {
     const [[e]] = await pool.query(`SELECT MAX(${calendarCol}) d FROM ${calendar}`);
