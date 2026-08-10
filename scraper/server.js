@@ -6908,6 +6908,154 @@ app.get('/api/signal-scanner', async (req, res) => {
 // returns that day's saved rows. Some fields the live endpoint returns
 // (tradePlan, weeklyTrend, trendAligned, convictionTier) aren't stored per
 // row and are intentionally omitted here rather than faked.
+/**
+ * GET /api/signal-scanner/ticker/:ticker/factor-history?range=10D
+ *
+ * Per-ticker factor history for the DETAIL panel. Reads stored snapshots and
+ * computes NOTHING — the scoring engine, weights, composite and signal logic
+ * are untouched, which is the whole point of the feature's scope.
+ *
+ * REUSES idx_signal_history rather than adding factor_score_history. That table
+ * already stores exactly this shape — f1..f14, composite, signal, confidence,
+ * price, one row per (data_date, stock_code) under a UNIQUE key — so a second
+ * table would be duplicate storage that could disagree with the first.
+ *
+ * THE DATE AXIS COMES FROM THE EXCHANGE CALENDAR, NOT FROM AVAILABLE ROWS.
+ * This is the failure this codebase has now been bitten by three times: "10D"
+ * must mean ten consecutive canonical sessions, not ten rows that happen to
+ * exist. Snapshots are currently written as a side effect of someone opening
+ * /api/signal-scanner, so history has real holes — 2026-08-03..06 have none at
+ * all (the scanner was correctly refusing during the broker outage), and
+ * 07-17/20/21 carry only 144 of 245 tickers. A window built from available rows
+ * would silently span twelve calendar days while labelled "10D", and each
+ * missing day would shift every column beside it.
+ *
+ * So every session in the range is returned, and one without a snapshot comes
+ * back with `observed: false` and null factors. Missing is not zero, and it is
+ * not absent either — it is a dash the reader can see.
+ */
+app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) => {
+  try {
+    const ticker = String(req.params.ticker || '').toUpperCase().trim();
+    if (!/^[A-Z0-9.]{1,12}$/.test(ticker)) {
+      return res.status(400).json({ error: 'Invalid ticker' });
+    }
+    // Ranges are expressed in SESSIONS. "1M" is ~20 trading days, not 30
+    // calendar days — the axis is the exchange calendar throughout.
+    const RANGES = { '5D': 5, '10D': 10, '20D': 20, '1M': 20 };
+    const range = String(req.query.range || '10D').toUpperCase();
+    const count = RANGES[range];
+    if (!count) {
+      return res.status(400).json({ error: `Unknown range '${range}'`, allowed: Object.keys(RANGES) });
+    }
+
+    const [[calRow]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+    const endSession = calRow?.d ? toDateStr(calRow.d) : null;
+    if (!endSession) return res.status(503).json({ error: 'NO_SESSION_CALENDAR' });
+
+    const [sessRows] = await pool.query(
+      'SELECT date FROM idx_ihsg_history WHERE date <= ? ORDER BY date DESC LIMIT ?',
+      [endSession, count]);
+    const sessions = sessRows.map(r => toDateStr(r.date)).reverse();   // oldest first
+    if (!sessions.length) return res.json({ ticker, range, history: [], latest: null });
+
+    const [snapRows] = await pool.query(
+      `SELECT data_date, composite_score, signal_type, confidence, price_at_signal, data_source,
+              f1_concentration, f2_trend, f3_volume_z, f4_momentum, f5_rel_strength,
+              f6_breadth, f7_alignment, f8_streak, f9_rsi, f10_macd, f11_bollinger,
+              f12_ema_trend, f13_support_resistance, f14_atr
+         FROM idx_signal_history
+        WHERE stock_code = ? AND data_date IN (?)`,
+      [ticker, sessions]);
+    const snapMap = Object.fromEntries(snapRows.map(r => [toDateStr(r.data_date), r]));
+
+    const [priceRows] = await pool.query(
+      `SELECT date, close_price, change_pct FROM idx_stock_prices
+        WHERE stock_code = ? AND date IN (?)`, [ticker, sessions]);
+    const priceMap = Object.fromEntries(priceRows.map(r => [toDateStr(r.date), r]));
+
+    // Keyed by the SAME names the screener's FACTOR_LABELS already uses, so the
+    // frontend renders history with its existing labels and never needs to know
+    // what any factor means or how it is computed.
+    const FACTOR_COLUMNS = [
+      ['concentration', 'f1_concentration'], ['trend', 'f2_trend'],
+      ['volumeZ', 'f3_volume_z'], ['momentum', 'f4_momentum'],
+      ['relStrength', 'f5_rel_strength'], ['breadth', 'f6_breadth'],
+      ['alignment', 'f7_alignment'], ['streak', 'f8_streak'],
+      ['rsi', 'f9_rsi'], ['macd', 'f10_macd'], ['bollinger', 'f11_bollinger'],
+      ['emaTrend', 'f12_ema_trend'], ['supportResistance', 'f13_support_resistance'],
+      ['atr', 'f14_atr'],
+    ];
+    const num = v => (v === null || v === undefined ? null : Number(v));
+
+    const history = sessions.map(date => {
+      const s = snapMap[date];
+      const p = priceMap[date];
+      if (!s) {
+        // The session happened; we simply have no snapshot for it. Returned
+        // rather than dropped, so a gap is visible instead of collapsing the
+        // window and mislabelling its length.
+        return {
+          date, observed: false,
+          price: p ? Number(p.close_price) : null,
+          changePct: p?.change_pct === null || p?.change_pct === undefined ? null : Number(p.change_pct),
+          compositeScore: null, signal: null, confidence: null,
+          dataSource: null, factors: null,
+        };
+      }
+      return {
+        date, observed: true,
+        // Price at the moment the signal was scored, falling back to the
+        // session close. Both are that session's price; neither is today's.
+        price: num(s.price_at_signal) ?? (p ? Number(p.close_price) : null),
+        changePct: p?.change_pct === null || p?.change_pct === undefined ? null : Number(p.change_pct),
+        compositeScore: num(s.composite_score),
+        signal: s.signal_type || null,
+        confidence: num(s.confidence),
+        dataSource: s.data_source || null,
+        factors: Object.fromEntries(FACTOR_COLUMNS.map(([k, col]) => [k, num(s[col])])),
+      };
+    });
+
+    let window = null;
+    try {
+      const c = await systemHealth.assertCompleteSessions(pool, {
+        table: 'idx_signal_history', col: 'data_date', endSession, count });
+      window = {
+        from: sessions[0], to: sessions[sessions.length - 1],
+        expectedSessions: count,
+        // Scoped to THIS ticker: a date can hold 144 of 245 tickers, so the
+        // table having rows for a session does not mean this ticker does.
+        observedSessions: history.filter(h => h.observed).length,
+        missingSessions: history.filter(h => !h.observed).map(h => h.date),
+        complete: history.every(h => h.observed),
+        tableComplete: c.complete,
+      };
+    } catch { /* completeness is reported, never a precondition */ }
+
+    const observed = history.filter(h => h.observed);
+    const latest = observed.length ? observed[observed.length - 1] : null;
+
+    res.json({
+      ticker, range, rangeSessions: count,
+      window,
+      latest,
+      // Newest first, as the spec's table wants.
+      history: [...history].reverse(),
+      // Stated rather than implied: these are STORED scores, not a recomputation
+      // against today's market. `dataSource` distinguishes a live capture from a
+      // reconstruction. engine_version is not recorded per row, so it is not
+      // claimed — inventing provenance is the error R2-A existed to fix.
+      immutable: true,
+      engineVersion: null,
+      engineVersionNote: 'not recorded per snapshot row; dataSource distinguishes live from backfill',
+    });
+  } catch (err) {
+    console.error('factor-history error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/signal-scanner-history', async (req, res) => {
   try {
     const { date } = req.query;

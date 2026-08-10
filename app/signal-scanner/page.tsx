@@ -86,6 +86,287 @@ function ConfidenceBadge({ confidence, winRate, winRateSample }: { confidence: n
   );
 }
 
+/* ── Historical factor analytics ────────────────────────────────────────────
+   Renders STORED snapshots. It computes no factor, no composite and no signal —
+   every number here was produced by the engine on the trading date it is shown
+   against, and this component only displays it. That separation is why the
+   panel cannot drift from the scoring engine: there is nothing here to drift. */
+
+type FactorHistoryRow = {
+  date: string; observed: boolean;
+  price: number | null; changePct: number | null;
+  compositeScore: number | null; signal: string | null; confidence: number | null;
+  dataSource: string | null;
+  factors: Record<string, number | null> | null;
+};
+type FactorHistoryResp = {
+  ticker: string; range: string; rangeSessions: number;
+  window: { from: string; to: string; expectedSessions: number; observedSessions: number;
+            missingSessions: string[]; complete: boolean } | null;
+  latest: FactorHistoryRow | null;
+  history: FactorHistoryRow[];
+};
+
+const RANGE_OPTIONS = ["5D", "10D", "20D", "1M"];
+
+/** Heatmap that stays out of the way. Missing data gets NO colour at all — a
+ *  grey dash, never a green or red cell, because absence is not a weak score. */
+function heat(v: number | null): { bg: string; color: string } {
+  if (v === null || v === undefined || Number.isNaN(v)) {
+    return { bg: "transparent", color: "var(--text-muted)" };
+  }
+  if (v >= 65) return { bg: "rgba(63,185,80,0.13)", color: "#3fb950" };
+  if (v >= 45) return { bg: "rgba(210,153,34,0.10)", color: "#d29922" };
+  return { bg: "rgba(248,81,73,0.11)", color: "#f85149" };
+}
+
+/** ↑ improving / → stable / ↓ weakening against the PREVIOUS OBSERVED session.
+ *  Deliberately skips unobserved days rather than treating them as 0, which
+ *  would invent a crash into a gap and a recovery out of it. */
+function dirVs(rows: FactorHistoryRow[], idx: number, key: string): string {
+  const cur = rows[idx]?.factors?.[key];
+  if (cur === null || cur === undefined) return "";
+  for (let j = idx + 1; j < rows.length; j++) {          // rows are newest-first
+    const prev = rows[j]?.factors?.[key];
+    if (prev === null || prev === undefined) continue;
+    const d = cur - prev;
+    if (d > 3) return "↑";
+    if (d < -3) return "↓";
+    return "→";
+  }
+  return "";
+}
+
+function FactorHistoryPanel({ ticker }: { ticker: string }) {
+  const [range, setRange] = useState("10D");
+  const [data, setData] = useState<FactorHistoryResp | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true); setErr(null);
+    fetch(`${API_BASE}/api/signal-scanner/ticker/${encodeURIComponent(ticker)}/factor-history?range=${range}`)
+      .then(async r => ({ ok: r.ok, json: await r.json().catch(() => ({})) }))
+      .then(({ ok, json }) => {
+        if (cancelled) return;
+        // A failure here must never disturb the screener row that opened it.
+        if (!ok) { setErr(json.error || "Failed to load history"); setData(null); return; }
+        setData(json);
+      })
+      .catch(e => { if (!cancelled) setErr(String(e?.message || e)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [ticker, range]);
+
+  const rows = data?.history || [];
+  const observedRows = rows.filter(r => r.observed);
+
+  /* Rule-based, not a recommendation. Compares latest vs previous observed and
+     vs the start of the window — the three points the spec asks for. */
+  const insight = useMemo(() => {
+    if (observedRows.length < 2) return null;
+    const latest = observedRows[0], first = observedRows[observedRows.length - 1];
+    const up: string[] = [], down: string[] = [], flat: string[] = [];
+    for (const f of FACTOR_LABELS) {
+      const a = first.factors?.[f.key as string], b = latest.factors?.[f.key as string];
+      if (a === null || a === undefined || b === null || b === undefined) continue;
+      const d = b - a;
+      if (d >= 8) up.push(`${f.label}: ${Math.round(a)} → ${Math.round(b)}`);
+      else if (d <= -8) down.push(`${f.label}: ${Math.round(a)} → ${Math.round(b)}`);
+      else if (b >= 65) flat.push(`${f.label} remained strong (${Math.round(b)})`);
+    }
+    return { up, down, flat, from: first.date, to: latest.date };
+  }, [observedRows]);
+
+  const sticky = (left: number, z = 3): React.CSSProperties => ({
+    position: "sticky", left, zIndex: z, background: "var(--bg-secondary, #0d1117)",
+  });
+
+  return (
+    <div style={{ padding: "16px 24px 20px", borderTop: "1px solid rgba(48,54,61,0.5)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 12 }}>
+        <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.06em", color: "#8b949e" }}>
+          FACTOR HISTORY
+        </span>
+        <div style={{ display: "flex", gap: 4 }}>
+          {RANGE_OPTIONS.map(r => (
+            <button key={r} onClick={e => { e.stopPropagation(); setRange(r); }}
+              style={{
+                fontSize: 10, fontWeight: 700, padding: "3px 10px", borderRadius: 4, cursor: "pointer",
+                border: `1px solid ${range === r ? "rgba(88,166,255,0.5)" : "rgba(48,54,61,0.8)"}`,
+                background: range === r ? "rgba(88,166,255,0.15)" : "transparent",
+                color: range === r ? "#58a6ff" : "var(--text-muted)",
+              }}>{r}</button>
+          ))}
+        </div>
+        {data?.window && (
+          <span style={{ fontSize: 10, color: data.window.complete ? "var(--text-muted)" : "#d29922" }}>
+            {data.window.observedSessions}/{data.window.expectedSessions} sessions observed
+            {!data.window.complete && ` · missing ${data.window.missingSessions.join(", ")}`}
+          </span>
+        )}
+      </div>
+
+      {loading ? (
+        <div style={{ padding: 24, textAlign: "center", color: "var(--text-muted)", fontSize: 12 }}>
+          <span style={{ display: "inline-block", animation: "spin 1.5s linear infinite" }}>⟳</span> Loading factor history…
+        </div>
+      ) : err ? (
+        <div style={{ padding: 16, fontSize: 12, color: "#f85149" }}>⚠️ {err}</div>
+      ) : observedRows.length === 0 ? (
+        <div style={{ padding: 16, fontSize: 12, color: "var(--text-muted)" }}>
+          📭 No historical snapshots for {ticker} in this range.
+          {data?.window && !data.window.complete && " Snapshots are recorded per trading session; these sessions have none."}
+        </div>
+      ) : (
+        <>
+          {/* Score & price, sharing one date axis */}
+          <ScorePriceStrip rows={rows} />
+
+          {/* Matrix: row = trading date, column = factor */}
+          <div style={{ overflowX: "auto", border: "1px solid rgba(48,54,61,0.6)", borderRadius: 6 }}>
+            <table style={{ borderCollapse: "collapse", fontSize: 11, minWidth: 1000, width: "100%" }}>
+              <thead>
+                <tr style={{ background: "rgba(22,27,34,0.95)" }}>
+                  <th style={{ ...sticky(0, 4), padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700 }}>DATE</th>
+                  <th style={{ ...sticky(84, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>PRICE</th>
+                  <th style={{ ...sticky(150, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>CHG%</th>
+                  <th style={{ ...sticky(208, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>SCORE</th>
+                  <th style={{ ...sticky(264, 4), padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700, borderRight: "1px solid rgba(48,54,61,0.8)" }}>SIGNAL</th>
+                  {FACTOR_LABELS.map(f => (
+                    <th key={f.key as string} title={f.label}
+                      style={{ padding: "6px 8px", textAlign: "center", color: "#8b949e", fontWeight: 700, whiteSpace: "nowrap" }}>
+                      {f.icon} {f.label}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => {
+                  const cfg = (r.signal && SIG[r.signal]) || null;
+                  return (
+                    <tr key={r.date} style={{
+                      borderTop: "1px solid rgba(48,54,61,0.4)",
+                      opacity: r.observed ? 1 : 0.55,
+                    }}>
+                      <td style={{ ...sticky(0), padding: "5px 10px", color: "var(--text-secondary)", whiteSpace: "nowrap" }}>
+                        {r.date.slice(5)}
+                        {!r.observed && <span title="Trading session with no snapshot" style={{ marginLeft: 4, color: "#d29922" }}>⚠</span>}
+                      </td>
+                      <td style={{ ...sticky(84), padding: "5px 10px", textAlign: "right", color: "var(--text-primary)" }}>
+                        {r.price === null ? "—" : r.price.toLocaleString("id-ID")}
+                      </td>
+                      <td style={{ ...sticky(150), padding: "5px 10px", textAlign: "right",
+                                   color: r.changePct === null ? "var(--text-muted)" : r.changePct >= 0 ? "#3fb950" : "#f85149" }}>
+                        {r.changePct === null ? "—" : `${r.changePct > 0 ? "+" : ""}${r.changePct.toFixed(2)}`}
+                      </td>
+                      <td style={{ ...sticky(208), padding: "5px 10px", textAlign: "right", fontWeight: 800,
+                                   color: r.compositeScore === null ? "var(--text-muted)" : "var(--text-primary)" }}>
+                        {r.compositeScore === null ? "—" : Math.round(r.compositeScore)}
+                      </td>
+                      <td style={{ ...sticky(264), padding: "5px 10px", borderRight: "1px solid rgba(48,54,61,0.8)", whiteSpace: "nowrap" }}>
+                        {r.signal ? (
+                          <span style={{ fontSize: 9, fontWeight: 800, padding: "2px 6px", borderRadius: 3,
+                                         background: cfg?.bg || "transparent", color: cfg?.color || "var(--text-muted)" }}>
+                            {r.signal}
+                          </span>
+                        ) : <span style={{ color: "var(--text-muted)" }}>—</span>}
+                      </td>
+                      {FACTOR_LABELS.map(f => {
+                        const v = r.factors?.[f.key as string] ?? null;
+                        const h = heat(v);
+                        return (
+                          <td key={f.key as string}
+                            style={{ padding: "5px 8px", textAlign: "center", background: h.bg, color: h.color, fontWeight: 700 }}>
+                            {v === null ? "—" : Math.round(v)}
+                            {v !== null && <span style={{ marginLeft: 3, opacity: 0.55, fontWeight: 400 }}>{dirVs(rows, i, f.key as string)}</span>}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {insight && (insight.up.length > 0 || insight.down.length > 0 || insight.flat.length > 0) && (
+            <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginTop: 12, fontSize: 11 }}>
+              {insight.up.length > 0 && (
+                <div>
+                  <div style={{ fontWeight: 800, color: "#3fb950", marginBottom: 4 }}>STRENGTHENING</div>
+                  {insight.up.map(t => <div key={t} style={{ color: "var(--text-secondary)" }}>• {t}</div>)}
+                </div>
+              )}
+              {insight.down.length > 0 && (
+                <div>
+                  <div style={{ fontWeight: 800, color: "#f85149", marginBottom: 4 }}>WEAK / WATCH</div>
+                  {insight.down.map(t => <div key={t} style={{ color: "var(--text-secondary)" }}>• {t}</div>)}
+                </div>
+              )}
+              {insight.flat.length > 0 && (
+                <div>
+                  <div style={{ fontWeight: 800, color: "#8b949e", marginBottom: 4 }}>HOLDING</div>
+                  {insight.flat.slice(0, 4).map(t => <div key={t} style={{ color: "var(--text-secondary)" }}>• {t}</div>)}
+                </div>
+              )}
+              <div style={{ fontSize: 10, color: "var(--text-muted)", alignSelf: "flex-end" }}>
+                {insight.from} → {insight.to} · observation, not a recommendation
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Composite score and close price on one date axis, so the reader can see
+ *  whether a rising score was followed by price or not. Unobserved sessions
+ *  break the score line rather than being bridged — a straight segment across a
+ *  gap would assert a trend through days nothing was measured on. */
+function ScorePriceStrip({ rows }: { rows: FactorHistoryRow[] }) {
+  const series = [...rows].reverse();                       // oldest → newest
+  const scores = series.map(r => r.compositeScore);
+  const prices = series.map(r => r.price);
+  const okS = scores.filter(v => v !== null) as number[];
+  const okP = prices.filter(v => v !== null) as number[];
+  if (okS.length < 2 || okP.length < 2) return null;
+
+  const W = 100, H = 34;
+  const sMin = Math.min(...okS), sMax = Math.max(...okS);
+  const pMin = Math.min(...okP), pMax = Math.max(...okP);
+  const x = (i: number) => (series.length === 1 ? 0 : (i / (series.length - 1)) * W);
+  const yS = (v: number) => H - ((v - sMin) / (sMax - sMin || 1)) * H;
+  const yP = (v: number) => H - ((v - pMin) / (pMax - pMin || 1)) * H;
+
+  const seg = (vals: (number | null)[], y: (v: number) => number) => {
+    const out: string[] = []; let cur: string[] = [];
+    vals.forEach((v, i) => {
+      if (v === null) { if (cur.length > 1) out.push(cur.join(" ")); cur = []; return; }
+      cur.push(`${cur.length ? "L" : "M"}${x(i).toFixed(2)},${y(v).toFixed(2)}`);
+    });
+    if (cur.length > 1) out.push(cur.join(" "));
+    return out;
+  };
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={{ display: "flex", gap: 14, fontSize: 10, color: "var(--text-muted)", marginBottom: 3 }}>
+        <span><span style={{ color: "#58a6ff" }}>▬</span> Composite score</span>
+        <span><span style={{ color: "#d29922" }}>▬</span> Close price</span>
+      </div>
+      <svg viewBox={`0 0 ${W} ${H}`} preserveAspectRatio="none"
+           style={{ width: "100%", height: 60, display: "block",
+                    border: "1px solid rgba(48,54,61,0.6)", borderRadius: 6, background: "rgba(13,17,23,0.5)" }}>
+        {seg(prices, yP).map((d, i) => <path key={`p${i}`} d={d} fill="none" stroke="#d29922" strokeWidth={0.7} vectorEffect="non-scaling-stroke" />)}
+        {seg(scores, yS).map((d, i) => <path key={`s${i}`} d={d} fill="none" stroke="#58a6ff" strokeWidth={1} vectorEffect="non-scaling-stroke" />)}
+      </svg>
+    </div>
+  );
+}
+
 function FactorBreakdownPanel({ factors, score, weights, engineVersion }: { factors: FactorBreakdown; score: number; weights?: EngineWeights; engineVersion?: string }) {
   return (
     <div style={{
@@ -3851,6 +4132,9 @@ export default function SignalScannerPage() {
                         {isExpanded && (
                           <div style={{ minWidth: 1100 }}>
                             <FactorBreakdownPanel factors={row.factors} score={row.score} weights={engineWeights} engineVersion={engineVersion} />
+                            {/* Fetched only once the row is expanded, so the main
+                                screener stays as light as it was. */}
+                            <FactorHistoryPanel ticker={row.ticker} />
                             {row.tradePlan && (
                               <div style={{
                                 padding: "12px 24px 16px", background: "rgba(22,27,34,0.6)",
