@@ -808,7 +808,11 @@ async function recordBurnIn(pool) {
   if (!rec.verdict) {
     line('  the count RESTARTS. Ten clean sessions means ten in a row, not ten in total.');
     report({ level: 'FAIL', what: `burn-in session ${sessionDate} failed`,
-             detail: (rec.allFailures.length ? rec.allFailures : failures).join('; ') });
+             // DEDUPED. allFailures accumulates every attempt's failures, so a
+             // session re-run eight times repeated the same six reasons eight
+             // times and produced a 2,000-character line nobody reads. The
+             // distinct set is the information; the repetition is noise.
+             detail: [...new Set(rec.allFailures.length ? rec.allFailures : failures)].join('; ') });
   } else if (streak >= 10) {
     line('  TEN CONSECUTIVE CLEAN SESSIONS. Operationally stable.');
     line('  This says nothing whatsoever about whether the strategy makes money.');

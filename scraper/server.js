@@ -2241,6 +2241,41 @@ function apiFailure(service, status, detail) {
   }
 }
 
+/**
+ * Clear a service's failure state once it answers successfully again.
+ *
+ * WHY (2026-08-10). The failure recording added yesterday was one-directional:
+ * apiFailure() wrote a FAILED row and nothing ever wrote an OK, so jobHealth —
+ * which counts failures since the last OK — reported `api:indexalpha FAILED`
+ * permanently. After the quota was raised and 6,125 calls succeeded with zero
+ * errors, the watchdog was still failing the burn-in on a 403 that no longer
+ * happens.
+ *
+ * That is the same disease as the one it was built to cure, pointing the other
+ * way: a signal that can only ever go one way is not a health signal, it is a
+ * latch. Recovery has to be observable too.
+ *
+ * Deliberately cheap: it only touches the database on the FIRST success after a
+ * failure, so a 1,225-call run writes one row, not 1,225.
+ */
+const apiRecoveredPending = new Set();
+
+function apiRecovered(service) {
+  if (!apiFailures.has(service) && !apiRecoveredPending.has(service)) return;
+  apiFailures.delete(service);
+  apiRecoveredPending.delete(service);
+  systemHealth.recordJobRun(pool, {
+    job: `api:${service}`, status: 'OK',
+    error: null,
+  }).catch(() => { /* recording must never break the pull */ });
+}
+
+// A restart clears the in-memory failure map, so a process that starts clean
+// would never call apiRecovered() and the stale FAILED row would survive
+// forever. Arm the recovery on boot instead: the first successful call after a
+// restart resolves whatever the registry still says.
+apiRecoveredPending.add('indexalpha');
+
 async function fetchIndexAlpha(ticker, fromDate, toDate, investor = 'all', market = null) {
   const marketQs = market ? `&market=${market}` : '';
   const url = `${INDEX_ALPHA_BASE}/stocks/broker-summary?ticker=${ticker}&from=${fromDate}&to=${toDate || fromDate}&investor=${investor}${marketQs}`;
@@ -2272,6 +2307,7 @@ async function fetchIndexAlpha(ticker, fromDate, toDate, investor = 'all', marke
       apiFailure('indexalpha', resp.status, text.slice(0, 200));
       return [];
     }
+    apiRecovered('indexalpha');
     const json = await resp.json();
     if (!json.success || !Array.isArray(json.data)) return [];
     
