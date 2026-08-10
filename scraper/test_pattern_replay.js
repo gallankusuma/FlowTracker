@@ -89,7 +89,7 @@ const get = async (path) => {
 
   await t('CONTAMINATED backfill rows are excluded', async () => {
     const { body } = await get(`/api/signal-scanner/ticker/${TICKER}/factor-history?range=20D`);
-    assert.deepStrictEqual(body.allowedSources, ['live', 'backfill_v2']);
+    assert.deepStrictEqual(body.allowedSources, ['live', 'backfill_v2', 'backfill_v3_f5v1']);
     for (const h of body.history) {
       if (!h.observed) continue;
       assert.notStrictEqual(h.dataSource, 'backfill',
@@ -170,6 +170,60 @@ const get = async (path) => {
   await t('an unknown range is refused rather than defaulted', async () => {
     const { status } = await get(`/api/signal-scanner/ticker/${TICKER}/factor-history?range=99D`);
     assert.strictEqual(status, 400);
+  });
+
+  // ── F5 DATA CONTRACT ─────────────────────────────────────────────────────
+  console.log('\nF5 benchmark contract\n');
+  const bench = require('./modules/benchmark_universe');
+
+  await t('the benchmark is exactly 245 unique names', async () => {
+    assert.strictEqual(bench.BENCHMARK_TICKERS.length, 245);
+    assert.strictEqual(new Set(bench.BENCHMARK_TICKERS).size, 245, 'duplicate names in the benchmark');
+  });
+
+  await t('the benchmark is NOT an alias for the tracked universe', async () => {
+    // IDX_TICKERS is already 600 in the working tree. If these ever become the
+    // same array, F5's denominator silently follows the scan universe again.
+    const { IDX_TICKERS } = require('./modules/tickers');
+    assert.notStrictEqual(bench.BENCHMARK_TICKERS, IDX_TICKERS, 'benchmark is the same array object as IDX_TICKERS');
+  });
+
+  await t('coverage fails CLOSED, and an empty benchmark is never a flat market', async () => {
+    assert.strictEqual(bench.benchmarkCoverage(0).ok, false);
+    assert.strictEqual(bench.benchmarkCoverage(29).ok, false, 'below the absolute name floor');
+    assert.strictEqual(bench.benchmarkCoverage(245).ok, true);
+    // The floor came from the measured distribution: legitimate historical
+    // thinness bottoms at 68.6%, and the one real anomaly sits at 41.6%.
+    assert.strictEqual(bench.benchmarkCoverage(Math.round(245 * 0.686)).ok, true);
+    assert.strictEqual(bench.benchmarkCoverage(Math.round(245 * 0.416)).ok, false);
+  });
+
+  await t('every regenerated snapshot carries its benchmark version', async () => {
+    const [rows] = await pool.query(
+      "SELECT COUNT(*) n FROM idx_signal_history WHERE data_source = 'backfill_v3_f5v1' AND f5_benchmark_version IS NULL");
+    assert.strictEqual(Number(rows[0].n), 0, 'clean-generation rows exist with no benchmark version');
+  });
+
+  await t('an F5 value never coexists with an unusable benchmark', async () => {
+    const [rows] = await pool.query(
+      'SELECT COUNT(*) n FROM idx_signal_history WHERE f5_benchmark_observed IS NOT NULL AND f5_benchmark_observed < ? AND f5_rel_strength IS NOT NULL',
+      [bench.F5_MIN_BENCHMARK_NAMES]);
+    assert.strictEqual(Number(rows[0].n), 0, 'F5 was scored against a benchmark below the floor');
+  });
+
+  await t('factor-history reports whether a window shares one benchmark', async () => {
+    const { body } = await get(`/api/signal-scanner/ticker/${TICKER}/factor-history?range=10D`);
+    assert.ok(Object.prototype.hasOwnProperty.call(body, 'f5BenchmarkConsistent'));
+    for (const h of body.history.filter(x => x.observed)) {
+      assert.ok(Object.prototype.hasOwnProperty.call(h, 'f5BenchmarkVersion'),
+        `${h.date} carries no benchmark provenance`);
+    }
+  });
+
+  await t('the clean generation REPLACED the old backfills rather than joining them', async () => {
+    const [rows] = await pool.query(
+      "SELECT data_source, COUNT(*) n FROM idx_signal_history WHERE data_source IN ('backfill','backfill_v2') GROUP BY data_source");
+    assert.strictEqual(rows.length, 0, `prior backfill generations still present: ${JSON.stringify(rows)}`);
   });
 
   console.log(`\n${pass} passed, ${fail} failed`);

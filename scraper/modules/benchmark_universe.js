@@ -56,4 +56,56 @@ const BENCHMARK_TICKERS = [
   "WIFI", "WIIM", "WSBP", "WTON", "YULE",
 ];
 
-module.exports = { BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS };
+/**
+ * FAIL-CLOSED FLOOR for benchmark coverage.
+ *
+ * Without one, an empty benchmark yields marketAvgChange = 0 and every stock's
+ * F5 is then computed against a market that was never observed — full weight,
+ * no warning. "0 of 245 observed" must not read as "the market was flat".
+ *
+ * CHOSEN FROM THE DISTRIBUTION, NOT INVENTED. Measured across all 2,408
+ * sessions the benchmark names have prices for:
+ *
+ *     whole history      median 84.1%   p05 69.0%   min 41.6%
+ *     since 2026-06-01   median  100%   min  100%
+ *
+ * The low end of the old history is NOT breakage — many of today's 245 names
+ * had not listed in 2016, so 168/245 is an honest average over the names that
+ * existed. A 90-95% floor would refuse ~two thirds of the deep history for
+ * being old rather than for being wrong.
+ *
+ * 60% sits below every legitimately thin session (the historical floor is
+ * 68.6%) and above the one true anomaly (2019-06-19 at 41.6%, a partial
+ * scrape), while any modern breakage falls far below it since current coverage
+ * is a flat 100%.
+ *
+ * The absolute floor is the guard for the early series, where a percentage of
+ * 245 can look acceptable while resting on a handful of names.
+ *
+ * This is a REFUSAL threshold, not a quality bar. `f5_benchmark_observed` is
+ * recorded on every snapshot regardless, so research can demand 95% later
+ * without needing anything regenerated.
+ */
+const F5_MIN_BENCHMARK_COVERAGE = 0.60;
+const F5_MIN_BENCHMARK_NAMES = 30;
+
+/**
+ * Is the cross-section observed well enough to measure relative strength at all?
+ * @returns {{ok:boolean, observed:number, size:number, coverage:number, reason:string|null}}
+ */
+function benchmarkCoverage(observed) {
+  const size = BENCHMARK_TICKERS.length;
+  const coverage = size ? observed / size : 0;
+  if (observed < F5_MIN_BENCHMARK_NAMES) {
+    return { ok: false, observed, size, coverage, reason: `only ${observed} benchmark names observed (floor ${F5_MIN_BENCHMARK_NAMES})` };
+  }
+  if (coverage < F5_MIN_BENCHMARK_COVERAGE) {
+    return { ok: false, observed, size, coverage, reason: `benchmark coverage ${(coverage * 100).toFixed(1)}% is below ${(F5_MIN_BENCHMARK_COVERAGE * 100).toFixed(0)}%` };
+  }
+  return { ok: true, observed, size, coverage, reason: null };
+}
+
+module.exports = {
+  BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS,
+  F5_MIN_BENCHMARK_COVERAGE, F5_MIN_BENCHMARK_NAMES, benchmarkCoverage,
+};

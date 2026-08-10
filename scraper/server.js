@@ -82,7 +82,7 @@ const { IDX_TICKERS: TOP_STOCKS } = require('./modules/tickers');
 // TOP_STOCKS: what we scan and what we benchmark against are different
 // decisions, and letting one drag the other is how F5 became incomparable
 // between the live and historical paths.
-const { BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS } = require('./modules/benchmark_universe');
+const { BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS, benchmarkCoverage } = require('./modules/benchmark_universe');
 
 // ── Yahoo Finance — Official IDX closing prices (free, no API key) ─────────────
 const YF_CACHE_MS = 10 * 60 * 1000; // 10 min
@@ -94,16 +94,38 @@ let _yfCacheAt  = 0;
  * Gets last 5 days of OHLCV → computes today's close and daily change %.
  * Returns { BBCA: { price, prevClose, changePct }, ... }
  */
+/**
+ * PER-SYMBOL CACHE, not one global snapshot (2026-08-10 review, P2).
+ *
+ * This used to return `_yfCache` whenever it was fresh, WITHOUT checking that
+ * it covered the tickers being asked for. So an endpoint that fetched 30 names
+ * would populate the cache, and a scanner asking for 245 within the TTL got
+ * those 30 back — the F5 denominator then depended on which endpoint happened
+ * to be called first.
+ *
+ * That is worse now than before: with F5 failing closed below the coverage
+ * floor, a 30-of-245 cache hit would withhold F5 across the whole market for a
+ * caching artefact rather than a data outage — a correct-looking refusal for an
+ * entirely wrong reason.
+ *
+ * Each symbol now carries its own timestamp, and only symbols that are missing
+ * or stale are fetched. Callers get exactly the set they asked for.
+ */
 async function fetchYahooPrices(tickers) {
   const now = Date.now();
-  if (_yfCacheAt > 0 && (now - _yfCacheAt) < YF_CACHE_MS && Object.keys(_yfCache).length > 0) {
-    return _yfCache;
+  const wanted = [...new Set(tickers)];
+  const fresh = {}, stale = [];
+  for (const t of wanted) {
+    const e = _yfCache[t];
+    if (e && (now - (e.__at || 0)) < YF_CACHE_MS) fresh[t] = e;
+    else stale.push(t);
   }
+  if (stale.length === 0) return fresh;
 
   const https  = require('https');
   const result = {};
 
-  await Promise.allSettled(tickers.map(ticker => new Promise(resolve => {
+  await Promise.allSettled(stale.map(ticker => new Promise(resolve => {
     const cryptoNames = ['BTC','ETH','BNB','SOL','XRP','ADA','AVAX','DOGE','DOT','LINK','MATIC','SHIB','LTC','UNI','BCH','ATOM','XLM','INJ','RNDR','FET','OP','ARB','SUI','SEI','APT','FIL','NEAR','TON','TIA','JUP'];
     let sym = ticker;
     if (cryptoNames.includes(ticker)) sym = ticker + '-USD';
@@ -149,11 +171,15 @@ async function fetchYahooPrices(tickers) {
   })));
 
   if (Object.keys(result).length > 0) {
-    _yfCache   = result;
+    // Merge rather than replace: a partial fetch must not evict symbols another
+    // caller still holds a fresh reading for.
+    for (const [k, v] of Object.entries(result)) _yfCache[k] = { ...v, __at: now };
     _yfCacheAt = now;
-    console.log(`📈 Yahoo prices: ${Object.keys(result).length}/${tickers.length} tickers`);
+    console.log(`📈 Yahoo prices: ${Object.keys(result).length}/${stale.length} fetched (${Object.keys(fresh).length} from cache)`);
   }
-  return result;
+  // The caller asked for `tickers`; give back everything we have for them —
+  // freshly fetched AND still-valid cache — not just this call's fetches.
+  return { ...fresh, ...result };
 }
 
 
@@ -436,6 +462,19 @@ async function setupDB() {
     ['regime_gate_reason', 'VARCHAR(30) DEFAULT NULL'],
   ];
   for (const [col, def] of awoColumns) {
+    await pool.query(`ALTER TABLE idx_signal_history ADD COLUMN ${col} ${def}`).catch(() => {});
+  }
+  // F5 PROVENANCE PER SNAPSHOT.
+  //
+  // The benchmark version lived only in the scanner's response, so a stored F5
+  // carried no record of the cross-section that produced it. A trajectory could
+  // then run 61 -> 68 -> 72 across rows measured against different denominators
+  // and look like a stock strengthening. Stamped per row instead, so a change in
+  // the benchmark can never be mistaken for a change in the stock.
+  for (const [col, def] of [
+    ['f5_benchmark_version',  'VARCHAR(32) NULL'],
+    ['f5_benchmark_observed', 'SMALLINT NULL'],
+  ]) {
     await pool.query(`ALTER TABLE idx_signal_history ADD COLUMN ${col} ${def}`).catch(() => {});
   }
 
@@ -6787,7 +6826,15 @@ async function runSignalScan({ persist = false } = {}) {
       if (chg === null || !Number.isFinite(chg)) { benchMissing++; continue; }
       allChanges.push(chg);
     }
-    const marketAvgChange = allChanges.length ? stats.mean(allChanges) : 0;
+    // FAIL CLOSED. `allChanges.length ? mean : 0` treated an unobserved market
+    // as a flat one: with 0 of 245 names seen, every stock's F5 was computed
+    // against a 0% return it had full confidence in. Below the floor F5 is
+    // UNAVAILABLE and must be excluded rather than guessed.
+    const benchCov = benchmarkCoverage(allChanges.length);
+    const marketAvgChange = benchCov.ok ? stats.mean(allChanges) : null;
+    if (!benchCov.ok) {
+      console.log(`  ⚠️  [F5] benchmark unusable: ${benchCov.reason} — F5 will be reported unavailable`);
+    }
 
     const [winRateRows] = await pool.query(`
       SELECT signal_type,
@@ -6836,7 +6883,10 @@ async function runSignalScan({ persist = false } = {}) {
       const f2 = f2_trend(dnValues.filter(v => v !== null));
       const f3 = f3_volumeZ(volumes, priceDirection);
       const f4 = f4_momentum(closes);
-      const f5 = f5_relStrength(dailyChange, marketAvgChange);
+      // NULL when the benchmark could not be observed. Relative strength has no
+      // meaning without something to be relative to, so it is withheld rather
+      // than computed against an assumed 0% market.
+      const f5 = marketAvgChange === null ? null : f5_relStrength(dailyChange, marketAvgChange);
       const f6 = f6_breadth(breadth.buyers, breadth.sellers);
       const f7 = f7_alignment(dailyChange, dn0);
       const f8 = f8_streak(dnValues.filter(v => v !== null));
@@ -6893,6 +6943,11 @@ async function runSignalScan({ persist = false } = {}) {
         { f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13 }, f14,
         {
           f1: brokerDataAvailable, f2: brokerDataAvailable, f6: breadthDataAvailable, f7: brokerDataAvailable, f8: brokerDataAvailable,
+          // F5 without an observed benchmark is not a weak reading, it is no
+          // reading. Marked unavailable so weightedComposite drops it and
+          // redistributes its weight, instead of scoring the `?? 50` default as
+          // a real, fully-weighted neutral.
+          f5: benchCov.ok,
           f9: techFactorAvailable.f9, f10: techFactorAvailable.f10, f11: techFactorAvailable.f11,
           f12: techFactorAvailable.f12, f13: techFactorAvailable.f13,
         },
@@ -7012,8 +7067,9 @@ async function runSignalScan({ persist = false } = {}) {
                f9_rsi, f10_macd, f11_bollinger, f12_ema_trend,
                f13_support_resistance, f14_atr,
                price_at_signal, regime_at_signal,
-               price_regime_at_signal, regime_gate_would_block, regime_gate_reason)
-            VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?, ?,?, ?,?,?)
+               price_regime_at_signal, regime_gate_would_block, regime_gate_reason,
+               f5_benchmark_version, f5_benchmark_observed)
+            VALUES (?,?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?,?,?, ?,?, ?,?, ?,?,?, ?,?)
             ON DUPLICATE KEY UPDATE
               composite_score=VALUES(composite_score), signal_type=VALUES(signal_type),
               confidence=VALUES(confidence),
@@ -7027,14 +7083,17 @@ async function runSignalScan({ persist = false } = {}) {
               price_at_signal=VALUES(price_at_signal), regime_at_signal=VALUES(regime_at_signal),
               price_regime_at_signal=VALUES(price_regime_at_signal),
               regime_gate_would_block=VALUES(regime_gate_would_block),
-              regime_gate_reason=VALUES(regime_gate_reason)
+              regime_gate_reason=VALUES(regime_gate_reason),
+              f5_benchmark_version=VALUES(f5_benchmark_version),
+              f5_benchmark_observed=VALUES(f5_benchmark_observed)
           `, [latestDate, r.ticker, r.score, r.signal, r.confidence,
               r.factors.concentration, r.factors.trend, r.factors.volumeZ, r.factors.momentum,
               r.factors.relStrength, r.factors.breadth, r.factors.alignment, r.factors.streak,
               r.factors.rsi, r.factors.macd, r.factors.bollinger, r.factors.emaTrend,
               r.factors.supportResistance, r.factors.atr,
               r.price, regimeAtSignal,
-              r.priceRegime, r.regimeGateShadow?.wouldBlock ? 1 : 0, r.regimeGateShadow?.reason ?? null]);
+              r.priceRegime, r.regimeGateShadow?.wouldBlock ? 1 : 0, r.regimeGateShadow?.reason ?? null,
+              BENCHMARK_UNIVERSE_VERSION, benchCov.observed]);
           snapshotWritten++;
         }
         console.log(`  📸 [SNAPSHOT] ${snapshotWritten} factor rows stored for ${latestDate}`);
@@ -7067,7 +7126,10 @@ async function runSignalScan({ persist = false } = {}) {
         // data rather than only in a commit.
         benchmarkUniverseVersion: BENCHMARK_UNIVERSE_VERSION,
         benchmarkUniverseSize: BENCHMARK_TICKERS.length,
-        benchmarkObserved: BENCHMARK_TICKERS.length - benchMissing,
+        benchmarkObserved: benchCov.observed,
+        benchmarkCoverage: Math.round(benchCov.coverage * 1000) / 10,
+        f5Available: benchCov.ok,
+        f5UnavailableReason: benchCov.reason,
         weights: getActiveWeights(),
         thresholds: getActiveThresholds(),
         regime: currentRegime.regime,
@@ -7082,7 +7144,7 @@ async function runSignalScan({ persist = false } = {}) {
         bullish: bullishCount,
         bearish: bearishCount,
         neutral: neutralCount,
-        avgChange: Math.round(marketAvgChange * 100) / 100,
+        avgChange: marketAvgChange === null ? null : Math.round(marketAvgChange * 100) / 100,
         breadthPct: results.length > 0 ? Math.round((bullishCount / results.length) * 100) : 50,
       },
     } };
@@ -7223,12 +7285,13 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
 
     const [snapRows] = await pool.query(
       `SELECT data_date, composite_score, signal_type, confidence, price_at_signal, data_source,
+              f5_benchmark_version, f5_benchmark_observed,
               f1_concentration, f2_trend, f3_volume_z, f4_momentum, f5_rel_strength,
               f6_breadth, f7_alignment, f8_streak, f9_rsi, f10_macd, f11_bollinger,
               f12_ema_trend, f13_support_resistance, f14_atr
          FROM idx_signal_history
         WHERE stock_code = ? AND data_date IN (?)
-          AND data_source IN ('live','backfill_v2')`,
+          AND data_source IN ('live','backfill_v2','backfill_v3_f5v1')`,
       [ticker, sessions]);
     const snapMap = Object.fromEntries(snapRows.map(r => [toDateStr(r.data_date), r]));
 
@@ -7276,6 +7339,14 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
         signal: s.signal_type || null,
         confidence: num(s.confidence),
         dataSource: s.data_source || null,
+        // F5 provenance per row. A trajectory that runs 61 -> 68 -> 72 across
+        // rows measured against different cross-sections would look like a
+        // strengthening stock; this is what makes that distinguishable. NULL on
+        // rows written before the contract existed — reported as unknown rather
+        // than assumed to match.
+        f5BenchmarkVersion: s.f5_benchmark_version || null,
+        f5BenchmarkObserved: s.f5_benchmark_observed === null || s.f5_benchmark_observed === undefined
+          ? null : Number(s.f5_benchmark_observed),
         factors: Object.fromEntries(FACTOR_COLUMNS.map(([k, col]) => [k, num(s[col])])),
       };
     });
@@ -7308,7 +7379,13 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
       // by name. Every other historical endpoint already filters on this — a
       // pattern classifier reading rows we KNOW are contaminated would be
       // learning from evidence this project has already disowned.
-      allowedSources: ['live', 'backfill_v2'],
+      allowedSources: ['live', 'backfill_v2', 'backfill_v3_f5v1'],
+      // Whether every row in the window shares one benchmark. Research must not
+      // read a mixed-benchmark series as one continuous measurement.
+      f5BenchmarkConsistent: (() => {
+        const vs = new Set(history.filter(h => h.observed).map(h => h.f5BenchmarkVersion));
+        return vs.size <= 1;
+      })(),
       window,
       latest,
       // Newest first, as the spec's table wants.

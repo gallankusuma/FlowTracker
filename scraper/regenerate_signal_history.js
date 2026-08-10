@@ -29,7 +29,7 @@ require('dotenv').config();
 const mysql = require('mysql2/promise');
 const stats = require('./modules/statistics');
 const { calcTechnicalFactors, computeWeeklyTrend } = require('./awo_technical');
-const { BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS } = require('./modules/benchmark_universe');
+const { BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS, benchmarkCoverage } = require('./modules/benchmark_universe');
 
 const DB = {
   host: process.env.DB_HOST || 'localhost',
@@ -53,6 +53,14 @@ const argOf = (flag, fallback) => {
 };
 const GAP_START = argOf('--from', '2026-01-19');
 const GAP_END = argOf('--to', '2026-06-12'); // exclusive — 'live' data_source takes over from here
+
+// A new benchmark contract means a new generation label, not a relabelled old
+// one: rows written before it were measured against a different denominator and
+// must stay distinguishable.
+const DATA_SOURCE = argOf('--source', 'backfill_v2');
+// Controlled migration. Deletes ONLY prior backfill generations in the range —
+// never 'live', which is genuine same-day evidence and is not ours to rewrite.
+const REPLACE_BACKFILL = process.argv.includes('--replace-backfill');
 
 function classifySignal(score) {
   const t = THRESHOLDS;
@@ -109,19 +117,30 @@ async function main() {
     if (Number(r.net_val) > 0) e.buyers++; else if (Number(r.net_val) < 0) e.sellers++;
   }
 
-  // F5 IS MEASURED AGAINST THE FROZEN BENCHMARK UNIVERSE, same as the live path.
+  // F5 IS MEASURED AGAINST THE FROZEN BENCHMARK UNIVERSE, LOADED SEPARATELY
+  // FROM THE CANDIDATES.
   //
-  // This used to average `changeByDate`, which was built from every ticker with
-  // >= 250 price bars — a different cross-section from the one the live scanner
-  // uses, so the historical F5 series and the live one were not comparable. The
-  // research this feeds is precisely about F5 trajectories, so an incomparable
-  // benchmark would have invalidated the result before it was measured.
-  const benchSet = new Set(BENCHMARK_TICKERS);
+  // It used to iterate `tickers` and filter to benchmark members, which quietly
+  // made the benchmark the INTERSECTION of "in the frozen 245" and "has >= 250
+  // price bars". A benchmark name that listed recently — 180 sessions of history
+  // — would contribute to the live market average but never to the historical
+  // one, so the two denominators could differ for a reason that has nothing to
+  // do with the benchmark definition. Candidate eligibility is a rule about
+  // which stocks we can SCORE; it must not decide what "the market" means.
+  //
+  // Measured today the two sets happen to be identical, which is exactly why
+  // this had to be fixed by construction rather than left to coincidence.
+  const benchOhlc = new Map();
+  for (const t of BENCHMARK_TICKERS) {
+    if (ohlcMap.has(t)) { benchOhlc.set(t, ohlcMap.get(t)); continue; }
+    const [rows] = await pool.query(
+      `SELECT date, close_price c FROM idx_stock_prices WHERE stock_code=? ORDER BY date ASC`, [t]);
+    if (rows.length) {
+      benchOhlc.set(t, rows.map(r => ({ date: r.date.toISOString().split('T')[0], close: Number(r.c) })));
+    }
+  }
   const benchChangeByDate = new Map();
-  for (const t of tickers) {
-    if (!benchSet.has(t)) continue;
-    const c = ohlcMap.get(t);
-    if (!c) continue;
+  for (const [, c] of benchOhlc) {
     for (let i = 1; i < c.length; i++) {
       const chg = (c[i].close / c[i - 1].close - 1) * 100;
       if (!Number.isFinite(chg)) continue;
@@ -129,10 +148,17 @@ async function main() {
       benchChangeByDate.get(c[i].date).push(chg);
     }
   }
-  const marketAvgByDate = new Map();
-  for (const [date, arr] of benchChangeByDate) marketAvgByDate.set(date, stats.mean(arr));
-  console.log(`F5 benchmark: ${BENCHMARK_UNIVERSE_VERSION} (${BENCHMARK_TICKERS.length} tickers, ` +
-              `${[...benchSet].filter(t => ohlcMap.has(t)).length} with price history)`);
+  // Coverage decides availability per DATE, same contract as the live path.
+  const marketAvgByDate = new Map(), benchObservedByDate = new Map(), benchOkByDate = new Map();
+  for (const [date, arr] of benchChangeByDate) {
+    const cov = benchmarkCoverage(arr.length);
+    benchObservedByDate.set(date, arr.length);
+    benchOkByDate.set(date, cov.ok);
+    marketAvgByDate.set(date, cov.ok ? stats.mean(arr) : null);
+  }
+  const refused = [...benchOkByDate.values()].filter(v => !v).length;
+  console.log(`F5 benchmark: ${BENCHMARK_UNIVERSE_VERSION} — ${benchOhlc.size}/${BENCHMARK_TICKERS.length} names have price history`);
+  console.log(`              ${benchOkByDate.size} sessions, ${refused} below the coverage floor (F5 withheld there)`);
 
   console.log('Computing factor scores + outcomes for the gap window...\n');
   let rowsToInsert = [];
@@ -174,13 +200,17 @@ async function main() {
       const breadth = breadthMap.get(breadthKey) || { buyers: 0, sellers: 0 };
       const brokerDataAvailable = !!conc;
       const breadthDataAvailable = breadthMap.has(breadthKey);
-      const marketAvgChange = marketAvgByDate.get(date) || 0;
+      // null, not 0. `|| 0` made an unobserved market look like a flat one and
+      // gave F5 full weight against a return nobody measured.
+      const marketAvgChange = marketAvgByDate.has(date) ? marketAvgByDate.get(date) : null;
+      const benchObserved = benchObservedByDate.get(date) ?? 0;
+      const f5Available = marketAvgChange !== null;
 
       const f1 = f1_concentration(dn0);
       const f2 = f2_trend(dnValues);
       const f3 = f3_volumeZ(volumes, priceDirection);
       const f4 = f4_momentum(closes);
-      const f5 = f5_relStrength(dailyChange, marketAvgChange);
+      const f5 = f5Available ? f5_relStrength(dailyChange, marketAvgChange) : null;
       const f6 = f6_breadth(breadth.buyers, breadth.sellers);
       const f7 = f7_alignment(dailyChange, dn0);
       const f8 = f8_streak(dnValues);
@@ -201,7 +231,11 @@ async function main() {
         { f1: DEFAULT_WEIGHTS.f1, f2: DEFAULT_WEIGHTS.f2, f3: DEFAULT_WEIGHTS.f3, f4: DEFAULT_WEIGHTS.f4,
           f5: DEFAULT_WEIGHTS.f5, f6: DEFAULT_WEIGHTS.f6, f7: DEFAULT_WEIGHTS.f7, f8: DEFAULT_WEIGHTS.f8,
           f9: DEFAULT_WEIGHTS.f9, f10: DEFAULT_WEIGHTS.f10, f11: DEFAULT_WEIGHTS.f11, f12: DEFAULT_WEIGHTS.f12, f13: DEFAULT_WEIGHTS.f13 },
-        { f1: brokerDataAvailable, f2: brokerDataAvailable, f6: breadthDataAvailable, f7: brokerDataAvailable, f8: brokerDataAvailable }
+        // f5 excluded when the benchmark was not observed well enough — same
+        // contract as the live scanner, so a session refuses F5 in both paths
+        // or in neither.
+        { f1: brokerDataAvailable, f2: brokerDataAvailable, f5: f5Available,
+          f6: breadthDataAvailable, f7: brokerDataAvailable, f8: brokerDataAvailable }
       );
       const composite = combineFinalScore(rawComposite13, computeConfidence(factorCoverage), computeRiskModifier(f14));
       const signal = classifySignal(composite);
@@ -247,10 +281,14 @@ async function main() {
 
       rowsToInsert.push([
         date, ticker, composite, signal, confidence,
-        Math.round(f1), Math.round(f2), Math.round(f3), Math.round(f4), Math.round(f5), Math.round(f6), Math.round(f7), Math.round(f8),
+        Math.round(f1), Math.round(f2), Math.round(f3), Math.round(f4),
+        // NULL survives to the row. Math.round(null) is 0, which would store an
+        // unmeasured F5 as the strongest possible bearish reading.
+        f5 === null ? null : Math.round(f5),
+        Math.round(f6), Math.round(f7), Math.round(f8),
         Math.round(f9), Math.round(f10), Math.round(f11), Math.round(f12), Math.round(f13), Math.round(f14),
         entry, price_5d_later, outcome, return_1d, return_3d, return_5d, return_10d, max_drawdown, max_profit,
-        'backfill_v2',
+        DATA_SOURCE, BENCHMARK_UNIVERSE_VERSION, benchObserved,
       ]);
       processed++;
     }
@@ -258,6 +296,18 @@ async function main() {
 
   console.log(`Rows to insert: ${rowsToInsert.length}`);
   if (dryRun) { console.log('(dry run — not writing)'); await pool.end(); return; }
+
+  if (REPLACE_BACKFILL) {
+    // Prior backfill generations only. 'live' rows are same-day evidence of what
+    // the engine actually emitted and are never rewritten — if a live row and a
+    // regenerated one disagree, that disagreement is information, not a defect
+    // to paper over.
+    const [del] = await pool.query(
+      `DELETE FROM idx_signal_history
+        WHERE data_date >= ? AND data_date < ? AND data_source IN ('backfill','backfill_v2')`,
+      [GAP_START, GAP_END]);
+    console.log(`Replaced: deleted ${del.affectedRows} prior backfill row(s) in ${GAP_START}..${GAP_END} (live rows untouched)`);
+  }
 
   let inserted = 0;
   const BATCH = 500;
@@ -269,7 +319,7 @@ async function main() {
          f1_concentration, f2_trend, f3_volume_z, f4_momentum, f5_rel_strength, f6_breadth, f7_alignment, f8_streak,
          f9_rsi, f10_macd, f11_bollinger, f12_ema_trend, f13_support_resistance, f14_atr,
          price_at_signal, price_5d_later, outcome, return_1d, return_3d, return_5d, return_10d, max_drawdown, max_profit,
-         data_source)
+         data_source, f5_benchmark_version, f5_benchmark_observed)
        VALUES ?`,
       [batch]
     );
@@ -277,7 +327,7 @@ async function main() {
     console.log(`  [${Math.min(i + BATCH, rowsToInsert.length)}/${rowsToInsert.length}] inserted so far: ${inserted}`);
   }
 
-  console.log(`\nDone. ${inserted} rows inserted (data_source='backfill_v2'), ${rowsToInsert.length - inserted} skipped (already existed).`);
+  console.log(`\nDone. ${inserted} rows inserted (data_source='${DATA_SOURCE}', benchmark ${BENCHMARK_UNIVERSE_VERSION}), ${rowsToInsert.length - inserted} skipped (already existed).`);
   await pool.end();
 }
 
