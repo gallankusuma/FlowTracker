@@ -84,6 +84,22 @@ const { IDX_TICKERS: TOP_STOCKS } = require('./modules/tickers');
 // between the live and historical paths.
 const { BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS, benchmarkCoverage } = require('./modules/benchmark_universe');
 
+/**
+ * The snapshot generations a historical consumer may read.
+ *
+ * ONE list, because three copies of it is what broke: the F5 migration replaced
+ * backfill_v2 with backfill_v3_f5v1, factor-history was updated, and the two
+ * other consumers were not — so /api/signal-scanner-history silently dropped
+ * from 121 sessions of history to 23. Nothing errored; the older half of the
+ * series simply stopped existing for those endpoints.
+ *
+ * 'backfill_v2' stays listed so a database that has not run the migration keeps
+ * working. 'backfill' is deliberately absent: that generation is the 885
+ * contaminated rows from the 2026-07-19 leakage incident and must never be read.
+ */
+const CLEAN_SIGNAL_HISTORY_SOURCES = ['live', 'backfill_v2', 'backfill_v3_f5v1'];
+const CLEAN_SOURCES_SQL = CLEAN_SIGNAL_HISTORY_SOURCES.map(s => `'${s}'`).join(',');
+
 // ── Yahoo Finance — Official IDX closing prices (free, no API key) ─────────────
 const YF_CACHE_MS = 10 * 60 * 1000; // 10 min
 let _yfCache    = {};
@@ -452,7 +468,9 @@ async function setupDB() {
     ['f12_ema_trend', 'FLOAT DEFAULT NULL'],
     ['f13_support_resistance', 'FLOAT DEFAULT NULL'],
     ['f14_atr', 'FLOAT DEFAULT NULL'],
-    ['data_source', "ENUM('live','backfill') DEFAULT 'live'"],
+    // VARCHAR, not ENUM — see the MODIFY below. A fresh database now gets the
+    // right type on creation instead of relying on the widening migration.
+    ['data_source', "VARCHAR(32) NOT NULL DEFAULT 'live'"],
     // Regime gate shadow mode (P1 follow-up #13, 2026-07-30) — logs what a
     // counter-trend gate on detectPriceRegime WOULD have decided, never
     // enforced. price_regime_at_signal is the PER-INSTRUMENT regime (distinct
@@ -471,6 +489,21 @@ async function setupDB() {
   // then run 61 -> 68 -> 72 across rows measured against different denominators
   // and look like a stock strengthening. Stamped per row instead, so a change in
   // the benchmark can never be mistaken for a change in the stock.
+  // PROVENANCE IS A LABEL, NOT A CLOSED SET.
+  //
+  // data_source was ENUM('live','backfill'), so writing 'backfill_v3_f5v1'
+  // stored '' for all 27,719 rows — MySQL accepted the invalid value without
+  // erroring, and the loss was only visible by reading the table back. Widening
+  // it by hand fixed production and left a fresh database ready to repeat the
+  // bug, which is exactly the state a schema must never be in.
+  //
+  // VARCHAR because every research generation adds a label. Making that require
+  // a schema migration is what turns "record the provenance" into a chore people
+  // route around.
+  await pool.query(
+    `ALTER TABLE idx_signal_history MODIFY data_source VARCHAR(32) NOT NULL DEFAULT 'live'`
+  ).catch(() => {});
+
   for (const [col, def] of [
     ['f5_benchmark_version',  'VARCHAR(32) NULL'],
     ['f5_benchmark_observed', 'SMALLINT NULL'],
@@ -6603,7 +6636,7 @@ app.get('/api/idx-deepdive/:code', async (req, res) => {
               f1_concentration, f2_trend, f3_volume_z, f4_momentum, f5_rel_strength,
               f6_breadth, f7_alignment, f8_streak, f9_rsi, f10_macd, f11_bollinger,
               f12_ema_trend, f13_support_resistance, f14_atr
-       FROM idx_signal_history WHERE stock_code = ? AND data_source IN ('live', 'backfill_v2') ORDER BY data_date ASC`,
+       FROM idx_signal_history WHERE stock_code = ? AND data_source IN (${CLEAN_SOURCES_SQL}) ORDER BY data_date ASC`,
       [ticker]
     );
     const priceIndexByDate = new Map(priceHistory.map((p, i) => [p.date, i]));
@@ -7291,7 +7324,7 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
               f12_ema_trend, f13_support_resistance, f14_atr
          FROM idx_signal_history
         WHERE stock_code = ? AND data_date IN (?)
-          AND data_source IN ('live','backfill_v2','backfill_v3_f5v1')`,
+          AND data_source IN (${CLEAN_SOURCES_SQL})`,
       [ticker, sessions]);
     const snapMap = Object.fromEntries(snapRows.map(r => [toDateStr(r.data_date), r]));
 
@@ -7379,12 +7412,21 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
       // by name. Every other historical endpoint already filters on this — a
       // pattern classifier reading rows we KNOW are contaminated would be
       // learning from evidence this project has already disowned.
-      allowedSources: ['live', 'backfill_v2', 'backfill_v3_f5v1'],
-      // Whether every row in the window shares one benchmark. Research must not
-      // read a mixed-benchmark series as one continuous measurement.
-      f5BenchmarkConsistent: (() => {
-        const vs = new Set(history.filter(h => h.observed).map(h => h.f5BenchmarkVersion));
-        return vs.size <= 1;
+      allowedSources: CLEAN_SIGNAL_HISTORY_SOURCES,
+      // TRI-STATE, because a boolean lied here. Rows written before the contract
+      // carry version null, so a window made entirely of them collapsed to
+      // Set{null}, size 1, and reported consistent:true — "we have no idea what
+      // benchmark produced any of this" presented as "all the same benchmark".
+      // For research those are opposite answers.
+      //
+      //   CONSISTENT  every observed row names the same benchmark
+      //   MIXED       two or more benchmarks, or some rows unlabelled
+      //   UNKNOWN     nothing observed, or nothing labelled
+      f5BenchmarkConsistency: (() => {
+        const vs = history.filter(h => h.observed).map(h => h.f5BenchmarkVersion);
+        if (!vs.length || vs.every(v => v === null)) return 'UNKNOWN';
+        if (vs.some(v => v === null)) return 'MIXED';
+        return new Set(vs).size === 1 ? 'CONSISTENT' : 'MIXED';
       })(),
       window,
       latest,
@@ -7409,13 +7451,13 @@ app.get('/api/signal-scanner-history', async (req, res) => {
     const { date } = req.query;
     if (!date) {
       const [dateRows] = await pool.query(
-        `SELECT DISTINCT data_date FROM idx_signal_history WHERE data_source IN ('live','backfill_v2') ORDER BY data_date DESC LIMIT 120`
+        `SELECT DISTINCT data_date FROM idx_signal_history WHERE data_source IN (${CLEAN_SOURCES_SQL}) ORDER BY data_date DESC LIMIT 120`
       );
       return res.json({ dates: dateRows.map(r => toDateStr(r.data_date)) });
     }
 
     const [rows] = await pool.query(
-      `SELECT * FROM idx_signal_history WHERE data_date = ? AND data_source IN ('live','backfill_v2')`,
+      `SELECT * FROM idx_signal_history WHERE data_date = ? AND data_source IN (${CLEAN_SOURCES_SQL})`,
       [date]
     );
     if (!rows.length) return res.json({ data: [], date, count: 0 });

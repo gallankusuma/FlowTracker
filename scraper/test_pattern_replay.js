@@ -51,7 +51,7 @@ const get = async (path) => {
   // A ticker that actually has history, chosen from the data rather than pinned.
   const [[pick]] = await pool.query(
     `SELECT stock_code FROM idx_signal_history
-      WHERE data_source IN ('live','backfill_v2')
+      WHERE data_source IN ('live','backfill_v2','backfill_v3_f5v1')
       GROUP BY stock_code ORDER BY COUNT(*) DESC LIMIT 1`);
   const TICKER = pick.stock_code;
   console.log(`\nPattern Replay — ticker ${TICKER}\n`);
@@ -90,6 +90,7 @@ const get = async (path) => {
   await t('CONTAMINATED backfill rows are excluded', async () => {
     const { body } = await get(`/api/signal-scanner/ticker/${TICKER}/factor-history?range=20D`);
     assert.deepStrictEqual(body.allowedSources, ['live', 'backfill_v2', 'backfill_v3_f5v1']);
+    assert.ok(!body.allowedSources.includes('backfill'), 'the contaminated generation is readable');
     for (const h of body.history) {
       if (!h.observed) continue;
       assert.notStrictEqual(h.dataSource, 'backfill',
@@ -105,7 +106,7 @@ const get = async (path) => {
         WHERE h.data_source = 'backfill'
           AND NOT EXISTS (SELECT 1 FROM idx_signal_history c
                            WHERE c.stock_code = h.stock_code AND c.data_date = h.data_date
-                             AND c.data_source IN ('live','backfill_v2'))
+                             AND c.data_source IN ('live','backfill_v2','backfill_v3_f5v1'))
         LIMIT 1`);
     if (!legacy) { console.log('          (no contaminated-only rows remain — rule holds vacuously)'); return; }
     const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
@@ -213,10 +214,28 @@ const get = async (path) => {
 
   await t('factor-history reports whether a window shares one benchmark', async () => {
     const { body } = await get(`/api/signal-scanner/ticker/${TICKER}/factor-history?range=10D`);
-    assert.ok(Object.prototype.hasOwnProperty.call(body, 'f5BenchmarkConsistent'));
+    assert.ok(['CONSISTENT', 'MIXED', 'UNKNOWN'].includes(body.f5BenchmarkConsistency),
+      `unexpected consistency verdict: ${body.f5BenchmarkConsistency}`);
     for (const h of body.history.filter(x => x.observed)) {
       assert.ok(Object.prototype.hasOwnProperty.call(h, 'f5BenchmarkVersion'),
         `${h.date} carries no benchmark provenance`);
+    }
+  });
+
+  await t('an all-unlabelled window reports UNKNOWN, never CONSISTENT', async () => {
+    // 'live' rows predate the contract and carry no benchmark version. A window
+    // made only of them must not claim they share one.
+    const [rows] = await pool.query(
+      `SELECT data_date FROM idx_signal_history
+        WHERE data_source = 'live' AND f5_benchmark_version IS NULL
+        ORDER BY data_date DESC LIMIT 1`);
+    if (!rows.length) { console.log('          (no unlabelled rows left — holds vacuously)'); return; }
+    const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const { body } = await get(
+      `/api/signal-scanner/ticker/${TICKER}/factor-history?range=6D&endSession=${iso(rows[0].data_date)}`);
+    const observed = body.history.filter(h => h.observed);
+    if (observed.length && observed.every(h => h.f5BenchmarkVersion === null)) {
+      assert.strictEqual(body.f5BenchmarkConsistency, 'UNKNOWN');
     }
   });
 

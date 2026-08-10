@@ -57,7 +57,12 @@ const GAP_END = argOf('--to', '2026-06-12'); // exclusive — 'live' data_source
 // A new benchmark contract means a new generation label, not a relabelled old
 // one: rows written before it were measured against a different denominator and
 // must stay distinguishable.
-const DATA_SOURCE = argOf('--source', 'backfill_v2');
+// Defaults to the CURRENT generation. It defaulted to 'backfill_v2' — the label
+// this contract replaced — so anyone running the script without flags would have
+// produced v1-benchmark F5 values wearing the old generation's name, quietly
+// undoing the provenance the migration had just established. --source stays for
+// deliberate research runs; the default must be the truth.
+const DATA_SOURCE = argOf('--source', 'backfill_v3_f5v1');
 // Controlled migration. Deletes ONLY prior backfill generations in the range —
 // never 'live', which is genuine same-day evidence and is not ours to rewrite.
 const REPLACE_BACKFILL = process.argv.includes('--replace-backfill');
