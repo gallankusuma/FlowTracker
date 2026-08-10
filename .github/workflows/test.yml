@@ -1,0 +1,51 @@
+# Runs the unit suite on every push and pull request.
+#
+# WHY THIS EXISTS
+# ---------------
+# Every recent commit has claimed "N tests passing" and the reviewer has had to
+# take that on trust, because `statuses: []` meant there was no independent
+# evidence — the number came from the same person making the change. This turns
+# the claim into something checkable by anyone reading the commit.
+#
+# UNIT ONLY, DELIBERATELY. `test:integration` needs a populated MySQL — real
+# broker rows, a session calendar, months of snapshots — and a CI database
+# seeded with fixtures would assert against data invented to make it pass. Those
+# suites stay where the real data is; this one covers the 372 assertions that
+# depend on nothing external.
+#
+# Runs on both branches: all work is on `master` while `main` holds only an
+# initial commit, and CI should not be waiting on that being sorted out.
+name: tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scraper
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: scraper/package-lock.json
+
+      # Puppeteer is a dependency of the scraper but no unit test drives a
+      # browser, and downloading Chromium would add minutes to every run.
+      - name: Install
+        run: npm ci
+        env:
+          PUPPETEER_SKIP_DOWNLOAD: 'true'
+          PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: 'true'
+
+      - name: Unit tests
+        run: npm run test:unit
