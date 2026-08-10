@@ -559,6 +559,25 @@ const MODAL_TOTAL   = 100_000_000; // Rp 100 juta
 const RISK_PER_TRADE = 0.02;        // 2% per trade = Rp 2 juta
 const MAX_POS_PCT   = 0.30;         // max 30% per posisi = Rp 30 juta
 
+/**
+ * The price a journalled position was entered at.
+ *
+ * ONE definition, shared by the table, the CSV export and the sorter, so they
+ * cannot disagree about what "entry" means. Returns 0 — not 1 — when nothing is
+ * stored: the old `|| 1` fallback turned a missing entry into a plausible-looking
+ * Rp 1 and, worse, into a float-P/L denominator that reported percentages in the
+ * hundreds of thousands.
+ *
+ * Midpoint of the range, matching calcPosition(). Rows journalled at a live
+ * price carry min === max, so for those this simply is that price.
+ */
+function entryOf(rec: any): number {
+  const lo = Number(rec?.entry_min) || 0;
+  const hi = Number(rec?.entry_max) || 0;
+  if (hi > 0 && lo > 0) return (lo + hi) / 2;
+  return hi || lo || 0;
+}
+
 function calcPosition(rec: any) {
   const entryMin = Number(rec.entry_min) || 0;
   const entryMax = Number(rec.entry_max) || 0;
@@ -2047,15 +2066,18 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
                 ["Ticker","Pattern","ConvictionTier","Direction","Entry","SL","T1","T2","R:R","Lot","Modal","EstT1","EstT2","HargaActual","FloatPL","DetectedDate","Status"],
                 arr.map((r: any) => {
                   const pos = calcPosition(r);
-                  const entryPrice = r.entry_price || r.entry_max || 1;
+                  const entryPrice = entryOf(r);
                   const mPrice = r.market_price || entryPrice;
-                  const floatPct = ((mPrice - entryPrice) / entryPrice) * 100;
+                  const floatPct = entryPrice > 0 ? ((mPrice - entryPrice) / entryPrice) * 100 : null;
                   return [
                     r.ticker, r.pattern_type, r.convictionTier ?? "", r.direction,
-                    pos ? Math.round(pos.entry) : "", r.stop_loss, r.target_1, r.target_2, r.risk_reward,
+                    // Same correction as the table: entry is a stored price, so
+                    // it must not vanish from the export just because the sizer
+                    // declined to allocate under shadow mode.
+                    entryPrice > 0 ? Math.round(entryPrice) : "", r.stop_loss, r.target_1, r.target_2, r.risk_reward,
                     pos ? pos.finalLots : "", pos ? Math.round(pos.finalAlloc) : "",
                     pos ? Math.round(pos.gainT1) : "", pos ? Math.round(pos.gainT2) : "",
-                    r.market_price ?? "", r.market_price ? floatPct.toFixed(2) : "",
+                    r.market_price ?? "", (r.market_price && floatPct !== null) ? floatPct.toFixed(2) : "",
                     r.detected_date, r.status,
                   ];
                 })
@@ -2170,14 +2192,26 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
                 const pos  = calcPosition(r);
                 const isClosed = ["HIT_T1","HIT_T2","STOPPED","EXPIRED"].includes(r.status);
                 
-                const entryPrice = r.entry_price || r.entry_max || 1;
+                // Midpoint of the journalled entry range, matching what
+                // calcPosition() sizes against — for a row saved at a single
+                // live price, min and max are equal and this is that price.
+                // Reading entry_max alone would quietly disagree with the sizer
+                // the moment a genuine range is stored.
+                const entryPrice = entryOf(r);
                 const live = livePrices[r.ticker];
                 const mPrice = (r.status === "OPEN" && live?.price) ? live.price : (r.market_price || entryPrice);
                 const isLive = r.status === "OPEN" && !!live?.price;
-                const floatPts = mPrice - entryPrice;
-                const floatPct = (floatPts / entryPrice) * 100;
-                const floatStr = floatPts > 0 ? `+${floatPts.toFixed(0)} (${floatPct.toFixed(1)}%)` : `${floatPts.toFixed(0)} (${floatPct.toFixed(1)}%)`;
-                const floatColor = floatPts > 0 ? "#10b981" : floatPts < 0 ? "#f87171" : "var(--text-muted)";
+                // Without an entry price there is no float P/L to state. The old
+                // `|| 1` fallback hid this by dividing by Rp 1, which turned an
+                // unknown entry into a six-figure percentage that looked like a
+                // measurement.
+                const floatPts = entryPrice > 0 ? mPrice - entryPrice : null;
+                const floatPct = entryPrice > 0 ? ((mPrice - entryPrice) / entryPrice) * 100 : null;
+                const floatStr = floatPts === null || floatPct === null
+                  ? "–"
+                  : `${floatPts > 0 ? "+" : ""}${floatPts.toFixed(0)} (${floatPct.toFixed(1)}%)`;
+                const floatColor = floatPts === null ? "var(--text-muted)"
+                  : floatPts > 0 ? "#10b981" : floatPts < 0 ? "#f87171" : "var(--text-muted)";
                 
                 return (
                   <div key={r.id} style={{
@@ -2210,9 +2244,22 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
                       {r.direction === "BULLISH" ? "▲ B" : "▼ BR"}
                     </span>
 
-                    {/* Price levels */}
+                    {/* Price levels.
+                        ENTRY COMES FROM THE RECORD, NOT FROM THE SIZER. It used
+                        to read `pos.entry`, and `calcPosition` returns null
+                        whenever sizeMultiplier is 0 — which is the NORMAL state
+                        today, because conviction sizing runs in SHADOW_ONLY
+                        mode (modules/conviction.js: no measured edge per EXP-018
+                        and EXP-005). So every journalled row showed a dash where
+                        its entry price should be, while SL/T1/T2 beside it
+                        rendered fine.
+                        Shadow mode zeroes SIZE, not VISIBILITY. Entry is the
+                        price the position was journalled at — a stored fact, not
+                        a sizing output — so it must render regardless. LOT,
+                        MODAL and EST T1/T2 below stay blank on purpose: those
+                        really are sizing outputs, and there is no size. */}
                     <span style={{ fontSize: 11, fontWeight: 700, color: "var(--text-primary)" }}>
-                      {pos ? Math.round(pos.entry).toLocaleString("id-ID") : "–"}
+                      {entryPrice > 0 ? Math.round(entryPrice).toLocaleString("id-ID") : "–"}
                     </span>
                     <span style={{ fontSize: 11, color: "#f87171", fontWeight: 700 }}>{Number(r.stop_loss).toLocaleString("id-ID")}</span>
                     <span style={{ fontSize: 11, color: "#34d399", fontWeight: 700 }}>{Number(r.target_1).toLocaleString("id-ID")}</span>
