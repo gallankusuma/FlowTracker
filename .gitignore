@@ -72,3 +72,11 @@ Revisi/
 
 # Written by the deploy, not by a developer: the commit a box is actually running.
 scraper/.deployed-commit
+
+# Scratch file for pasting review feedback. Deliberately untracked: it has twice
+# held things that must never reach a public repo — most recently a rotated
+# MySQL password and an admin login, one `git add .` away from being pushed.
+# The previous credential leak reached production via a committed test file and
+# needed git-filter-repo to purge, so this one is kept out by construction
+# rather than by remembering.
+Review.md
