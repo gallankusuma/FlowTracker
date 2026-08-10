@@ -33,6 +33,7 @@ const DB = { host: process.env.DB_HOST || 'localhost', user: process.env.DB_USER
              password: process.env.DB_PASSWORD, database: process.env.DB_NAME || 'erp_manufacturing' };
 
 const CLEAN = ['live', 'backfill_v2', 'backfill_v3_f5v1'];
+const { BENCHMARK_UNIVERSE_VERSION } = require('./modules/benchmark_universe');
 const WIN_THRESHOLD = Number(process.argv.includes('--win') ? process.argv[process.argv.indexOf('--win') + 1] : 5);
 const HORIZON = 5;          // forward sessions
 const LOOKBACK = 5;         // H-5..H-1
@@ -77,9 +78,18 @@ const iso = d => (d instanceof Date
   const sessions = calRows.map(r => iso(r.date));
   const idxOf = new Map(sessions.map((d, i) => [d, i]));
 
+  // BENCHMARK PROVENANCE IS ENFORCED, not merely available.
+  //
+  // F5 is the factor under study, so a row whose benchmark is UNKNOWN or from
+  // another generation cannot join the cohort — mixing them would let a change
+  // in the denominator read as a change in the stocks. Rows predating the
+  // contract carry NULL and are excluded here rather than assumed to match.
   const [snapRows] = await pool.query(
-    `SELECT data_date, stock_code, ${FACTORS.map(f => f[0]).join(', ')}
-       FROM idx_signal_history WHERE data_source IN (?)`, [CLEAN]);
+    `SELECT data_date, stock_code, f5_benchmark_version, f5_benchmark_observed,
+            ${FACTORS.map(f => f[0]).join(', ')}
+       FROM idx_signal_history
+      WHERE data_source IN (?) AND f5_benchmark_version = ?`,
+    [CLEAN, BENCHMARK_UNIVERSE_VERSION]);
   const snap = new Map();
   for (const r of snapRows) snap.set(`${r.stock_code}|${iso(r.data_date)}`, r);
 
@@ -92,14 +102,30 @@ const iso = d => (d instanceof Date
     if (!closesBy.has(t)) closesBy.set(t, []);
     closesBy.get(t).push({ date: d, close: c });
   }
-  // Prior 20-session high, strictly BEFORE the entry bar, so the level a
-  // breakout must clear is knowable at entry rather than in hindsight.
+  // THE PRIOR HIGH IS 20 CANONICAL SESSIONS, NOT 20 PRICE ROWS.
+  //
+  // Walking back 20 rows of idx_stock_prices counts BARS, and this repo has
+  // documented repeatedly that the price table has carried non-session rows —
+  // weekends, IDX holidays, and carried-forward duplicates of the previous
+  // close. Every one of those shifts a rolling window, so "20 rows back" could
+  // reach a different distance for different tickers and quietly lower the bar
+  // a breakout had to clear.
+  //
+  // The axis is idx_ihsg_history, and a window missing any required session's
+  // price is EXCLUDED rather than filled by reaching further back — a shorter
+  // window with an older high is not the same test.
   const priorHigh = new Map();
-  for (const [t, arr] of closesBy) {
-    for (let i = HIGH_LOOKBACK; i < arr.length; i++) {
-      let hi = -Infinity;
-      for (let k = i - HIGH_LOOKBACK; k < i; k++) if (arr[k].close > hi) hi = arr[k].close;
-      priorHigh.set(`${t}|${arr[i].date}`, hi);
+  let incompleteWindows = 0;
+  for (const t of closesBy.keys()) {
+    for (let i = HIGH_LOOKBACK; i < sessions.length; i++) {
+      let hi = -Infinity, whole = true;
+      for (let k = i - HIGH_LOOKBACK; k < i; k++) {
+        const c = px.get(`${t}|${sessions[k]}`);
+        if (c === undefined) { whole = false; break; }
+        if (c > hi) hi = c;
+      }
+      if (!whole) { incompleteWindows++; continue; }
+      priorHigh.set(`${t}|${sessions[i]}`, hi);
     }
   }
 
@@ -181,13 +207,25 @@ const iso = d => (d instanceof Date
   console.log('\nF5 crossing 50 during H-5..H-1:');
   let wCross = 0, wTot = 0, cCross = 0, cTot = 0;
   for (const d of perDate) {
+    // Number(null) is 0, so mapping before filtering turned an unmeasured F5
+    // into the strongest possible bearish reading — and one that sits below 50,
+    // making a "crossing" out of a value that was never observed. Nulls are
+    // dropped BEFORE conversion, and a path missing any session is skipped
+    // rather than shortened.
+    const f5Path = p => p
+      .map(s => s.f5_rel_strength)
+      .filter(v => v !== null && v !== undefined)
+      .map(Number)
+      .filter(Number.isFinite);
     for (const p of d.win) {
-      const v = p.map(s => Number(s.f5_rel_strength)).filter(Number.isFinite);
-      if (v.length === LOOKBACK) { wTot++; if (v[0] < 50 && v[v.length - 1] >= 50) wCross++; }
+      const v = f5Path(p);
+      if (v.length !== LOOKBACK) continue;
+      wTot++; if (v[0] < 50 && v[v.length - 1] >= 50) wCross++;
     }
     for (const p of d.ctl) {
-      const v = p.map(s => Number(s.f5_rel_strength)).filter(Number.isFinite);
-      if (v.length === LOOKBACK) { cTot++; if (v[0] < 50 && v[v.length - 1] >= 50) cCross++; }
+      const v = f5Path(p);
+      if (v.length !== LOOKBACK) continue;
+      cTot++; if (v[0] < 50 && v[v.length - 1] >= 50) cCross++;
     }
   }
   console.log(`  winners  ${wCross}/${wTot} (${wTot ? (wCross / wTot * 100).toFixed(1) : 0}%)`);
