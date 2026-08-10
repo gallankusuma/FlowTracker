@@ -2600,6 +2600,39 @@ async function runDailyCron(dateOverride) {
   
   try { await saveIHSGFactorSnapshot(); console.log('  📊 IHSG factor snapshot saved'); } catch (e) { console.log('  ⚠️ IHSG factor snapshot failed:', e.message); }
 
+  // ── SIGNAL SNAPSHOT — a scheduled stage, not a page-view side effect ──────
+  //
+  // Runs last, after prices, broker data and concentration have landed, so it
+  // scores the session it is dated for rather than whatever happened to exist
+  // when someone opened a browser tab.
+  //
+  // runSignalScan validates readiness itself and returns 503 when the required
+  // inputs are not current — so a stale night writes NOTHING rather than
+  // recording a score built on absent inputs. That refusal is the point: the
+  // missing 2026-08-03..06 snapshots are what a correct refusal looks like from
+  // the outside, and inventing them would have been worse than the gap.
+  try {
+    const scan = await runSignalScan({ persist: true });
+    if (scan.status === 200) {
+      results.signalSnapshot = { date: scan.payload.date, rows: scan.payload.data?.length || 0 };
+      await systemHealth.recordJobRun(pool, {
+        job: 'signal_snapshot', status: 'OK',
+        records: scan.payload.data?.length || 0, dataDate: scan.payload.date,
+      }).catch(() => {});
+    } else {
+      const why = scan.payload?.error || `HTTP ${scan.status}`;
+      console.log(`  ⏭  [SNAPSHOT] refused: ${why}`);
+      await systemHealth.recordJobRun(pool, {
+        job: 'signal_snapshot', status: 'FAILED', error: String(why).slice(0, 500),
+      }).catch(() => {});
+    }
+  } catch (e) {
+    console.log('  ⚠️ [SNAPSHOT] failed:', e.message);
+    await systemHealth.recordJobRun(pool, {
+      job: 'signal_snapshot', status: 'FAILED', error: e.message,
+    }).catch(() => {});
+  }
+
   results.completed = new Date().toISOString();
   // PERSISTENT record of the nightly pull. Everything else in this system's
   // health story is derived from data rather than self-reports, and this job —
@@ -6450,7 +6483,24 @@ app.get('/api/idx-deepdive/:code', async (req, res) => {
 });
 
 // ─── Signal Scanner API ─────────────────────────────────────────────────────
-app.get('/api/signal-scanner', async (req, res) => {
+/**
+ * THE SCAN, SEPARATED FROM THE REQUEST THAT USED TO OWN IT.
+ *
+ * Snapshots used to be written as a side effect of GET /api/signal-scanner —
+ * so `idx_signal_history` only grew when a human happened to open the page.
+ * That is why 2026-08-03..06 have no snapshots at all: the endpoint was
+ * correctly refusing during the broker outage and nobody called it afterwards.
+ * A GET should not be the scheduler, and page views should not be the history
+ * mechanism.
+ *
+ * One implementation, two callers: the route reads (`persist:false`), the
+ * nightly pipeline writes (`persist:true`). Duplicating the scoring into a
+ * separate job instead would have created the second implementation this
+ * codebase has spent the week removing everywhere else.
+ *
+ * @returns {{status:number, payload:object}}
+ */
+async function runSignalScan({ persist = false } = {}) {
   try {
     const toStr = d => (d instanceof Date ? d.toISOString().split('T')[0] : String(d).split('T')[0]);
 
@@ -6458,7 +6508,7 @@ app.get('/api/signal-scanner', async (req, res) => {
     const [dateRows] = await pool.query(
       'SELECT DISTINCT date FROM idx_broker_summary ORDER BY date DESC LIMIT 20'
     );
-    if (dateRows.length === 0) return res.json({ data: [], date: '', source: 'empty' });
+    if (dateRows.length === 0) return { status: 200, payload: { data: [], date: '', source: 'empty' } };
 
     const dates = dateRows.map(r => toStr(r.date));
     const latestDate = dates[0];
@@ -6500,7 +6550,7 @@ app.get('/api/signal-scanner', async (req, res) => {
     });
     if (!ready.enabled) {
       const bf = ready.brokerFreshness;
-      return res.status(503).json({
+      return { status: 503, payload: {
         data: [], date: latestDate, source: 'stale-broker-feed',
         stale: true,
         brokerState: bf?.state || null,
@@ -6513,7 +6563,7 @@ app.get('/api/signal-scanner', async (req, res) => {
         error: `Broker inputs are not usable: ${ready.blocking.join('; ')}. ` +
                `Scores are not computed — concentration and flow factors have no data for the ` +
                `session a score would be dated to, so the score would be built on inputs that do not exist.`,
-      });
+      } };
     }
 
     // ── 2. Score EVERY tracked ticker (TOP_STOCKS), not just whichever subset
@@ -6820,7 +6870,15 @@ app.get('/api/signal-scanner', async (req, res) => {
     let regimeAtSignal = 'DEFAULT';
     try { const rd = await detectRegime(pool); regimeAtSignal = rd.regime; } catch {}
 
-    (async () => {
+    // PERSIST ONLY WHEN THE PIPELINE ASKS, AND AWAIT IT.
+    //
+    // This was a fire-and-forget IIFE inside a GET handler: it wrote history on
+    // every page view, and because nothing awaited it a failure could only ever
+    // appear in a log nobody reads. Now the scheduled run owns it, the write is
+    // awaited so a failure is a failure of the job, and a page view changes
+    // nothing.
+    let snapshotWritten = 0;
+    if (persist) {
       try {
         for (const r of results) {
           await pool.query(`
@@ -6854,9 +6912,16 @@ app.get('/api/signal-scanner', async (req, res) => {
               r.factors.supportResistance, r.factors.atr,
               r.price, regimeAtSignal,
               r.priceRegime, r.regimeGateShadow?.wouldBlock ? 1 : 0, r.regimeGateShadow?.reason ?? null]);
+          snapshotWritten++;
         }
-      } catch (e) { console.error('Signal history save error:', e.message); }
-    })();
+        console.log(`  📸 [SNAPSHOT] ${snapshotWritten} factor rows stored for ${latestDate}`);
+      } catch (e) {
+        // Rethrown, not swallowed. A pipeline stage that could not record the
+        // evidence has failed, and the caller records that in ft_system_health.
+        console.error('Signal history save error:', e.message);
+        throw e;
+      }
+    }
 
     const bullishCount = results.filter(r => r.score >= 56).length;
     const bearishCount = results.filter(r => r.score <= 44).length;
@@ -6866,7 +6931,7 @@ app.get('/api/signal-scanner', async (req, res) => {
     let currentRegime = { regime: 'DEFAULT', confidence: 0 };
     try { currentRegime = await detectRegime(pool); } catch {}
 
-    res.json({
+    return { status: 200, payload: {
       data: results,
       date: latestDate,
       dates: dates.slice(0, 5),
@@ -6891,12 +6956,22 @@ app.get('/api/signal-scanner', async (req, res) => {
         avgChange: Math.round(marketAvgChange * 100) / 100,
         breadthPct: results.length > 0 ? Math.round((bullishCount / results.length) * 100) : 50,
       },
-    });
+    } };
 
   } catch (err) {
     console.error('Signal scanner error:', err.message);
-    res.json({ data: [], error: err.message });
+    // 500, not a 200 carrying an error string: a caller that only checks res.ok
+    // would otherwise render an empty scan as a successful quiet market.
+    return { status: 500, payload: { data: [], error: err.message } };
   }
+}
+
+/**
+ * READ-ONLY. This route no longer writes history — see runSignalScan above.
+ */
+app.get('/api/signal-scanner', async (req, res) => {
+  const r = await runSignalScan({ persist: false });
+  res.status(r.status).json(r.payload);
 });
 
 // ─── Signal Scanner — historical time frame ──────────────────────────────────

@@ -12,7 +12,18 @@ gives a wrong picture of what the system does:
 1. **PM2** — keeps `flowtracker` (Next.js, :3201) and `flowtracker-scraper` (Express, :3100) alive.
 2. **`scheduleDailyCron()` inside `server.js`** — a 30-second `setInterval` that fires once
    per weekday after 12:30 UTC (19:30 WIB) and runs the IDX data pull, concentration
-   calculation, harmonic scan and the 5-step AWO learning pipeline.
+   calculation, harmonic scan, the 5-step AWO learning pipeline, and — since
+   2026-08-10 — the **signal factor snapshot**.
+
+   **The snapshot used to be a side effect of `GET /api/signal-scanner`.** History only
+   grew when a human opened the page, which is why 2026-08-03..06 have no snapshots at
+   all: the endpoint was correctly refusing during the broker outage and nobody called it
+   afterwards. It is now the last stage of this job, after prices, broker data and
+   concentration have landed, so it scores the session it is dated for. `runSignalScan()`
+   is the single implementation; the route calls it with `persist:false` and reads, the
+   pipeline calls it with `persist:true` and writes. It validates readiness itself and
+   writes NOTHING on a stale night rather than recording a score built on absent inputs.
+   Outcome is recorded to `ft_system_health` as `signal_snapshot`.
 3. **This system crontab** — a Python subsystem that neither of the above knows about.
 
 A 2026-08-02 code study that examined only PM2 and `server.js` reached two conclusions
