@@ -29,6 +29,7 @@ require('dotenv').config();
 const mysql = require('mysql2/promise');
 const stats = require('./modules/statistics');
 const { calcTechnicalFactors, computeWeeklyTrend } = require('./awo_technical');
+const { BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS } = require('./modules/benchmark_universe');
 
 const DB = {
   host: process.env.DB_HOST || 'localhost',
@@ -108,17 +109,30 @@ async function main() {
     if (Number(r.net_val) > 0) e.buyers++; else if (Number(r.net_val) < 0) e.sellers++;
   }
 
-  const changeByDate = new Map();
+  // F5 IS MEASURED AGAINST THE FROZEN BENCHMARK UNIVERSE, same as the live path.
+  //
+  // This used to average `changeByDate`, which was built from every ticker with
+  // >= 250 price bars — a different cross-section from the one the live scanner
+  // uses, so the historical F5 series and the live one were not comparable. The
+  // research this feeds is precisely about F5 trajectories, so an incomparable
+  // benchmark would have invalidated the result before it was measured.
+  const benchSet = new Set(BENCHMARK_TICKERS);
+  const benchChangeByDate = new Map();
   for (const t of tickers) {
+    if (!benchSet.has(t)) continue;
     const c = ohlcMap.get(t);
+    if (!c) continue;
     for (let i = 1; i < c.length; i++) {
       const chg = (c[i].close / c[i - 1].close - 1) * 100;
-      if (!changeByDate.has(c[i].date)) changeByDate.set(c[i].date, []);
-      changeByDate.get(c[i].date).push(chg);
+      if (!Number.isFinite(chg)) continue;
+      if (!benchChangeByDate.has(c[i].date)) benchChangeByDate.set(c[i].date, []);
+      benchChangeByDate.get(c[i].date).push(chg);
     }
   }
   const marketAvgByDate = new Map();
-  for (const [date, arr] of changeByDate) marketAvgByDate.set(date, stats.mean(arr));
+  for (const [date, arr] of benchChangeByDate) marketAvgByDate.set(date, stats.mean(arr));
+  console.log(`F5 benchmark: ${BENCHMARK_UNIVERSE_VERSION} (${BENCHMARK_TICKERS.length} tickers, ` +
+              `${[...benchSet].filter(t => ohlcMap.has(t)).length} with price history)`);
 
   console.log('Computing factor scores + outcomes for the gap window...\n');
   let rowsToInsert = [];

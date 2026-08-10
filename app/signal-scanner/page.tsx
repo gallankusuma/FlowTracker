@@ -259,6 +259,11 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
   // null = canonical date order (newest first), which is the window's own shape.
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortAsc, setSortAsc] = useState(false);
+  // "" = latest. Anything else anchors the window to a past session, which is
+  // the difference between watching the current trajectory and asking what the
+  // factors looked like BEFORE a move.
+  const [anchor, setAnchor] = useState("");
+  const [sessions, setSessions] = useState<string[]>([]);
   const [data, setData] = useState<FactorHistoryResp | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -266,7 +271,8 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
   useEffect(() => {
     let cancelled = false;
     setLoading(true); setErr(null);
-    fetch(`${API_BASE}/api/signal-scanner/ticker/${encodeURIComponent(ticker)}/factor-history?range=${range}`)
+    fetch(`${API_BASE}/api/signal-scanner/ticker/${encodeURIComponent(ticker)}/factor-history?range=${range}`
+          + (anchor ? `&endSession=${anchor}` : ""))
       .then(async r => ({ ok: r.ok, json: await r.json().catch(() => ({})) }))
       .then(({ ok, json }) => {
         if (cancelled) return;
@@ -277,7 +283,19 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
       .catch(e => { if (!cancelled) setErr(String(e?.message || e)); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [ticker, range]);
+  }, [ticker, range, anchor]);
+
+  // Real sessions only. A free-text date box would push "is this a trading
+  // day?" onto the person typing, and a non-session anchor is the one input the
+  // endpoint has to silently reinterpret.
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${API_BASE}/api/exchange-sessions?limit=180`)
+      .then(r => r.json())
+      .then(j => { if (!cancelled) setSessions(j.sessions || []); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
 
   /* TWO ORDERINGS, DELIBERATELY SEPARATE.
      `rows` is always newest-first by DATE and is what every trajectory
@@ -385,6 +403,26 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                 color: range === r ? "#58a6ff" : "var(--text-muted)",
               }}>{r}</button>
           ))}
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 10, fontWeight: 700, color: "#8b949e", letterSpacing: "0.05em" }}>AS OF</span>
+          <select value={anchor} onClick={e => e.stopPropagation()}
+            onChange={e => { e.stopPropagation(); setAnchor(e.target.value); }}
+            style={{ fontSize: 10, fontWeight: 700, padding: "3px 6px", borderRadius: 4,
+                     background: anchor ? "rgba(88,166,255,0.15)" : "transparent",
+                     color: anchor ? "#58a6ff" : "var(--text-secondary)",
+                     border: `1px solid ${anchor ? "rgba(88,166,255,0.5)" : "rgba(48,54,61,0.8)"}` }}>
+            <option value="">LATEST</option>
+            {sessions.map(d => <option key={d} value={d}>{d}</option>)}
+          </select>
+          {anchor && (
+            <button onClick={e => { e.stopPropagation(); setAnchor(""); }}
+              title="Back to the latest session"
+              style={{ fontSize: 10, fontWeight: 700, padding: "3px 8px", borderRadius: 4, cursor: "pointer",
+                       background: "transparent", color: "var(--text-muted)", border: "1px solid rgba(48,54,61,0.8)" }}>
+              ✕
+            </button>
+          )}
         </div>
         {data?.window && (
           <span style={{ fontSize: 10, color: data.window.complete ? "var(--text-muted)" : "#d29922" }}>

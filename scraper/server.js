@@ -78,6 +78,11 @@ function requireAdminKey(req, res, next) {
 
 // Top IDX stocks to auto-pull daily
 const { IDX_TICKERS: TOP_STOCKS } = require('./modules/tickers');
+// The cross-section F5 is measured against. Frozen and versioned SEPARATELY from
+// TOP_STOCKS: what we scan and what we benchmark against are different
+// decisions, and letting one drag the other is how F5 became incomparable
+// between the live and historical paths.
+const { BENCHMARK_UNIVERSE_VERSION, BENCHMARK_TICKERS } = require('./modules/benchmark_universe');
 
 // ── Yahoo Finance — Official IDX closing prices (free, no API key) ─────────────
 const YF_CACHE_MS = 10 * 60 * 1000; // 10 min
@@ -5772,7 +5777,9 @@ async function computeStockFactorsLive(ticker) {
   // too since fetchYahooPrices shares its 10-min cache across the whole app.
   let marketAvgChange = 0;
   try {
-    const yfMap = await fetchYahooPrices(TOP_STOCKS);
+    // BENCHMARK_TICKERS, not TOP_STOCKS: F5's denominator must not change when
+    // the scanned universe does.
+    const yfMap = await fetchYahooPrices(BENCHMARK_TICKERS);
     const changes = Object.values(yfMap).map(v => v.changePct).filter(Number.isFinite);
     if (changes.length > 0) marketAvgChange = changes.reduce((a, b) => a + b, 0) / changes.length;
   } catch {}
@@ -6761,15 +6768,26 @@ async function runSignalScan({ persist = false } = {}) {
       if (net < 0 && !topSellerMap[r.stock_code]) topSellerMap[r.stock_code] = r.broker_code;
     }
 
+    // F5's market average spans the FROZEN BENCHMARK UNIVERSE, not `tickers`.
+    // Averaging over whatever is being scanned made the denominator move with
+    // the scan: widen the universe and every stock's relative strength shifts
+    // without a single price having changed.
+    //
+    // A benchmark name with no observation is SKIPPED rather than counted as
+    // 0.00% — a suspended stock did not "close flat", and filling it with zero
+    // drags the market average toward zero in exactly the illiquid conditions
+    // where relative strength matters most.
     const allChanges = [];
-    for (const ticker of tickers) {
+    let benchMissing = 0;
+    for (const ticker of BENCHMARK_TICKERS) {
       const yf = yfMap[ticker];
       const pHistory = priceMap[ticker] || [];
       const chg = yf?.changePct !== undefined ? yf.changePct
-        : (pHistory.length > 0 ? pHistory[pHistory.length - 1].changePct : 0);
+        : (pHistory.length > 0 ? pHistory[pHistory.length - 1].changePct : null);
+      if (chg === null || !Number.isFinite(chg)) { benchMissing++; continue; }
       allChanges.push(chg);
     }
-    const marketAvgChange = stats.mean(allChanges);
+    const marketAvgChange = allChanges.length ? stats.mean(allChanges) : 0;
 
     const [winRateRows] = await pool.query(`
       SELECT signal_type,
@@ -7044,6 +7062,12 @@ async function runSignalScan({ persist = false } = {}) {
       engine: {
         version: AWO_MODEL_VERSION,
         factors: 14,
+        // Stated so an F5 value can be traced to the cross-section it was
+        // measured against, and so a future universe change is visible in the
+        // data rather than only in a commit.
+        benchmarkUniverseVersion: BENCHMARK_UNIVERSE_VERSION,
+        benchmarkUniverseSize: BENCHMARK_TICKERS.length,
+        benchmarkObserved: BENCHMARK_TICKERS.length - benchMissing,
         weights: getActiveWeights(),
         thresholds: getActiveThresholds(),
         regime: currentRegime.regime,
@@ -7114,6 +7138,24 @@ app.get('/api/signal-scanner', async (req, res) => {
  * back with `observed: false` and null factors. Missing is not zero, and it is
  * not absent either — it is a dash the reader can see.
  */
+/**
+ * GET /api/exchange-sessions?limit=90
+ *
+ * The canonical session list, so the UI's anchor picker offers real sessions
+ * instead of a free-text date box. A date picker that accepts any day pushes
+ * the "is this a session?" question onto the person typing.
+ */
+app.get('/api/exchange-sessions', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 90, 1), 500);
+    const [rows] = await pool.query(
+      'SELECT date FROM idx_ihsg_history ORDER BY date DESC LIMIT ?', [limit]);
+    res.json({ sessions: rows.map(r => toDateStr(r.date)), count: rows.length });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) => {
   try {
     const ticker = String(req.params.ticker || '').toUpperCase().trim();
@@ -7144,6 +7186,20 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
     if (wanted) {
       if (!/^\d{4}-\d{2}-\d{2}$/.test(wanted)) {
         return res.status(400).json({ error: `Invalid endSession '${wanted}', expected YYYY-MM-DD` });
+      }
+      // A FUTURE ANCHOR IS A TYPO, NOT A REQUEST. Snapping backward is right for
+      // a weekend or a holiday, and wrong for 2099-01-01: it would quietly
+      // resolve to the newest session and hand back "today" under a date the
+      // caller plainly did not mean. Mistyping the year should fail loudly.
+      const [[latestRow]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+      const latestKnown = latestRow?.d ? toDateStr(latestRow.d) : null;
+      if (latestKnown && wanted > latestKnown) {
+        return res.status(400).json({
+          error: 'FUTURE_ANCHOR',
+          message: `endSession ${wanted} is after the newest known exchange session (${latestKnown}). ` +
+                   `Refused rather than snapped back, so a mistyped year cannot silently become "today".`,
+          latestKnownSession: latestKnown,
+        });
       }
       const [okRows] = await pool.query(
         'SELECT date FROM idx_ihsg_history WHERE date <= ? ORDER BY date DESC LIMIT 1', [wanted]);
