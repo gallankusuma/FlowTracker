@@ -36,6 +36,29 @@ const CLEAN = ['live', 'backfill_v2', 'backfill_v3_f5v1'];
 const WIN_THRESHOLD = Number(process.argv.includes('--win') ? process.argv[process.argv.indexOf('--win') + 1] : 5);
 const HORIZON = 5;          // forward sessions
 const LOOKBACK = 5;         // H-5..H-1
+const HIGH_LOOKBACK = 20;   // the range a breakout must clear
+
+/**
+ * TWO DEFINITIONS OF "WINNER", because the first answered a different question
+ * than we thought it did.
+ *
+ *   bounce    forward return >= +5%
+ *   breakout  forward return >= +5% AND the exit close clears the highest close
+ *             of the 20 sessions ending at entry
+ *
+ * "+5% in five sessions" is satisfied very comfortably by mean reversion: a
+ * stock that just fell hard and snapped back qualifies. EXP-024 found winners
+ * scored LOWER on momentum and trend beforehand — exactly what buying weakness
+ * looks like — so that test may have been rewarding bounces while reporting it
+ * as a fact about precursors.
+ *
+ * Clearing a 20-session high removes those: the stock cannot merely have
+ * recovered, it must be making new ground. If the factors STILL lean negative
+ * here, the anti-predictive reading holds and is no longer explainable by the
+ * choice of target.
+ */
+const MODE = process.argv.includes('--mode') ? process.argv[process.argv.indexOf('--mode') + 1] : 'bounce';
+if (!['bounce', 'breakout'].includes(MODE)) { console.error(`unknown --mode ${MODE}`); process.exit(1); }
 
 const FACTORS = [
   ['f5_rel_strength', 'F5 RelStrength'], ['f1_concentration', 'F1 SmartMoney'],
@@ -60,13 +83,32 @@ const iso = d => (d instanceof Date
   const snap = new Map();
   for (const r of snapRows) snap.set(`${r.stock_code}|${iso(r.data_date)}`, r);
 
-  const [pxRows] = await pool.query('SELECT stock_code, date, close_price FROM idx_stock_prices');
+  const [pxRows] = await pool.query('SELECT stock_code, date, close_price FROM idx_stock_prices ORDER BY stock_code, date');
   const px = new Map();
-  for (const r of pxRows) px.set(`${r.stock_code}|${iso(r.date)}`, Number(r.close_price));
+  const closesBy = new Map();
+  for (const r of pxRows) {
+    const t = r.stock_code, d = iso(r.date), c = Number(r.close_price);
+    px.set(`${t}|${d}`, c);
+    if (!closesBy.has(t)) closesBy.set(t, []);
+    closesBy.get(t).push({ date: d, close: c });
+  }
+  // Prior 20-session high, strictly BEFORE the entry bar, so the level a
+  // breakout must clear is knowable at entry rather than in hindsight.
+  const priorHigh = new Map();
+  for (const [t, arr] of closesBy) {
+    for (let i = HIGH_LOOKBACK; i < arr.length; i++) {
+      let hi = -Infinity;
+      for (let k = i - HIGH_LOOKBACK; k < i; k++) if (arr[k].close > hi) hi = arr[k].close;
+      priorHigh.set(`${t}|${arr[i].date}`, hi);
+    }
+  }
 
   const tickers = [...new Set(snapRows.map(r => r.stock_code))];
   console.log(`sessions ${sessions.length} · tickers ${tickers.length} · snapshots ${snapRows.length}`);
-  console.log(`winner = forward ${HORIZON}-session return >= +${WIN_THRESHOLD}%\n`);
+  console.log(`mode = ${MODE}`);
+  console.log(MODE === 'breakout'
+    ? `winner = forward ${HORIZON}-session return >= +${WIN_THRESHOLD}% AND exit close clears the prior ${HIGH_LOOKBACK}-session high\n`
+    : `winner = forward ${HORIZON}-session return >= +${WIN_THRESHOLD}%\n`);
 
   // Per session: split into winners/controls, then average each factor's
   // H-5..H-1 path WITHIN that session before combining across sessions.
@@ -89,7 +131,15 @@ const iso = d => (d instanceof Date
       }
       if (!whole) continue;
       const ret = ((p1 - p0) / p0) * 100;
-      (ret >= WIN_THRESHOLD ? win : ctl).push(path);
+      let isWinner = ret >= WIN_THRESHOLD;
+      if (isWinner && MODE === 'breakout') {
+        const hi = priorHigh.get(`${t}|${entry}`);
+        // Without 20 sessions of history we cannot say whether this is new
+        // ground, so the name is excluded rather than assumed either way.
+        if (hi === undefined) continue;
+        isWinner = p1 > hi;
+      }
+      (isWinner ? win : ctl).push(path);
     }
     if (win.length < 3 || ctl.length < 10) continue;   // too thin to compare
     perDate.push({ entry, win, ctl });
