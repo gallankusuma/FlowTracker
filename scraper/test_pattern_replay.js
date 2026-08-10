@@ -130,18 +130,36 @@ const get = async (path) => {
     assert.ok(body.history.every(h => h.date <= anchor), 'window leaked past the anchor');
   });
 
+  // The weekend must sit INSIDE the known calendar. Picking one after the newest
+  // session used to work and now correctly returns 400 FUTURE_ANCHOR — the suite
+  // caught the collision between snap-back and the new future-anchor rule, and
+  // the rule is the one that is right: a Sunday past the last known session is
+  // not a weekend to snap over, it is a date we have no calendar for.
   await t('a non-session anchor snaps BACK to a real session, never forward', async () => {
-    const [cal] = await pool.query('SELECT date FROM idx_ihsg_history ORDER BY date DESC LIMIT 3');
     const iso = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-    const session = iso(cal[0].date);
-    const sunday = new Date(`${session}T00:00:00Z`);
-    sunday.setUTCDate(sunday.getUTCDate() + ((7 - sunday.getUTCDay()) % 7 || 7));  // next Sunday
+    const [cal] = await pool.query('SELECT date FROM idx_ihsg_history ORDER BY date DESC LIMIT 40');
+    const dates = cal.map(r => iso(r.date));               // newest first
+    // A Saturday strictly between two real sessions, well inside the calendar.
+    let saturday = null, expected = null;
+    for (let i = 1; i < dates.length; i++) {
+      const d = new Date(`${dates[i]}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + 1);
+      if (d.getUTCDay() === 6 && iso(d) < dates[0]) { saturday = iso(d); expected = dates[i]; break; }
+    }
+    assert.ok(saturday, 'no in-range weekend found to test with');
     const { status, body } = await get(
-      `/api/signal-scanner/ticker/${TICKER}/factor-history?range=6D&endSession=${sunday.toISOString().slice(0, 10)}`);
-    assert.strictEqual(status, 200);
-    assert.ok(body.endSession <= sunday.toISOString().slice(0, 10));
-    const [ok] = await pool.query('SELECT 1 FROM idx_ihsg_history WHERE date = ?', [body.endSession]);
-    assert.ok(ok.length, `${body.endSession} is not an exchange session`);
+      `/api/signal-scanner/ticker/${TICKER}/factor-history?range=6D&endSession=${saturday}`);
+    assert.strictEqual(status, 200, `HTTP ${status} for in-range weekend ${saturday}`);
+    assert.strictEqual(body.endSession, expected,
+      `${saturday} should snap back to ${expected}, got ${body.endSession}`);
+  });
+
+  await t('a FUTURE anchor is refused rather than snapped back to today', async () => {
+    const { status, body } = await get(
+      `/api/signal-scanner/ticker/${TICKER}/factor-history?range=6D&endSession=2099-01-01`);
+    assert.strictEqual(status, 400, `HTTP ${status}`);
+    assert.strictEqual(body.error, 'FUTURE_ANCHOR');
+    assert.ok(body.latestKnownSession, 'refusal did not name the latest known session');
   });
 
   await t('a malformed anchor is refused, not silently ignored', async () => {
