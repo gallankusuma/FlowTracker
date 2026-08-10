@@ -44,8 +44,14 @@ const DEFAULT_WEIGHTS = {
   f13: 0.03, f14: 0.03,
 };
 const THRESHOLDS = { strongBuy: 78, buy: 63, watch: 53, neutral: 40, sell: 25 };
-const GAP_START = '2026-01-19';
-const GAP_END = '2026-06-12'; // exclusive — 'live' data_source takes over from here
+// Defaults preserve the original run's window. Override with --from/--to to
+// repair a later hole; --to is EXCLUSIVE.
+const argOf = (flag, fallback) => {
+  const i = process.argv.indexOf(flag);
+  return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback;
+};
+const GAP_START = argOf('--from', '2026-01-19');
+const GAP_END = argOf('--to', '2026-06-12'); // exclusive — 'live' data_source takes over from here
 
 function classifySignal(score) {
   const t = THRESHOLDS;
@@ -125,8 +131,21 @@ async function main() {
     for (let i = 20; i < candles.length; i++) {
       const date = candles[i].date;
       if (date < GAP_START || date >= GAP_END) continue;
+      // THE FACTOR SNAPSHOT AND THE OUTCOME ARE DIFFERENT CLAIMS.
+      //
+      // This used to skip any date without ten forward sessions, because the
+      // outcome could not be evaluated. That is right for the outcome and wrong
+      // for the snapshot: the factor scores for a session are complete the
+      // moment that session closes and do not depend on anything after it.
+      // Skipping meant the most RECENT sessions — exactly the ones a trajectory
+      // view needs — could never be written until ten more had passed.
+      //
+      // So the snapshot is always written; the outcome is written only when the
+      // forward window genuinely exists, and left NULL otherwise for the
+      // existing outcome-backfill to fill in later. A partial forward window is
+      // not a small outcome, it is an unfinished one.
       const futureIdx10 = i + 10;
-      if (futureIdx10 >= candles.length) continue; // need forward data for outcome eval
+      const hasFullForward = futureIdx10 < candles.length;
 
       const closes = candles.slice(0, i + 1).map(c => c.close);
       const volumes = candles.slice(Math.max(0, i - 29), i + 1).map(c => c.volume);
@@ -176,31 +195,40 @@ async function main() {
 
       // ── Outcome evaluation — same logic as the live outcome-backfill endpoint ──
       const entry = candles[i].close;
-      const future = candles.slice(i + 1, i + 11);
-      const getReturn = (idx) => idx < future.length ? Math.round(((future[idx].close - entry) / entry) * 10000) / 100 : null;
+      const future = hasFullForward ? candles.slice(i + 1, i + 11) : [];
+      const getReturn = (idx) => idx >= 0 && idx < future.length ? Math.round(((future[idx].close - entry) / entry) * 10000) / 100 : null;
       const return_1d = getReturn(0), return_3d = getReturn(Math.min(2, future.length - 1)),
             return_5d = getReturn(Math.min(4, future.length - 1)), return_10d = getReturn(Math.min(9, future.length - 1));
       const highs5 = future.slice(0, 5).map(c => c.high), lows5 = future.slice(0, 5).map(c => c.low);
-      const max_profit = Math.round(((Math.max(...highs5) - entry) / entry) * 10000) / 100;
-      const max_drawdown = Math.round(((Math.min(...lows5) - entry) / entry) * 10000) / 100;
+      const max_profit = highs5.length ? Math.round(((Math.max(...highs5) - entry) / entry) * 10000) / 100 : null;
+      const max_drawdown = lows5.length ? Math.round(((Math.min(...lows5) - entry) / entry) * 10000) / 100 : null;
       const price_5d_later = return_5d !== null ? future[Math.min(4, future.length - 1)].close : null;
 
-      let outcome = 'NEUTRAL';
+      // NULL, not 'NEUTRAL'. An unevaluated outcome is unknown; recording it as
+      // neutral would put a verdict in the win-rate statistics for a trade whose
+      // result has not happened yet.
+      let outcome = hasFullForward ? 'NEUTRAL' : null;
       const isBullish = signal === 'STRONG BUY' || signal === 'BUY';
       const isBearish = signal === 'STRONG SELL' || signal === 'SELL';
-      if (isBullish) {
-        if (max_profit >= 3 && max_drawdown > -2) outcome = 'WIN';
-        else if (max_drawdown <= -2) outcome = 'LOSS';
-        else if (return_5d !== null && return_5d > 1) outcome = 'WIN';
-        else if (return_5d !== null && return_5d < -1) outcome = 'LOSS';
-      } else if (isBearish) {
-        if (max_drawdown <= -3 && max_profit < 2) outcome = 'WIN';
-        else if (max_profit >= 2) outcome = 'LOSS';
-        else if (return_5d !== null && return_5d < -1) outcome = 'WIN';
-        else if (return_5d !== null && return_5d > 1) outcome = 'LOSS';
-      } else {
-        if (return_5d !== null && return_5d > 2) outcome = 'WIN';
-        else if (return_5d !== null && return_5d < -2) outcome = 'LOSS';
+      // Guarded explicitly rather than relying on every null comparison below
+      // happening to be false. It does work out that way today, but a verdict
+      // that depends on `null >= 3` staying falsy is one refactor from becoming
+      // a WIN nobody earned.
+      if (hasFullForward) {
+        if (isBullish) {
+          if (max_profit >= 3 && max_drawdown > -2) outcome = 'WIN';
+          else if (max_drawdown <= -2) outcome = 'LOSS';
+          else if (return_5d !== null && return_5d > 1) outcome = 'WIN';
+          else if (return_5d !== null && return_5d < -1) outcome = 'LOSS';
+        } else if (isBearish) {
+          if (max_drawdown <= -3 && max_profit < 2) outcome = 'WIN';
+          else if (max_profit >= 2) outcome = 'LOSS';
+          else if (return_5d !== null && return_5d < -1) outcome = 'WIN';
+          else if (return_5d !== null && return_5d > 1) outcome = 'LOSS';
+        } else {
+          if (return_5d !== null && return_5d > 2) outcome = 'WIN';
+          else if (return_5d !== null && return_5d < -2) outcome = 'LOSS';
+        }
       }
 
       rowsToInsert.push([
