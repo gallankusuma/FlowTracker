@@ -213,10 +213,16 @@ function windowDelta(rows: FactorHistoryRow[], key: string): number | null {
   return latest - first;
 }
 
-function dirVs(rows: FactorHistoryRow[], idx: number, key: string): string {
+function dirVs(rows: FactorHistoryRow[], date: string, key: string): string {
+  // Anchored to the row's DATE, not to its position on screen. Once the table
+  // became sortable, an index into the rendered order would have made "previous
+  // session" mean "next row in whatever sort is active" — turning the arrow
+  // into a comparison between two unrelated days.
+  const idx = rows.findIndex(r => r.date === date);
+  if (idx < 0) return "";
   const cur = rows[idx]?.factors?.[key];
   if (cur === null || cur === undefined) return "";
-  for (let j = idx + 1; j < rows.length; j++) {          // rows are newest-first
+  for (let j = idx + 1; j < rows.length; j++) {          // rows are newest-first by date
     const prev = rows[j]?.factors?.[key];
     if (prev === null || prev === undefined) continue;
     const d = cur - prev;
@@ -228,7 +234,10 @@ function dirVs(rows: FactorHistoryRow[], idx: number, key: string): string {
 }
 
 function FactorHistoryPanel({ ticker }: { ticker: string }) {
-  const [range, setRange] = useState("10D");
+  const [range, setRange] = useState("6D");
+  // null = canonical date order (newest first), which is the window's own shape.
+  const [sortKey, setSortKey] = useState<string | null>(null);
+  const [sortAsc, setSortAsc] = useState(false);
   const [data, setData] = useState<FactorHistoryResp | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -249,8 +258,49 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
     return () => { cancelled = true; };
   }, [ticker, range]);
 
+  /* TWO ORDERINGS, DELIBERATELY SEPARATE.
+     `rows` is always newest-first by DATE and is what every trajectory
+     calculation reads: Δ, the TREND arrows, the per-cell direction and the
+     pattern classification all mean "compared with the session before". Sorting
+     by a factor column and then computing those off the displayed order would
+     silently redefine "previous" as "next-lowest value", which is not a
+     sequence at all.
+     `viewRows` is what the table renders. Sorting is a way of LOOKING at the
+     window, never a change to what the window is. */
   const rows = data?.history || [];
   const observedRows = rows.filter(r => r.observed);
+
+  const viewRows = useMemo(() => {
+    if (!sortKey) return rows;
+    const val = (r: FactorHistoryRow): number | string | null => {
+      switch (sortKey) {
+        case "date":      return r.date;
+        case "price":     return r.price;
+        case "chg":       return r.changePct;
+        case "score":     return r.compositeScore;
+        case "conf":      return r.confidence;
+        case "signal":    return r.signal;
+        default:          return r.factors?.[sortKey] ?? null;   // a factor key
+      }
+    };
+    return [...rows].sort((a, b) => {
+      const va = val(a), vb = val(b);
+      // An unobserved session has nothing to rank; it sinks either way rather
+      // than being treated as zero.
+      if (va === null && vb === null) return 0;
+      if (va === null) return 1;
+      if (vb === null) return -1;
+      if (va < vb) return sortAsc ? -1 : 1;
+      if (va > vb) return sortAsc ? 1 : -1;
+      return 0;
+    });
+  }, [rows, sortKey, sortAsc]);
+
+  const onSort = (k: string) => {
+    if (sortKey === k) setSortAsc(!sortAsc);
+    else { setSortKey(k); setSortAsc(k === "date"); }
+  };
+  const sortMark = (k: string) => (sortKey === k ? (sortAsc ? " ↑" : " ↓") : "");
 
   /* Rule-based, not a recommendation. Compares latest vs previous observed and
      vs the start of the window — the three points the spec asks for. */
@@ -269,8 +319,33 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
     return { up, down, flat, from: first.date, to: latest.date };
   }, [observedRows]);
 
-  const sticky = (left: number, z = 3): React.CSSProperties => ({
-    position: "sticky", left, zIndex: z, background: "var(--bg-secondary, #0d1117)",
+  /* The frozen left block.
+     Offsets USED to be hand-written pixel constants while the widths were left
+     to the browser, so the two disagreed the moment a cell was wider than the
+     number I had guessed — a "STRONG BUY" badge stretched the SIGNAL column
+     past its assumed 88px and the overflow sat on top of the first scrolling
+     column, hiding Smart Money entirely.
+     Width and offset now come from one table: the offset of a column is the sum
+     of the widths before it, by construction, so they cannot drift apart. */
+  const LEFT_COLS = [
+    { w: 84 },   // DATE
+    { w: 66 },   // PRICE
+    { w: 58 },   // CHG%
+    { w: 56 },   // SCORE
+    { w: 52 },   // CONF
+    { w: 92 },   // SIGNAL
+  ];
+  const LEFT_OFFSET = LEFT_COLS.map((_, i) =>
+    LEFT_COLS.slice(0, i).reduce((s, c) => s + c.w, 0));
+  const LEFT_TOTAL = LEFT_COLS.reduce((s, c) => s + c.w, 0);
+
+  const sticky = (i: number, z = 3): React.CSSProperties => ({
+    position: "sticky", left: LEFT_OFFSET[i], zIndex: z,
+    width: LEFT_COLS[i].w, minWidth: LEFT_COLS[i].w, maxWidth: LEFT_COLS[i].w,
+    // A cell that outgrows its column would reintroduce exactly the overlap
+    // this table exists to avoid.
+    overflow: "hidden", whiteSpace: "nowrap",
+    background: "var(--bg-secondary, #0d1117)",
   });
 
   return (
@@ -316,29 +391,37 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
 
           {/* Matrix: row = trading date, column = factor */}
           <div style={{ overflowX: "auto", border: "1px solid rgba(48,54,61,0.6)", borderRadius: 6 }}>
-            <table style={{ borderCollapse: "collapse", fontSize: 11, minWidth: 1000, width: "100%" }}>
+            {/* Wide enough that the 14 factor columns keep a readable width
+                instead of being squeezed under the frozen block. */}
+            <table style={{ borderCollapse: "collapse", fontSize: 11, tableLayout: "fixed",
+                            minWidth: LEFT_TOTAL + 14 * 62 + 70, width: "100%" }}>
               <thead>
                 <tr style={{ background: "rgba(22,27,34,0.95)" }}>
-                  <th style={{ ...sticky(0, 4), padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700 }}>DATE</th>
-                  <th style={{ ...sticky(84, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>PRICE</th>
-                  <th style={{ ...sticky(150, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>CHG%</th>
-                  <th style={{ ...sticky(208, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>SCORE</th>
-                  <th style={{ ...sticky(264, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>CONF</th>
-                  <th style={{ ...sticky(316, 4), padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700, borderRight: "1px solid rgba(48,54,61,0.8)" }}>SIGNAL</th>
+                  {([["date","DATE","left"],["price","PRICE","right"],["chg","CHG%","right"],
+                     ["score","SCORE","right"],["conf","CONF","right"],["signal","SIGNAL","left"]] as const).map(([k, label, align], ci) => (
+                    <th key={k} onClick={() => onSort(k)} title={`Sort by ${label}`}
+                      style={{ ...sticky(ci, 4), padding: "6px 10px", textAlign: align as any, cursor: "pointer", userSelect: "none",
+                               color: sortKey === k ? "#58a6ff" : "#8b949e", fontWeight: 700,
+                               ...(ci === 5 ? { borderRight: "1px solid rgba(48,54,61,0.8)" } : {}) }}>
+                      {label}{sortMark(k)}
+                    </th>
+                  ))}
                   {FACTOR_LABELS.map(f => (
-                    <th key={f.key as string}
+                    <th key={f.key as string} onClick={() => onSort(f.key as string)}
                       title={RISK_FACTORS.has(f.key as string)
-                        ? `${f.label} — risk/volatility, not direction. High = wide range, not bullish.`
-                        : f.label}
-                      style={{ padding: "6px 8px", textAlign: "center", color: "#8b949e", fontWeight: 700, whiteSpace: "nowrap" }}>
-                      {f.icon} {f.label}{RISK_FACTORS.has(f.key as string) ? " ⚠" : ""}
+                        ? `${f.label} — risk/volatility, not direction. High = wide range, not bullish. Click to sort.`
+                        : `${f.label} — click to sort`}
+                      style={{ padding: "6px 8px", textAlign: "center", fontWeight: 700, whiteSpace: "nowrap",
+                               cursor: "pointer", userSelect: "none",
+                               color: sortKey === f.key ? "#58a6ff" : "#8b949e" }}>
+                      {f.icon} {f.label}{RISK_FACTORS.has(f.key as string) ? " ⚠" : ""}{sortMark(f.key as string)}
                     </th>
                   ))}
                   <th style={{ padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700, borderLeft: "1px solid rgba(48,54,61,0.8)" }}>SRC</th>
                 </tr>
               </thead>
               <tbody>
-                {rows.map((r, i) => {
+                {viewRows.map((r, i) => {
                   const cfg = (r.signal && SIG[r.signal]) || null;
                   return (
                     <tr key={r.date} style={{
@@ -349,22 +432,22 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                         {r.date.slice(5)}
                         {!r.observed && <span title="Trading session with no snapshot" style={{ marginLeft: 4, color: "#d29922" }}>⚠</span>}
                       </td>
-                      <td style={{ ...sticky(84), padding: "5px 10px", textAlign: "right", color: "var(--text-primary)" }}>
+                      <td style={{ ...sticky(1), padding: "5px 10px", textAlign: "right", color: "var(--text-primary)" }}>
                         {r.price === null ? "—" : r.price.toLocaleString("id-ID")}
                       </td>
-                      <td style={{ ...sticky(150), padding: "5px 10px", textAlign: "right",
+                      <td style={{ ...sticky(2), padding: "5px 10px", textAlign: "right",
                                    color: r.changePct === null ? "var(--text-muted)" : r.changePct >= 0 ? "#3fb950" : "#f85149" }}>
                         {r.changePct === null ? "—" : `${r.changePct > 0 ? "+" : ""}${r.changePct.toFixed(2)}`}
                       </td>
-                      <td style={{ ...sticky(208), padding: "5px 10px", textAlign: "right", fontWeight: 800,
+                      <td style={{ ...sticky(3), padding: "5px 10px", textAlign: "right", fontWeight: 800,
                                    color: r.compositeScore === null ? "var(--text-muted)" : "var(--text-primary)" }}>
                         {r.compositeScore === null ? "—" : Math.round(r.compositeScore)}
                       </td>
-                      <td style={{ ...sticky(264), padding: "5px 10px", textAlign: "right",
+                      <td style={{ ...sticky(4), padding: "5px 10px", textAlign: "right",
                                    color: r.confidence === null ? "var(--text-muted)" : "var(--text-secondary)" }}>
                         {r.confidence === null ? "—" : Math.round(r.confidence)}
                       </td>
-                      <td style={{ ...sticky(316), padding: "5px 10px", borderRight: "1px solid rgba(48,54,61,0.8)", whiteSpace: "nowrap" }}>
+                      <td style={{ ...sticky(5), padding: "5px 10px", borderRight: "1px solid rgba(48,54,61,0.8)", whiteSpace: "nowrap" }}>
                         {r.signal ? (
                           <span style={{ fontSize: 9, fontWeight: 800, padding: "2px 6px", borderRadius: 3,
                                          background: cfg?.bg || "transparent", color: cfg?.color || "var(--text-muted)" }}>
@@ -381,7 +464,7 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                             style={{ padding: "5px 8px", textAlign: "center", background: h.bg, color: h.color, fontWeight: 700 }}>
                             {v === null ? "—" : Math.round(v)}
                             {v !== null && !RISK_FACTORS.has(k) &&
-                              <span style={{ marginLeft: 3, opacity: 0.55, fontWeight: 400 }}>{dirVs(rows, i, k)}</span>}
+                              <span style={{ marginLeft: 3, opacity: 0.55, fontWeight: 400 }}>{dirVs(rows, r.date, k)}</span>}
                           </td>
                         );
                       })}
@@ -404,10 +487,10 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                   inferred by reading up the column. */}
               <tfoot>
                 <tr style={{ borderTop: "2px solid rgba(48,54,61,0.9)", background: "rgba(22,27,34,0.7)" }}>
-                  <td style={{ ...sticky(0), padding: "6px 10px", fontWeight: 800, color: "#8b949e" }} colSpan={5}>
+                  <td style={{ ...sticky(0), width: LEFT_OFFSET[5], minWidth: LEFT_OFFSET[5], maxWidth: LEFT_OFFSET[5], padding: "6px 10px", fontWeight: 800, color: "#8b949e" }} colSpan={5}>
                     Δ {data?.range || ""}
                   </td>
-                  <td style={{ ...sticky(316), borderRight: "1px solid rgba(48,54,61,0.8)" }} />
+                  <td style={{ ...sticky(5), borderRight: "1px solid rgba(48,54,61,0.8)" }} />
                   {FACTOR_LABELS.map(f => {
                     const k = f.key as string;
                     const d = windowDelta(rows, k);
@@ -423,8 +506,8 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                   <td style={{ borderLeft: "1px solid rgba(48,54,61,0.8)" }} />
                 </tr>
                 <tr style={{ background: "rgba(22,27,34,0.7)" }}>
-                  <td style={{ ...sticky(0), padding: "6px 10px", fontWeight: 800, color: "#8b949e" }} colSpan={5}>TREND</td>
-                  <td style={{ ...sticky(316), borderRight: "1px solid rgba(48,54,61,0.8)" }} />
+                  <td style={{ ...sticky(0), width: LEFT_OFFSET[5], minWidth: LEFT_OFFSET[5], maxWidth: LEFT_OFFSET[5], padding: "6px 10px", fontWeight: 800, color: "#8b949e" }} colSpan={5}>TREND</td>
+                  <td style={{ ...sticky(5), borderRight: "1px solid rgba(48,54,61,0.8)" }} />
                   {FACTOR_LABELS.map(f => {
                     const k = f.key as string;
                     const d = windowDelta(rows, k);
@@ -2414,22 +2497,56 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
               ) : (() => {
                   let arr = filteredRecs.filter((r: any) => r.ticker !== "SUMMARY" && r.pattern_type !== "MONTHLY" && r.status === "OPEN");
                   if (openSortCol) {
-                    arr = [...arr].sort((a,b) => {
-                      let valA, valB;
-                      if (openSortCol === "TICKER") { valA = a.ticker; valB = b.ticker; }
-                      else if (openSortCol === "DIR") { valA = a.direction; valB = b.direction; }
-                      else if (openSortCol === "PATTERN") { valA = a.pattern_type; valB = b.pattern_type; }
-                      else if (openSortCol === "FLOAT P/L") {
-                        const ea = a.entry_price||a.entry_max||1; const ma = a.market_price||ea;
-                        valA = a.direction==="BULLISH" ? (ma-ea)/ea : (ea-ma)/ea;
-                        const eb = b.entry_price||b.entry_max||1; const mb = b.market_price||eb;
-                        valB = b.direction==="BULLISH" ? (mb-eb)/eb : (eb-mb)/eb;
+                    /* EVERY header that looks clickable now actually sorts.
+                       Before this, only 6 of the 17 columns were handled and the
+                       rest fell through to `return 0` — the header highlighted
+                       and the arrow flipped while the rows never moved, which
+                       reads as a broken table rather than an unsupported one.
+
+                       FLOAT P/L also sorted on `a.market_price` and the old
+                       `entry_price || 1` fallback, so it ignored the live quote
+                       the column actually displays and ranked an unknown entry
+                       as if it were Rp 1. It now sorts on exactly what is
+                       rendered. */
+                    const sortVal = (r: any): number | string | null => {
+                      const entry = entryOf(r);
+                      const lv = livePrices[r.ticker];
+                      const mkt = (r.status === "OPEN" && lv?.price) ? lv.price
+                        : (r.market_price ? Number(r.market_price) : null);
+                      const p = calcPosition(r);
+                      switch (openSortCol) {
+                        case "TICKER":        return r.ticker;
+                        case "PATTERN":       return r.pattern_type;
+                        case "DIR":           return r.direction;
+                        case "STATUS":        return r.status;
+                        case "ENTRY":         return entry || null;
+                        case "SL":            return Number(r.stop_loss) || null;
+                        case "T1":            return Number(r.target_1) || null;
+                        case "T2":            return Number(r.target_2) || null;
+                        case "R:R":           return Number(r.risk_reward) || null;
+                        case "LOT":           return p?.finalLots ?? null;
+                        case "MODAL":         return p?.finalAlloc ?? null;
+                        case "EST T1":        return p?.gainT1 ?? null;
+                        case "EST T2":        return p?.gainT2 ?? null;
+                        case "HARGA ACTUAL":  return mkt;
+                        case "FLOAT P/L":     return (entry && mkt)
+                          ? (r.direction === "BEARISH" ? -1 : 1) * ((mkt - entry) / entry) : null;
+                        case "HOLD":          return new Date(r.detected_date).getTime();
+                        case "DITAMBAHKAN":   return new Date(r.created_at || 0).getTime();
+                        default:              return null;
                       }
-                      else if (openSortCol === "HOLD") { valA = new Date(a.detected_date).getTime(); valB = new Date(b.detected_date).getTime(); }
-                      else if (openSortCol === "DITAMBAHKAN") { valA = new Date(a.created_at || 0).getTime(); valB = new Date(b.created_at || 0).getTime(); }
-                      else { return 0; }
-                      if (valA < valB) return openSortAsc ? -1 : 1;
-                      if (valA > valB) return openSortAsc ? 1 : -1;
+                    };
+                    arr = [...arr].sort((a, b) => {
+                      const va = sortVal(a), vb = sortVal(b);
+                      // Unknowns sink to the bottom in BOTH directions. Sorting
+                      // them as 0 would rank a position with no entry price
+                      // above every loser, which is a claim about data that does
+                      // not exist.
+                      if (va === null && vb === null) return 0;
+                      if (va === null) return 1;
+                      if (vb === null) return -1;
+                      if (va < vb) return openSortAsc ? -1 : 1;
+                      if (va > vb) return openSortAsc ? 1 : -1;
                       return 0;
                     });
                   }
