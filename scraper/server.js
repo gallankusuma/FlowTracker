@@ -7132,8 +7132,31 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
       return res.status(400).json({ error: `Unknown range '${range}'`, allowed: Object.keys(RANGES) });
     }
 
-    const [[calRow]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
-    const endSession = calRow?.d ? toDateStr(calRow.d) : null;
+    // ANCHOR THE WINDOW ANYWHERE, not only at the newest session.
+    //
+    // Without this the endpoint is a current-trajectory viewer, not Pattern
+    // Replay: the question worth asking is "BRPT rose hard on 23 Jul — what did
+    // its factors look like on H-5..H-1 BEFORE that?", and that needs the window
+    // to end on 22 Jul. Validated against the exchange calendar rather than
+    // trusted, so an arbitrary string cannot silently produce an empty window.
+    let endSession = null;
+    const wanted = String(req.query.endSession || '').trim();
+    if (wanted) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(wanted)) {
+        return res.status(400).json({ error: `Invalid endSession '${wanted}', expected YYYY-MM-DD` });
+      }
+      const [okRows] = await pool.query(
+        'SELECT date FROM idx_ihsg_history WHERE date <= ? ORDER BY date DESC LIMIT 1', [wanted]);
+      if (!okRows.length) {
+        return res.status(404).json({ error: `No exchange session on or before ${wanted}` });
+      }
+      // Snap backwards to the nearest real session: asking for a Sunday should
+      // give the Friday window, not an empty one.
+      endSession = toDateStr(okRows[0].date);
+    } else {
+      const [[calRow]] = await pool.query('SELECT MAX(date) d FROM idx_ihsg_history');
+      endSession = calRow?.d ? toDateStr(calRow.d) : null;
+    }
     if (!endSession) return res.status(503).json({ error: 'NO_SESSION_CALENDAR' });
 
     const [sessRows] = await pool.query(
@@ -7148,7 +7171,8 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
               f6_breadth, f7_alignment, f8_streak, f9_rsi, f10_macd, f11_bollinger,
               f12_ema_trend, f13_support_resistance, f14_atr
          FROM idx_signal_history
-        WHERE stock_code = ? AND data_date IN (?)`,
+        WHERE stock_code = ? AND data_date IN (?)
+          AND data_source IN ('live','backfill_v2')`,
       [ticker, sessions]);
     const snapMap = Object.fromEntries(snapRows.map(r => [toDateStr(r.data_date), r]));
 
@@ -7221,6 +7245,14 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
 
     res.json({
       ticker, range, rangeSessions: count,
+      endSession,
+      // The 2026-07-19 overfitting incident traced 885 rows to the original
+      // awo_backfill.js and its validation leakage; the clean reconstruction was
+      // relabelled backfill_v2 precisely so the bad generation could be excluded
+      // by name. Every other historical endpoint already filters on this — a
+      // pattern classifier reading rows we KNOW are contaminated would be
+      // learning from evidence this project has already disowned.
+      allowedSources: ['live', 'backfill_v2'],
       window,
       latest,
       // Newest first, as the spec's table wants.

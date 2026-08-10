@@ -109,10 +109,16 @@ type FactorHistoryResp = {
 
 const RANGE_OPTIONS = ["6D", "10D", "20D", "1M"];
 
-/* F14 is NOT directional and must not be coloured as if it were.
-   ATR is a risk/volatility modifier: 80 means "moving violently", not
-   "strongly bullish". Painting it green with the other thirteen would tell the
-   reader that rising risk is a rising opportunity. */
+/* F14 is NOT directional — and its scale runs the OPPOSITE way to the reading I
+   first gave it. scoreATR() in awo_technical.js:
+       atrPct <= 1  -> 80   "very tight, controlled"
+       atrPct >  8  -> 10   "extreme volatility"
+   so a HIGH F14 means LOW volatility / controlled risk, and a LOW F14 means the
+   range has widened. My first pass labelled high as "wide range", which was
+   backwards, and coloured high as the alarming end — telling the reader the
+   calmest names were the riskiest.
+   Still not painted with the directional greens: controlled risk is not a buy
+   signal, it is a statement about how wide the next move might be. */
 const RISK_FACTORS = new Set(["atr"]);
 
 /* Fourteen full labels will not fit fourteen columns, and forcing them to try
@@ -208,9 +214,9 @@ function heat(v: number | null, key?: string): { bg: string; color: string } {
   // Given the same green the directional factors use, a volatility spike would
   // read as strength, which is the opposite of what it says about position size.
   if (key && RISK_FACTORS.has(key)) {
-    if (v >= 65) return { bg: "rgba(167,139,250,0.16)", color: "#a78bfa" };  // high vol
-    if (v >= 35) return { bg: "rgba(139,148,158,0.10)", color: "#8b949e" };
-    return { bg: "rgba(139,148,158,0.06)", color: "#6e7681" };               // quiet
+    if (v >= 65) return { bg: "rgba(56,189,248,0.10)", color: "#38bdf8" };   // tight range, controlled
+    if (v >= 35) return { bg: "rgba(139,148,158,0.10)", color: "#8b949e" };  // moderate
+    return { bg: "rgba(167,139,250,0.16)", color: "#a78bfa" };               // wide range, elevated risk
   }
   if (v >= 65) return { bg: "rgba(63,185,80,0.13)", color: "#3fb950" };
   if (v >= 45) return { bg: "rgba(210,153,34,0.10)", color: "#d29922" };
@@ -424,7 +430,7 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                   {FACTOR_LABELS.map(f => (
                     <th key={f.key as string} onClick={() => onSort(f.key as string)}
                       title={RISK_FACTORS.has(f.key as string)
-                        ? `${f.label} — risk/volatility, not direction. High = wide range, not bullish. Click to sort.`
+                        ? `${f.label} — risk, not direction. HIGH = low volatility / controlled risk. LOW = wider range. Click to sort.`
                         : `${f.label} — click to sort`}
                       style={{ padding: "4px 4px", textAlign: "center", fontWeight: 700,
                                width: FACTOR_COL_W, minWidth: FACTOR_COL_W, maxWidth: FACTOR_COL_W,
@@ -562,7 +568,7 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                 </b>{" "}
                 {f.icon} {f.label}
                 {RISK_FACTORS.has(f.key as string) && (
-                  <span style={{ color: "#a78bfa" }}> ⚠ risk, not direction</span>
+                  <span style={{ color: "#a78bfa" }}> ⚠ risk, not direction — high = calmer, low = wider range</span>
                 )}
               </span>
             ))}
@@ -579,6 +585,15 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.06em", color: "#8b949e" }}>PATTERN STATE</span>
                   <span style={{ fontSize: 13, fontWeight: 900, color: col.c }}>{p.state}</span>
+                  {/* Visible, not just documented in a code comment. "CONFIRMING"
+                      reads as a probability unless the screen says otherwise,
+                      and nothing here has been statistically validated. */}
+                  <span style={{ fontSize: 9, fontWeight: 900, letterSpacing: "0.08em",
+                                 padding: "2px 7px", borderRadius: 3, whiteSpace: "nowrap",
+                                 background: "rgba(210,153,34,0.15)", color: "#d29922",
+                                 border: "1px solid rgba(210,153,34,0.35)" }}>
+                    EXPERIMENTAL · NOT STATISTICALLY VALIDATED
+                  </span>
                   <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{p.why}</span>
                 </div>
                 {!complete && data?.window && (
