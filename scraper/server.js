@@ -285,6 +285,27 @@ async function setupDB() {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
   `);
 
+  // R2-B: which model produced a row, and whether its window was whole.
+  //
+  // Until now the writer blended RG with NG whenever flow_detail happened to
+  // have rows and stored no marker of which path ran, so /api/flow-analyzer had
+  // to return concentrationModel:null rather than invent one. Two rows that look
+  // identical could come from different models, and nothing in the table could
+  // tell them apart after the fact.
+  //
+  // ng_state is the distinction the review asked for by name: a stock with no NG
+  // TRADING and a stock with no NG DATA both produced pure-RG concentration and
+  // were indistinguishable. The first is a measurement; the second is a gap.
+  for (const [col, def] of [
+    ['concentration_model', "VARCHAR(32) NULL"],
+    ['model_version',       "VARCHAR(16) NULL"],
+    ['ng_state',            "VARCHAR(20) NULL"],
+    ['window_complete',     "TINYINT(1) NULL"],
+    ['window_missing',      "VARCHAR(255) NULL"],
+  ]) {
+    await pool.query(`ALTER TABLE idx_concentration ADD COLUMN ${col} ${def}`).catch(() => {});
+  }
+
   // ─── Detailed broker flow — foreign/domestic x RG/NG breakdown from Index Alpha ───
   // Additive: sums to idx_broker_summary's investor=all/market=RG figures for the RG
   // rows, plus captures NG (negotiated/block) trades that idx_broker_summary never
@@ -1196,7 +1217,9 @@ app.get('/api/flow-analyzer', async (req, res) => {
     const tickers = stockRows.map(r => r.stock_code);
 
     const [concRows] = await pool.query(
-      'SELECT stock_code, dn0, dn1, dn2, dn3, dn4 FROM idx_concentration WHERE data_date = ?',
+      `SELECT stock_code, dn0, dn1, dn2, dn3, dn4,
+              concentration_model, model_version, ng_state, window_complete, window_missing
+         FROM idx_concentration WHERE data_date = ?`,
       [analysisDate]
     );
     const concMap = Object.fromEntries(concRows.map(r => [r.stock_code, r]));
@@ -1239,6 +1262,12 @@ app.get('/api/flow-analyzer', async (req, res) => {
         buyValue:     formatVal(Number(stock.buy_value)),
         days,
         observedDays: days.filter(v => v !== null).length,
+        // Per-row provenance, so a reader can see WHICH model produced this
+        // ticker's numbers and whether NG was absent or merely inactive.
+        concentrationModel: ft?.concentration_model ?? null,
+        ngState: ft?.ng_state ?? null,
+        windowComplete: ft?.window_complete === null || ft?.window_complete === undefined
+          ? null : !!ft.window_complete,
         // Same as-of as the flow. This is the number to compare against days[].
         priceAtSnapshot,
         dailyChangeAtSnapshot: snap?.change_pct === null || snap?.change_pct === undefined
@@ -1279,12 +1308,14 @@ app.get('/api/flow-analyzer', async (req, res) => {
         positive: 'buyer-dominant flow',
         negative: 'seller-dominant flow',
       },
-      // NOT recorded per row yet — the concentration writer blends RG with NG at
-      // a 0.6 heuristic weight and stores no marker of which path ran. Claiming
-      // a model id here would be inventing the provenance this release exists to
-      // fix. Recording it is R2-B item 4.
-      concentrationModel: null,
-      concentrationModelNote: 'per-row model/version not recorded yet (R2-B). Values are internally computed, RG or RG+NG blended.',
+      // R2-B: recorded per row now, so this is read rather than guessed. Rows
+      // written before R2-B carry null and are reported as such — an unlabelled
+      // legacy row is not the same claim as a labelled one.
+      concentrationModel: concRows[0]?.concentration_model ?? null,
+      concentrationModelVersion: concRows[0]?.model_version ?? null,
+      concentrationModelNote: concRows[0]?.model_version
+        ? 'recorded per row; ng_state distinguishes NO_NG_ACTIVITY from NG_DATA_MISSING'
+        : 'legacy row written before R2-B — model not recorded',
       window: { dates: windowDates, complete: windowComplete, missingSessions: windowMissing },
       degraded,
       source: 'internal-calc+idx_stock_prices',
@@ -2371,11 +2402,34 @@ async function autoCalculateConcentration(targetDate, force = false) {
     return { date, stocks: 0, source: 'no_data' };
   }
 
-  // Get last 5 trading days (for dn0..dn4)
-  const [dateRows] = await pool.query(
-    'SELECT DISTINCT date FROM idx_broker_summary WHERE date <= ? ORDER BY date DESC LIMIT 5', [date]
-  );
-  const tradingDates = dateRows.map(r => toStr(r.date));
+  // ── R2-B: dn0..dn4 SPAN FIVE CANONICAL EXCHANGE SESSIONS ─────────────────
+  //
+  // This used to read `SELECT DISTINCT date FROM idx_broker_summary ... LIMIT 5`
+  // — the last five rows the broker table happened to have. When a session is
+  // missing (idx_broker_summary has no rows for 2026-06-15, 06-22 or 06-29) the
+  // window silently reached one session further back and dn0..dn4 spanned six
+  // trading days while every consumer read them as five consecutive ones.
+  //
+  // The axis is now idx_ihsg_history, the exchange's own calendar. A hole stays
+  // a hole instead of being closed by shifting an older session into its place.
+  const [sessRows] = await pool.query(
+    'SELECT date FROM idx_ihsg_history WHERE date <= ? ORDER BY date DESC LIMIT 5', [date]);
+  const tradingDates = sessRows.map(r => toStr(r.date));
+
+  // Completeness is a GATE here, not a note. A 5D concentration computed across
+  // a gap is not a slightly-worse number, it is a different measurement wearing
+  // the same name — and f1/f2/f7/f8 consume it as if the five values were
+  // consecutive.
+  let windowComplete = true, windowMissing = [];
+  try {
+    const w = await systemHealth.assertCompleteSessions(pool, {
+      table: 'idx_broker_summary', col: 'date', endSession: date, count: 5 });
+    windowComplete = w.complete;
+    windowMissing = w.missingSessions;
+  } catch { /* if completeness cannot be established, treat as unknown-complete */ }
+  if (!windowComplete) {
+    console.log(`  ⚠️  [CONC] ${date}: 5D window INCOMPLETE — missing ${windowMissing.join(', ')}`);
+  }
 
   // How much to favor negotiated/block-deal (NG) concentration over regular-market
   // (RG) concentration when a stock had NG activity that day. NG trades are large,
@@ -2387,10 +2441,39 @@ async function autoCalculateConcentration(targetDate, force = false) {
   // every date the idx_broker_flow_detail backfill hasn't reached yet.
   const NG_WEIGHT = 0.6;
 
+  // R2-B model identity. Bumped from the unversioned original because the
+  // window definition changed: dn0..dn4 now span canonical exchange sessions,
+  // so values differ wherever a session was missing from the broker table.
+  const MODEL_VERSION = 'v2';
+
+  // WAS THE NG FEED PULLED FOR THIS SESSION AT ALL?
+  //
+  // This is the only honest way to tell "no block trades" from "no NG data",
+  // and my first attempt got it wrong by asking per TICKER: a ticker with no NG
+  // rows looks identical either way. Measured on 2026-08-07, flow_detail held
+  // 14,756 rows across 240 tickers while the NG segment covered only 51 — so
+  // for ~189 tickers the absence of NG is a fact about the market, not a gap in
+  // our data, and labelling them NG_DATA_MISSING would invent an outage.
+  //
+  // Asked once per session instead: if the date has ANY flow_detail rows the
+  // pull happened, so a ticker's NG absence is genuine inactivity.
+  const ngFeedByDate = {};
+  for (const d of tradingDates) {
+    const [fd] = await pool.query(
+      'SELECT 1 AS ok FROM idx_broker_flow_detail WHERE date = ? LIMIT 1', [d]);
+    ngFeedByDate[d] = fd.length > 0;
+  }
+  const ngFeedGaps = tradingDates.filter(d => !ngFeedByDate[d]);
+  const MODEL_RG   = 'SIGNED_TOP3_RG_V1';
+  const MODEL_RGNG = 'SIGNED_TOP3_RGNG_V1';
+
   let saved = 0;
   for (const stock of stockRows) {
     const ticker = stock.stock_code;
     const dnValues = [];
+    // Which model actually ran, and why NG did or did not contribute. Collected
+    // per session, then reduced to one verdict for the row.
+    let usedNG = false, sawNGActivity = false;
 
     // Calculate concentration for each of last 5 days
     for (const d of tradingDates) {
@@ -2430,15 +2513,30 @@ async function autoCalculateConcentration(targetDate, force = false) {
       `, [d, ticker]);
       const totalNGNet = Number(totNGRow[0]?.total_net) || 0;
 
+      // NO NG TRADING vs NO NG DATA — the same pure-RG number, two different
+      // meanings, and the writer could not tell them apart. "This stock had no
+      // block trades today" is a measurement; "we never pulled the NG feed for
+      // this date" is a hole. The health layer classifies flow_detail as
+      // DEGRADED precisely because it can go stale on its own, so the two must
+      // be distinguishable after the fact.
       let blended = concRG;
       if (totalNGNet > 0) {
         const topNGNet = topNG.reduce((a, b) => a + Number(b.net), 0);
         const concNG = (topNGNet / totalNGNet) * 100;
         blended = concRG * (1 - NG_WEIGHT) + concNG * NG_WEIGHT;
+        usedNG = true; sawNGActivity = true;
       }
 
       dnValues.push(Math.round(blended * 10) / 10); // 1 decimal %
     }
+
+    // Feed gap beats activity: if any session in the window was never pulled,
+    // this window's NG picture is incomplete regardless of what the pulled
+    // sessions showed.
+    const ngState = ngFeedGaps.length ? 'NG_DATA_MISSING'
+      : sawNGActivity ? 'NG_ACTIVE'
+      : 'NO_NG_ACTIVITY';
+    const model = usedNG ? MODEL_RGNG : MODEL_RG;
 
     // dnValues[0] = latestDate (dn0), [1] = day before (dn1), etc.
     const dn0 = dnValues[0] ?? 0;
@@ -2464,17 +2562,24 @@ async function autoCalculateConcentration(targetDate, force = false) {
     const lastVal = Math.round(Number(stock.total_turnover) || 0);
 
     await pool.query(`
-      INSERT INTO idx_concentration (data_date, stock_code, dn0, dn1, dn2, dn3, dn4, price, change_pct, last_val)
-      VALUES (?,?,?,?,?,?,?,?,?,?)
+      INSERT INTO idx_concentration (data_date, stock_code, dn0, dn1, dn2, dn3, dn4, price, change_pct, last_val,
+                                     concentration_model, model_version, ng_state, window_complete, window_missing)
+      VALUES (?,?,?,?,?,?,?,?,?,?, ?,?,?,?,?)
       ON DUPLICATE KEY UPDATE dn0=VALUES(dn0),dn1=VALUES(dn1),dn2=VALUES(dn2),
         dn3=VALUES(dn3),dn4=VALUES(dn4),price=VALUES(price),change_pct=VALUES(change_pct),
-        last_val=VALUES(last_val),fetched_at=NOW()
-    `, [date, ticker, dn0, dn1, dn2, dn3, dn4, price, changePct, lastVal]);
+        last_val=VALUES(last_val),fetched_at=NOW(),
+        concentration_model=VALUES(concentration_model), model_version=VALUES(model_version),
+        ng_state=VALUES(ng_state), window_complete=VALUES(window_complete),
+        window_missing=VALUES(window_missing)
+    `, [date, ticker, dn0, dn1, dn2, dn3, dn4, price, changePct, lastVal,
+        model, MODEL_VERSION, ngState, windowComplete ? 1 : 0,
+        windowMissing.length ? windowMissing.join(',').slice(0, 255) : null]);
     saved++;
   }
 
-  console.log(`  📊 [CONC] ${date}: calculated & stored ${saved} stocks from broker data`);
-  return { date, stocks: saved, source: 'auto-calculated' };
+  console.log(`  📊 [CONC] ${date}: stored ${saved} stocks · model_version=${MODEL_VERSION} · window ${windowComplete ? 'complete' : 'INCOMPLETE'}`);
+  return { date, stocks: saved, source: 'auto-calculated',
+           modelVersion: MODEL_VERSION, windowComplete, windowMissing };
 }
 
 // ─── Auto-Cron: Daily Stock Pull via Index Alpha ─────────────────────────────
