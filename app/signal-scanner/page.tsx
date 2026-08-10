@@ -115,6 +115,21 @@ const RANGE_OPTIONS = ["6D", "10D", "20D", "1M"];
    reader that rising risk is a rising opportunity. */
 const RISK_FACTORS = new Set(["atr"]);
 
+/* Fourteen full labels will not fit fourteen columns, and forcing them to try
+   is what made the header letters collide. Codes in the header, names in a
+   legend under the table — the same shape the review's own mock used:
+       F1    F2     F3
+       SMART TREND  VOL-Z
+   The code is the engine's own f1..f14, so the header, the weights table and
+   AWO_14_FACTOR_FORMULAS.md all refer to a factor by the same name. */
+const FACTOR_SHORT: Record<string, string> = {
+  concentration: "SMART", trend: "TREND", volumeZ: "VOL-Z", momentum: "MOM",
+  relStrength: "RS", breadth: "BRDTH", alignment: "P↔BR", streak: "STRK",
+  rsi: "RSI", macd: "MACD", bollinger: "BB%", emaTrend: "EMA",
+  supportResistance: "S/R", atr: "ATR",
+};
+const FACTOR_COL_W = 58;
+
 /** Rising/falling thresholds, in score points. Small enough to catch a real
  *  drift over five sessions, large enough that ±2 of noise is not a "trend". */
 const DELTA_UP = 8, DELTA_DOWN = -8, STEP = 3;
@@ -394,7 +409,7 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
             {/* Wide enough that the 14 factor columns keep a readable width
                 instead of being squeezed under the frozen block. */}
             <table style={{ borderCollapse: "collapse", fontSize: 11, tableLayout: "fixed",
-                            minWidth: LEFT_TOTAL + 14 * 62 + 70, width: "100%" }}>
+                            minWidth: LEFT_TOTAL + 14 * FACTOR_COL_W + 70, width: "100%" }}>
               <thead>
                 <tr style={{ background: "rgba(22,27,34,0.95)" }}>
                   {([["date","DATE","left"],["price","PRICE","right"],["chg","CHG%","right"],
@@ -411,10 +426,17 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                       title={RISK_FACTORS.has(f.key as string)
                         ? `${f.label} — risk/volatility, not direction. High = wide range, not bullish. Click to sort.`
                         : `${f.label} — click to sort`}
-                      style={{ padding: "6px 8px", textAlign: "center", fontWeight: 700, whiteSpace: "nowrap",
+                      style={{ padding: "4px 4px", textAlign: "center", fontWeight: 700,
+                               width: FACTOR_COL_W, minWidth: FACTOR_COL_W, maxWidth: FACTOR_COL_W,
+                               overflow: "hidden", whiteSpace: "nowrap",
                                cursor: "pointer", userSelect: "none",
                                color: sortKey === f.key ? "#58a6ff" : "#8b949e" }}>
-                      {f.icon} {f.label}{RISK_FACTORS.has(f.key as string) ? " ⚠" : ""}{sortMark(f.key as string)}
+                      <div style={{ fontSize: 10, fontWeight: 900, letterSpacing: "0.04em" }}>
+                        {f.weightKey.toUpperCase()}{RISK_FACTORS.has(f.key as string) ? " ⚠" : ""}{sortMark(f.key as string)}
+                      </div>
+                      <div style={{ fontSize: 9, fontWeight: 600, opacity: 0.75 }}>
+                        {FACTOR_SHORT[f.key as string] || f.label}
+                      </div>
                     </th>
                   ))}
                   <th style={{ padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700, borderLeft: "1px solid rgba(48,54,61,0.8)" }}>SRC</th>
@@ -461,7 +483,8 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                         const h = heat(v, k);
                         return (
                           <td key={k}
-                            style={{ padding: "5px 8px", textAlign: "center", background: h.bg, color: h.color, fontWeight: 700 }}>
+                            style={{ padding: "5px 4px", textAlign: "center", background: h.bg, color: h.color, fontWeight: 700,
+                                     width: FACTOR_COL_W, minWidth: FACTOR_COL_W, maxWidth: FACTOR_COL_W, overflow: "hidden" }}>
                             {v === null ? "—" : Math.round(v)}
                             {v !== null && !RISK_FACTORS.has(k) &&
                               <span style={{ marginLeft: 3, opacity: 0.55, fontWeight: 400 }}>{dirVs(rows, r.date, k)}</span>}
@@ -526,6 +549,23 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                 </tr>
               </tfoot>
             </table>
+          </div>
+
+          {/* Legend for the coded header. Kept directly under the table so a
+              code never has to be remembered, only glanced at. */}
+          <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", marginTop: 8,
+                        fontSize: 10, color: "var(--text-muted)" }}>
+            {FACTOR_LABELS.map(f => (
+              <span key={f.key as string} style={{ whiteSpace: "nowrap" }}>
+                <b style={{ color: sortKey === f.key ? "#58a6ff" : "var(--text-secondary)" }}>
+                  {f.weightKey.toUpperCase()}
+                </b>{" "}
+                {f.icon} {f.label}
+                {RISK_FACTORS.has(f.key as string) && (
+                  <span style={{ color: "#a78bfa" }}> ⚠ risk, not direction</span>
+                )}
+              </span>
+            ))}
           </div>
 
           {/* PATTERN STATE — where the formation is, never whether to buy it. */}
