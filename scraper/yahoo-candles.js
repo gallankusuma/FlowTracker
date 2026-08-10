@@ -96,7 +96,12 @@ function fetchYahooLiveQuote(ticker, suffix = '.JK') {
           const meta = json?.chart?.result?.[0]?.meta;
           const price = meta?.regularMarketPrice || null;
           const marketTime = meta?.regularMarketTime ? meta.regularMarketTime * 1000 : null;
-          const entry = { price, ts: Date.now(), marketTime };
+          // Yahoo already sends the prior session's close in the same payload.
+          // Carrying it through is what makes a DAILY move computable at all —
+          // without it a caller can only ever know P/L since entry, and would
+          // have to guess today's contribution or issue a second request.
+          const previousClose = meta?.previousClose ?? meta?.chartPreviousClose ?? null;
+          const entry = { price, ts: Date.now(), marketTime, previousClose };
           if (price) liveQuoteCache.set(cacheKey, entry);
           resolve(entry);
         } catch (e) {

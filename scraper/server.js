@@ -3304,7 +3304,7 @@ app.get('/api/live-prices', async (req, res) => {
     }));
     const prices = {};
     for (const [ticker, q] of results) {
-      if (q.price) prices[ticker] = { price: q.price, marketTime: q.marketTime };
+      if (q.price) prices[ticker] = { price: q.price, marketTime: q.marketTime, previousClose: q.previousClose ?? null };
     }
     res.json({ prices, fetchedAt: Date.now() });
   } catch (err) {
@@ -6942,8 +6942,11 @@ app.get('/api/signal-scanner/ticker/:ticker/factor-history', async (req, res) =>
     }
     // Ranges are expressed in SESSIONS. "1M" is ~20 trading days, not 30
     // calendar days — the axis is the exchange calendar throughout.
-    const RANGES = { '5D': 5, '10D': 10, '20D': 20, '1M': 20 };
-    const range = String(req.query.range || '10D').toUpperCase();
+    // 6D is H-5..H0 — five sessions of run-up plus today, the window the
+    // trajectory is read over. It is the default because that is the shape the
+    // pattern question is asked in, not because six is a round number.
+    const RANGES = { '6D': 6, '5D': 5, '10D': 10, '20D': 20, '1M': 20 };
+    const range = String(req.query.range || '6D').toUpperCase();
     const count = RANGES[range];
     if (!count) {
       return res.status(400).json({ error: `Unknown range '${range}'`, allowed: Object.keys(RANGES) });

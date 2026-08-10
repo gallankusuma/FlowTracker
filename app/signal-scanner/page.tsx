@@ -107,13 +107,95 @@ type FactorHistoryResp = {
   history: FactorHistoryRow[];
 };
 
-const RANGE_OPTIONS = ["5D", "10D", "20D", "1M"];
+const RANGE_OPTIONS = ["6D", "10D", "20D", "1M"];
+
+/* F14 is NOT directional and must not be coloured as if it were.
+   ATR is a risk/volatility modifier: 80 means "moving violently", not
+   "strongly bullish". Painting it green with the other thirteen would tell the
+   reader that rising risk is a rising opportunity. */
+const RISK_FACTORS = new Set(["atr"]);
+
+/** Rising/falling thresholds, in score points. Small enough to catch a real
+ *  drift over five sessions, large enough that ±2 of noise is not a "trend". */
+const DELTA_UP = 8, DELTA_DOWN = -8, STEP = 3;
+
+/**
+ * PATTERN STATE — where in its formation the setup is, not whether to buy it.
+ *
+ * Deliberately rule-based and deliberately NOT a recommendation: the states are
+ * the reviewer's own vocabulary, and each is a statement about which factor
+ * groups have turned and in what order. EXP-016 in this repo found persistent
+ * broker accumulation preceding UNDERperformance, so a green trajectory is an
+ * observation to investigate, never a signal to act on.
+ *
+ * REFUSES on an incomplete window. Five available rows are not five consecutive
+ * exchange sessions, and a classification read off a window with a hole in it
+ * would describe a sequence that never happened — the transition order is the
+ * entire content of the claim.
+ */
+function classifyPattern(rows: FactorHistoryRow[], complete: boolean) {
+  if (!complete) return { state: "UNAVAILABLE", why: "window incomplete" };
+  const obs = rows.filter(r => r.observed);
+  if (obs.length < 3) return { state: "UNAVAILABLE", why: "not enough observed sessions" };
+
+  const latest = obs[0], first = obs[obs.length - 1];
+  const d = (k: string) => {
+    const a = first.factors?.[k], b = latest.factors?.[k];
+    return (a === null || a === undefined || b === null || b === undefined) ? null : b - a;
+  };
+  const now = (k: string) => latest.factors?.[k] ?? null;
+  const rising = (k: string) => (d(k) ?? 0) >= DELTA_UP;
+  const high = (k: string) => (now(k) ?? 0) >= 65;
+
+  const directional = FACTOR_LABELS.filter(f => !RISK_FACTORS.has(f.key as string));
+  const highCount = directional.filter(f => high(f.key as string)).length;
+
+  const priceRet = (first.price && latest.price) ? ((latest.price - first.price) / first.price) * 100 : null;
+
+  // Ordered most-advanced first: a setup that qualifies as EXTENDED is also
+  // technically "confirming", and reporting the earlier state would understate
+  // how late it is.
+  if (priceRet !== null && priceRet >= 10 && highCount >= 7) {
+    return { state: "EXTENDED", why: `price already +${priceRet.toFixed(1)}% over the window` };
+  }
+  if (highCount >= 8 && !rising("concentration")) {
+    return { state: "MATURE", why: `${highCount} factors high and no longer accelerating` };
+  }
+  if (rising("momentum") && rising("trend")) {
+    return { state: "CONFIRMING", why: "momentum and trend have joined" };
+  }
+  if (rising("concentration") && (rising("relStrength") || rising("volumeZ"))) {
+    return { state: "FORMING", why: "smart money aligning with relative strength / volume" };
+  }
+  if (rising("concentration")) {
+    return { state: "EARLY", why: "smart money rising, others not yet confirming" };
+  }
+  return { state: "NO PATTERN", why: "no factor group is turning" };
+}
+
+const PATTERN_COLORS: Record<string, { c: string; bg: string }> = {
+  EARLY:        { c: "#58a6ff", bg: "rgba(88,166,255,0.12)" },
+  FORMING:      { c: "#a78bfa", bg: "rgba(167,139,250,0.12)" },
+  CONFIRMING:   { c: "#3fb950", bg: "rgba(63,185,80,0.12)" },
+  MATURE:       { c: "#d29922", bg: "rgba(210,153,34,0.12)" },
+  EXTENDED:     { c: "#f85149", bg: "rgba(248,81,73,0.12)" },
+  UNAVAILABLE:  { c: "#8b949e", bg: "rgba(139,148,158,0.10)" },
+  "NO PATTERN": { c: "#8b949e", bg: "rgba(139,148,158,0.10)" },
+};
 
 /** Heatmap that stays out of the way. Missing data gets NO colour at all — a
  *  grey dash, never a green or red cell, because absence is not a weak score. */
-function heat(v: number | null): { bg: string; color: string } {
+function heat(v: number | null, key?: string): { bg: string; color: string } {
   if (v === null || v === undefined || Number.isNaN(v)) {
     return { bg: "transparent", color: "var(--text-muted)" };
+  }
+  // RISK, NOT DIRECTION. A high ATR is not a good thing — it is a wide thing.
+  // Given the same green the directional factors use, a volatility spike would
+  // read as strength, which is the opposite of what it says about position size.
+  if (key && RISK_FACTORS.has(key)) {
+    if (v >= 65) return { bg: "rgba(167,139,250,0.16)", color: "#a78bfa" };  // high vol
+    if (v >= 35) return { bg: "rgba(139,148,158,0.10)", color: "#8b949e" };
+    return { bg: "rgba(139,148,158,0.06)", color: "#6e7681" };               // quiet
   }
   if (v >= 65) return { bg: "rgba(63,185,80,0.13)", color: "#3fb950" };
   if (v >= 45) return { bg: "rgba(210,153,34,0.10)", color: "#d29922" };
@@ -123,6 +205,14 @@ function heat(v: number | null): { bg: string; color: string } {
 /** ↑ improving / → stable / ↓ weakening against the PREVIOUS OBSERVED session.
  *  Deliberately skips unobserved days rather than treating them as 0, which
  *  would invent a crash into a gap and a recovery out of it. */
+/** Change across the whole window, first observed session → latest observed. */
+function windowDelta(rows: FactorHistoryRow[], key: string): number | null {
+  const obs = rows.filter(r => r.observed && r.factors?.[key] !== null && r.factors?.[key] !== undefined);
+  if (obs.length < 2) return null;
+  const latest = obs[0].factors![key]!, first = obs[obs.length - 1].factors![key]!;
+  return latest - first;
+}
+
 function dirVs(rows: FactorHistoryRow[], idx: number, key: string): string {
   const cur = rows[idx]?.factors?.[key];
   if (cur === null || cur === undefined) return "";
@@ -233,13 +323,18 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                   <th style={{ ...sticky(84, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>PRICE</th>
                   <th style={{ ...sticky(150, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>CHG%</th>
                   <th style={{ ...sticky(208, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>SCORE</th>
-                  <th style={{ ...sticky(264, 4), padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700, borderRight: "1px solid rgba(48,54,61,0.8)" }}>SIGNAL</th>
+                  <th style={{ ...sticky(264, 4), padding: "6px 10px", textAlign: "right", color: "#8b949e", fontWeight: 700 }}>CONF</th>
+                  <th style={{ ...sticky(316, 4), padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700, borderRight: "1px solid rgba(48,54,61,0.8)" }}>SIGNAL</th>
                   {FACTOR_LABELS.map(f => (
-                    <th key={f.key as string} title={f.label}
+                    <th key={f.key as string}
+                      title={RISK_FACTORS.has(f.key as string)
+                        ? `${f.label} — risk/volatility, not direction. High = wide range, not bullish.`
+                        : f.label}
                       style={{ padding: "6px 8px", textAlign: "center", color: "#8b949e", fontWeight: 700, whiteSpace: "nowrap" }}>
-                      {f.icon} {f.label}
+                      {f.icon} {f.label}{RISK_FACTORS.has(f.key as string) ? " ⚠" : ""}
                     </th>
                   ))}
+                  <th style={{ padding: "6px 10px", textAlign: "left", color: "#8b949e", fontWeight: 700, borderLeft: "1px solid rgba(48,54,61,0.8)" }}>SRC</th>
                 </tr>
               </thead>
               <tbody>
@@ -265,7 +360,11 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                                    color: r.compositeScore === null ? "var(--text-muted)" : "var(--text-primary)" }}>
                         {r.compositeScore === null ? "—" : Math.round(r.compositeScore)}
                       </td>
-                      <td style={{ ...sticky(264), padding: "5px 10px", borderRight: "1px solid rgba(48,54,61,0.8)", whiteSpace: "nowrap" }}>
+                      <td style={{ ...sticky(264), padding: "5px 10px", textAlign: "right",
+                                   color: r.confidence === null ? "var(--text-muted)" : "var(--text-secondary)" }}>
+                        {r.confidence === null ? "—" : Math.round(r.confidence)}
+                      </td>
+                      <td style={{ ...sticky(316), padding: "5px 10px", borderRight: "1px solid rgba(48,54,61,0.8)", whiteSpace: "nowrap" }}>
                         {r.signal ? (
                           <span style={{ fontSize: 9, fontWeight: 800, padding: "2px 6px", borderRadius: 3,
                                          background: cfg?.bg || "transparent", color: cfg?.color || "var(--text-muted)" }}>
@@ -274,22 +373,110 @@ function FactorHistoryPanel({ ticker }: { ticker: string }) {
                         ) : <span style={{ color: "var(--text-muted)" }}>—</span>}
                       </td>
                       {FACTOR_LABELS.map(f => {
-                        const v = r.factors?.[f.key as string] ?? null;
-                        const h = heat(v);
+                        const k = f.key as string;
+                        const v = r.factors?.[k] ?? null;
+                        const h = heat(v, k);
                         return (
-                          <td key={f.key as string}
+                          <td key={k}
                             style={{ padding: "5px 8px", textAlign: "center", background: h.bg, color: h.color, fontWeight: 700 }}>
                             {v === null ? "—" : Math.round(v)}
-                            {v !== null && <span style={{ marginLeft: 3, opacity: 0.55, fontWeight: 400 }}>{dirVs(rows, i, f.key as string)}</span>}
+                            {v !== null && !RISK_FACTORS.has(k) &&
+                              <span style={{ marginLeft: 3, opacity: 0.55, fontWeight: 400 }}>{dirVs(rows, i, k)}</span>}
                           </td>
                         );
                       })}
+                      {/* Provenance: which observation this row actually is. A
+                          backfilled value is a reconstruction, not something the
+                          engine emitted that day, and the reader should be able
+                          to tell without leaving the table. */}
+                      <td style={{ padding: "5px 10px", borderLeft: "1px solid rgba(48,54,61,0.8)", fontSize: 9,
+                                   color: r.dataSource === "live" ? "#3fb950" : "var(--text-muted)", whiteSpace: "nowrap" }}>
+                        {r.dataSource || "—"}
+                      </td>
                     </tr>
                   );
                 })}
               </tbody>
+              {/* Δ over the window and its direction. The reviewer's point: two
+                  stocks both at 75 today are not the same stock if one arrived
+                  from 43 and the other never moved. The change is the signal
+                  worth looking at, so it gets its own row rather than being
+                  inferred by reading up the column. */}
+              <tfoot>
+                <tr style={{ borderTop: "2px solid rgba(48,54,61,0.9)", background: "rgba(22,27,34,0.7)" }}>
+                  <td style={{ ...sticky(0), padding: "6px 10px", fontWeight: 800, color: "#8b949e" }} colSpan={5}>
+                    Δ {data?.range || ""}
+                  </td>
+                  <td style={{ ...sticky(316), borderRight: "1px solid rgba(48,54,61,0.8)" }} />
+                  {FACTOR_LABELS.map(f => {
+                    const k = f.key as string;
+                    const d = windowDelta(rows, k);
+                    return (
+                      <td key={k} style={{ padding: "6px 8px", textAlign: "center", fontWeight: 800,
+                                           color: d === null ? "var(--text-muted)"
+                                             : RISK_FACTORS.has(k) ? "#a78bfa"
+                                             : d > 0 ? "#3fb950" : d < 0 ? "#f85149" : "var(--text-muted)" }}>
+                        {d === null ? "—" : `${d > 0 ? "+" : ""}${Math.round(d)}`}
+                      </td>
+                    );
+                  })}
+                  <td style={{ borderLeft: "1px solid rgba(48,54,61,0.8)" }} />
+                </tr>
+                <tr style={{ background: "rgba(22,27,34,0.7)" }}>
+                  <td style={{ ...sticky(0), padding: "6px 10px", fontWeight: 800, color: "#8b949e" }} colSpan={5}>TREND</td>
+                  <td style={{ ...sticky(316), borderRight: "1px solid rgba(48,54,61,0.8)" }} />
+                  {FACTOR_LABELS.map(f => {
+                    const k = f.key as string;
+                    const d = windowDelta(rows, k);
+                    const arrow = d === null ? "" : d >= 24 ? "↑↑↑" : d >= DELTA_UP ? "↑↑" : d > STEP ? "↑"
+                      : d <= -24 ? "↓↓↓" : d <= DELTA_DOWN ? "↓↓" : d < -STEP ? "↓" : "→";
+                    return (
+                      <td key={k} style={{ padding: "6px 8px", textAlign: "center", fontWeight: 800,
+                                           color: d === null ? "var(--text-muted)"
+                                             : RISK_FACTORS.has(k) ? "#a78bfa"
+                                             : d > STEP ? "#3fb950" : d < -STEP ? "#f85149" : "var(--text-muted)" }}>
+                        {arrow || "—"}
+                      </td>
+                    );
+                  })}
+                  <td style={{ borderLeft: "1px solid rgba(48,54,61,0.8)" }} />
+                </tr>
+              </tfoot>
             </table>
           </div>
+
+          {/* PATTERN STATE — where the formation is, never whether to buy it. */}
+          {(() => {
+            const complete = !!data?.window?.complete;
+            const p = classifyPattern(rows, complete);
+            const col = PATTERN_COLORS[p.state] || PATTERN_COLORS.UNAVAILABLE;
+            return (
+              <div style={{ marginTop: 12, padding: "10px 14px", borderRadius: 6,
+                            background: col.bg, border: `1px solid ${col.c}33` }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                  <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: "0.06em", color: "#8b949e" }}>PATTERN STATE</span>
+                  <span style={{ fontSize: 13, fontWeight: 900, color: col.c }}>{p.state}</span>
+                  <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{p.why}</span>
+                </div>
+                {!complete && data?.window && (
+                  // THE HARD RULE. Five available rows are not five consecutive
+                  // sessions, and the transition ORDER is the entire content of
+                  // a pattern claim — so a window with a hole cannot be
+                  // classified at all. It is not shifted, not zero-filled, and
+                  // not quietly shortened. It is refused, by name.
+                  <div style={{ marginTop: 6, fontSize: 11, color: "#d29922" }}>
+                    ⚠ <b>PATTERN WINDOW INCOMPLETE</b> — missing session(s): {data.window.missingSessions.join(", ")}.
+                    <span style={{ color: "var(--text-muted)" }}> Classification unavailable: a sequence read across a gap
+                    would describe an order of events that never happened.</span>
+                  </div>
+                )}
+                <div style={{ marginTop: 6, fontSize: 10, color: "var(--text-muted)" }}>
+                  States describe formation, not action. Per EXP-016 in this project, persistent broker accumulation has
+                  historically preceded UNDERperformance — treat this as something to investigate, not a signal.
+                </div>
+              </div>
+            );
+          })()}
 
           {insight && (insight.up.length > 0 || insight.down.length > 0 || insight.flat.length > 0) && (
             <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginTop: 12, fontSize: 11 }}>
@@ -931,7 +1118,7 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
   const [trackedPickTickers, setTrackedPickTickers] = useState<Set<string>>(new Set());
   const [trackingPickTicker, setTrackingPickTicker] = useState<string | null>(null);
   const [simRunning, setSimRunning] = useState(false);
-  const [livePrices, setLivePrices] = useState<Record<string, { price: number; marketTime: number | null }>>({});
+  const [livePrices, setLivePrices] = useState<Record<string, { price: number; marketTime: number | null; previousClose?: number | null }>>({});
   const [livePricesAt, setLivePricesAt] = useState<number | null>(null);
 
   const loadPicks = async () => {
@@ -2025,6 +2212,56 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
             const totalLoss   = positions.reduce((s: number, p: any) => s + p.maxLoss, 0);
             const openCount   = openRecs.length;
             const usedPct     = (totalAlloc / MODAL_TOTAL) * 100;
+
+            /* ── FLOATING P/L, daily and since entry ──────────────────────────
+               Two different questions: "what did today do to me" and "where am
+               I since I got in". Reported separately because a position can be
+               up 12% overall and down 3% today, and one number cannot say that.
+
+               PERCENTAGES ARE THE PRIMARY FIGURE, not a fallback. Rupiah needs
+               a lot count, and calcPosition() allocates nothing while conviction
+               sizing runs in SHADOW_ONLY mode — so a rupiah total would read
+               "Rp 0" and be mistaken for "flat" rather than "unsized". Rupiah is
+               shown only when positions genuinely size.
+
+               Equal-weighted across open positions: with no sizes there are no
+               weights to use, and pretending otherwise would invent a portfolio
+               shape that does not exist. */
+            const floats = openRecs.map((r: any) => {
+              const entry = entryOf(r);
+              const lv = livePrices[r.ticker];
+              const mkt = lv?.price ?? (r.market_price ? Number(r.market_price) : null);
+              if (!entry || !mkt) return null;
+              const prev = lv?.previousClose ?? null;
+              const dir = r.direction === "BEARISH" ? -1 : 1;
+              // Sized from THIS rec rather than matched out of `positions` —
+              // calcPosition() returns no ticker, so a lookup by ticker would
+              // silently never match and rupiah would stay null even after
+              // sizing is switched back on.
+              const p = calcPosition(r);
+              return {
+                totalPct: dir * ((mkt - entry) / entry) * 100,
+                dayPct: prev && prev > 0 ? dir * ((mkt - prev) / prev) * 100 : null,
+                shares: p?.finalShares ?? null,
+                entry, mkt, prev,
+              };
+            }).filter(Boolean) as any[];
+
+            const avg = (xs: (number | null)[]) => {
+              const v = xs.filter(x => x !== null) as number[];
+              return v.length ? v.reduce((a, b) => a + b, 0) / v.length : null;
+            };
+            const floatTotalPct = avg(floats.map(f => f.totalPct));
+            const floatDayPct   = avg(floats.map(f => f.dayPct));
+            const dayCovered    = floats.filter(f => f.dayPct !== null).length;
+            // Rupiah only where a real share count exists.
+            const sized = floats.filter(f => f.shares);
+            const floatTotalRp = sized.length ? sized.reduce((s, f) => s + (f.mkt - f.entry) * f.shares, 0) : null;
+            const floatDayRp   = sized.filter(f => f.prev).length
+              ? sized.filter(f => f.prev).reduce((s, f) => s + (f.mkt - f.prev) * f.shares, 0) : null;
+            const pctStr = (v: number | null) => v === null ? "–" : `${v > 0 ? "+" : ""}${v.toFixed(2)}%`;
+            const pnlColor = (v: number | null) => v === null ? "var(--text-muted)" : v > 0 ? "#34d399" : v < 0 ? "#f87171" : "var(--text-muted)";
+
             return (
               <div style={{ padding: "14px 20px", background: "linear-gradient(135deg, rgba(99,102,241,0.08), rgba(139,92,246,0.08))",
                 border: "1px solid rgba(99,102,241,0.2)", borderRadius: 12, marginBottom: 12 }}>
@@ -2032,8 +2269,18 @@ function HarmonicTab({ apiBase }: { apiBase: string }) {
                   <span style={{ fontSize: 12, fontWeight: 900, color: "#a78bfa" }}>💼 SIMULASI PORTOFOLIO — MODAL Rp 100 JUTA</span>
                   <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: 8 }}>Risk 2%/trade · Max 30%/posisi · IDX lot = 100 saham</span>
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 10 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", gap: 10 }}>
                   {[
+                    { label: "FLOAT HARIAN", value: pctStr(floatDayPct),
+                      sub: floatDayRp !== null ? fmtM(floatDayRp)
+                        : dayCovered === 0 ? "menunggu harga live"
+                        : `rata-rata ${dayCovered} posisi`,
+                      color: pnlColor(floatDayPct) },
+                    { label: "FLOAT TOTAL", value: pctStr(floatTotalPct),
+                      sub: floatTotalRp !== null ? fmtM(floatTotalRp)
+                        : floats.length ? `rata-rata ${floats.length} posisi · sejak entry`
+                        : "belum ada posisi open",
+                      color: pnlColor(floatTotalPct) },
                     { label: "MODAL DIPAKAI", value: `${(totalAlloc/1e6).toFixed(1)}M`, sub: `${usedPct.toFixed(1)}% dari 100M`, color: "#60a5fa" },
                     { label: "POSISI OPEN",   value: openCount, sub: `${filteredRecs.length} total`, color: "#a78bfa" },
                     { label: "EST PROFIT T1", value: fmtM(totalGainT1), sub: `+${(totalGainT1/MODAL_TOTAL*100).toFixed(1)}% modal`, color: "#34d399" },
