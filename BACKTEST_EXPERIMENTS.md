@@ -1100,3 +1100,82 @@ CONVERGENCE score beside DATA quality, and shown on the page as "day-one seed
 still in the map". A name whose map is mostly its own initialisation can no
 longer score the same as one whose float has rotated forty times: the median
 confidence fell from a flat 80/100 to **48/100** once it was measured honestly.
+
+---
+
+## EXP-2026-08-11-026 — Market Regime Conditionality: the conditionality is real, but the premise it was meant to test is not
+
+- **Script**: `scraper/backtest_market_regime_conditionality.js`
+- **Why**: the 2026-08-11 review round argued that the scanner answers "which stock is relatively strong?" while the question being asked of it is "is a long worth taking?", and proposed a Market State layer above the frozen stock engine. It explicitly asked that the FIRST step be measurement, not a rule — "jangan mulai dari rule mana yang bagus" — and named EXP-026 as *how does the existing system perform conditional on market state*, ahead of the EXP-025 OOS precursor test.
+- **Data**: `idx_signal_history`, source `backfill_v3_f5v1` only (uniform `f5_benchmark_version = v1-idx245-2026-08-10`). The 4,131 `live` rows carry no benchmark stamp at all and are excluded: 14 sessions hold rows from both sources with no duplicate ticker-days, so including them would put two F5 benchmark definitions inside a single session's cross-section — and F5 is the factor under discussion. **117 sessions, 26,739 scored ticker-sessions, 2026-01-19 .. 2026-07-21, 200 resolved BUY/STRONG BUY.**
+- **Method**: market features per session from the exchange's own index series (returns 1/5/20D, vs MA20/MA60, MA20/MA60 slope, drawdown from 20D/60D high, realized vol 20D) plus breadth computed independently from `idx_stock_prices` (% above own MA20, % closing up). Sessions bucketed into **terciles** of each feature — not a threshold, because choosing one would answer EXP-027's question with EXP-026's data. Per bucket: session-level Spearman rank IC of `composite_score` vs forward return, universe mean return, BUY absolute return, and **BUY excess = BUY mean minus the same session's universe mean**. All statistics computed per session and aggregated across sessions; every CI from `bootstrapMeanCI` resampling whole sessions.
+- **Date-blocking**: N is **117 sessions, not 26,739 rows** — every stock in a session shares that session's regime. Same correction EXP-025 needed when its "1,236 winner observations" turned out to be 100 sessions.
+
+### The measurement that was supposed to settle it
+
+The review's hypothesis has a precise empirical form: if the stock engine picks relative winners and only market permission is missing, then **EXCESS** (market move divided out) stays positive across regimes while **ABSOLUTE** goes negative in the bad ones.
+
+| Horizon | rank IC | 95% CI | IR | universe | BUY absolute | BUY **excess** | excess 95% CI |
+|---|---|---|---|---|---|---|---|
+| 1D | −0.0554 | [−0.0789, −0.0298] | −0.41 | −0.15% | −0.74% | −0.48% | [−1.39, +0.45] |
+| 3D | −0.0470 | [−0.0690, −0.0222] | −0.36 | −0.44% | −1.86% | −0.94% | [−2.17, +0.24] |
+| 5D | −0.0468 | [−0.0704, −0.0224] | −0.36 | −0.72% | −2.67% | −1.09% | [−2.49, +0.11] |
+| 10D | −0.0676 | [−0.0904, −0.0445] | −0.53 | −1.33% | −4.72% | **−2.11%** | **[−3.87, −0.48]** |
+
+**EXCESS is negative at every horizon and significantly so at 10D.** Removing the market's own move does not rescue the BUY bucket, so on this window the premise does not hold: the scanner is not picking relative winners that a bad market is dragging down.
+
+The 1D row is the one with no overlap caveat at all — daily sampling with a 1-day forward return produces 117 genuinely non-overlapping windows, and the IC there is significantly negative on its own.
+
+### The conditionality IS real, and it is strong
+
+Tercile splits, 5D horizon (IC column uses every scored name; BUY cells are small — see caveats):
+
+| Feature | bucket | sessions | BUYs | market | BUY excess | IC |
+|---|---|---|---|---|---|---|
+| MA60 slope | LOW | 39 | 50 | −0.02% | −2.66% | **−0.1286** |
+| | HIGH | 39 | 95 | −2.19% | +0.36% | **+0.0117** |
+| realized vol 20D | LOW | 39 | 98 | −3.71% | +0.03% | **+0.0142** |
+| | HIGH | 39 | 40 | +0.74% | −1.53% | **−0.1111** |
+| drawdown from 60D high | LOW (deep) | 39 | 37 | +0.82% | −2.09% | −0.1026 |
+| | HIGH (near high) | 39 | 104 | −1.68% | −0.71% | −0.0243 |
+| IHSG vs MA60 | LOW | 39 | 42 | +0.35% | −2.47% | −0.0642 |
+| | HIGH | 39 | 103 | −1.47% | +0.29% | −0.0176 |
+| IHSG vs MA20 | HIGH | 39 | 86 | −1.72% | **+0.84%** | −0.0363 |
+| breadth % > own MA20 | HIGH | 39 | 91 | −1.25% | +0.19% | −0.0363 |
+
+The pattern is consistent across six independent descriptions of the market: **in stressed states (falling MA60, high volatility, deep drawdown, below MA60) the score is actively anti-predictive, IC −0.10 to −0.13. In benign states it is approximately useless, IC ≈ 0 to +0.01, and BUY excess is ≈ 0 rather than negative.**
+
+A breakout column worth naming separately: in the weakest 20D-return tercile, BUY names hit +5% within 5 sessions **19.6%** of the time against a universe base rate of **45.7%** in the same sessions. The signals are less likely to break out than an average name in the same market.
+
+### The decile shape — where the damage actually is
+
+Mean forward return minus the session's own universe mean, per `composite_score` decile, averaged over 117 sessions:
+
+| | D1 | D2 | D3 | D4 | D5 | D6 | D7 | D8 | D9 | D10 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1D | −0.06 | **+0.23** | **+0.17** | **+0.18** | **+0.16** | +0.02 | −0.10 | −0.14 | **−0.24** | −0.22 |
+| 5D | −0.26 | **+0.49** | **+0.53** | +0.20 | +0.27 | +0.08 | −0.33 | −0.23 | −0.10 | **−0.81** |
+
+(bold = 95% CI excludes zero. D10 − D1 = **−0.56pp** at 5D; a working ranking is positive here.)
+
+**This is a hump, not a line.** The score is not uniformly inverted — D2/D3 significantly OUTPERFORM (+0.49/+0.53 at 5D) while D10 significantly UNDERPERFORMS (−0.81). D1, the very bottom, is also negative. So `composite_score` does carry usable cross-sectional information; it is being **read at the wrong end**. BUY fires on high scores, i.e. precisely on D10, the single worst decile in the distribution.
+
+### Findings
+
+1. **The conditionality the review asked about is real and large.** IC swings from −0.13 (falling MA60) to +0.01 (rising MA60), and from −0.11 (high vol) to +0.01 (low vol). A market-state layer is justified by this data.
+2. **But not for the reason proposed.** The case for the layer is not "protect a good stock signal from a bad market" — BUY excess is negative in the pooled sample and significantly negative at 10D. It is "the signal is actively harmful in stressed states and merely neutral otherwise", which is a weaker and less flattering justification for the same architecture.
+3. **`Stock Alpha × Market Permission` cannot work while Stock Alpha ≤ 0 at the top of the ranking.** Multiplying a market gate onto a negative-expectancy selection reduces exposure and therefore reduces losses, but that is risk reduction, not alpha, and it must not be reported as the architecture being validated.
+4. **The most valuable follow-up is not EXP-027.** The decile hump says the ranking's information is real but its top end is inverted — consistent with EXP-024 ("winners are preceded by LOWER factor values"), EXP-016 (broker accumulation inverted), and the standing finding that the composite is contemporaneous (corr 0.35 with the SAME day's return, so D10 is largely "already ran", which then mean-reverts on IDX). Asking why BUY fires on D10 is likely worth more than gating a signal that is negative at its own top decile.
+
+### Verification of the harness
+
+8/8 checks, independent of the experiment's own code path: `spearmanIC` returns exactly +1/−1 on monotone toy cases and does not fabricate a value when every return is tied (ARA/ARB ties are routine on IDX); the module's Spearman matches a separately written rank-and-Pearson implementation to 1e−9 on a real 245-name cross-section (2026-01-19, IC 0.069388 both ways); universe and BUY means match `SQL AVG` to 1e−6; one stored `return_5d` reconciles against `idx_stock_prices` from raw closes (AMIN 2026-01-19, 292 → 282, stored −3.4200% vs recomputed −3.4247%, the difference being the stored value's 2-decimal rounding); the bootstrap CI collapses to zero width on a constant series.
+
+### Caveats, and they bind hard
+
+- **One window, ~6 months, predominantly falling.** IHSG was above its MA60 on only 12 of 121 sessions and within 1% of its 60-day high on 2. A binary RISK_ON/RISK_OFF split is NOT supportable on this sample — that is why terciles were used, and it is the reason EXP-027 cannot be run on this data alone.
+- **Overlapping forward windows.** `modules/cross_sectional.js` documents that its bootstrap cannot fix serial correlation from daily sampling at multi-day horizons, so the 3/5/10D CIs are too narrow. Re-run on non-overlapping subsamples: 3D −0.0370 [−0.0749, −0.0000] (39 sessions), 5D −0.0420 [−0.0949, +0.0092] (24), 10D −0.0843 [−0.1705, −0.0012] (12). The 5D IC crosses zero once overlap is removed; **the 1D result needs no such correction and remains significant.** BUY absolute stays significantly negative at 1D-spacing and 5D-spacing.
+- **200 BUY signals over 78 sessions.** Every ABSOLUTE/EXCESS tercile cell rests on 37–104 signals. Treat them as directional; the IC column, which uses all 26,739 scored names, is the stronger statistic.
+- **In-sample.** These are the same sessions the engine and EXP-024/EXP-025 were developed against.
+
+**Status**: MEASURED, no rule proposed and no gate enabled. Answers the review's question as asked, and reports that the hypothesis behind it does not hold on this window. EXP-027 (regime model) is **not** unblocked by this — the sample cannot support a regime classifier — and the decile finding in §4 is recommended ahead of it.
