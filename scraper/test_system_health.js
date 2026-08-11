@@ -359,6 +359,87 @@ const ALL_FRESH = {
     });
   }
 
+  // ── P1 2026-08-11: ONE DEFINITION OF FRESHNESS ────────────────────────────
+  // Seen live 2026-08-10 18:55 WIB. The calendar (idx_ihsg_history) reaches
+  // session D at 16:15 WIB, because refreshIHSG keeps a bar once the WIB day has
+  // passed the close and it runs on page open. The broker pull is the 19:30 WIB
+  // job. In between, the freshest-feed reference was D while the broker table
+  // sat at D-1 — a lag of 1 against a tolerance of 0 — so the broker check went
+  // BLOCKING and the scanner and Flow Analyzer both refused, while
+  // brokerFreshness() called the very same feed CURRENT because
+  // expectedBrokerSession() knew D's data was not due yet.
+  //
+  // Every trading day, for about three and a quarter hours, healing itself at
+  // 19:30. The fixture below IS that window.
+  console.log('\nP1 — the calendar running ahead of the broker pull is not staleness');
+  {
+    const at = s => new Date(s);
+    // Calendar has reached Friday 31 Jul; broker/concentration/flow still hold
+    // Thursday 30 Jul, which is the session actually being promised right now.
+    const windowSpec = () => ({
+      tables: { idx_stock_prices: '2026-07-30', idx_broker_summary: '2026-07-30',
+                idx_concentration: '2026-07-30', idx_broker_flow_detail: '2026-07-30',
+                idx_ihsg_history: '2026-07-31', ft_signals: '2026-07-30' },
+      lag: { '2026-07-31': 0, '2026-07-30': 1 },
+      sessions: ['2026-07-27', '2026-07-28', '2026-07-29', '2026-07-30', '2026-07-31'],
+    });
+    // 10:30 UTC = 17:30 WIB: after the 16:15 close, before the 19:30 pull.
+    const INSIDE = at('2026-07-31T10:30:00Z');
+
+    await atest('inside the window the broker feed is NOT reported stale', async () => {
+      const rows = await sh.dataFreshness(makePool(windowSpec()), INSIDE);
+      for (const key of ['broker', 'concentration', 'flow_detail']) {
+        const r = rows.find(x => x.key === key);
+        assert.strictEqual(r.ok, true, `${key}: ${r.detail}`);
+      }
+    });
+
+    await atest('so the scanner and Flow Analyzer stay ENABLED all afternoon', async () => {
+      const r = await sh.readiness(makePool(windowSpec()), {
+        subsystems: [sh.SUBSYSTEM.SIGNAL_ENGINE], today: INSIDE });
+      assert.strictEqual(r.enabled, true, JSON.stringify(r.blocking));
+      assert.strictEqual(r.ready, true, JSON.stringify(r.blocking.concat(r.degraded)));
+    });
+
+    await atest('and the burn-in does not fail for a pull that is not due yet', async () => {
+      const r = await sh.readiness(makePool(windowSpec()), {
+        subsystems: [sh.SUBSYSTEM.VIRTUAL_BROKER], today: INSIDE });
+      assert.strictEqual(r.ready, true, JSON.stringify(r.blocking.concat(r.degraded)));
+    });
+
+    // The other half of the contract: the tolerance must not have been widened.
+    // Once the deadline passes, an absent pull is a real fault again.
+    await atest('AFTER the deadline the same fixture DOES block — this is not a widened tolerance', async () => {
+      const r = await sh.readiness(makePool(windowSpec()), {
+        subsystems: [sh.SUBSYSTEM.SIGNAL_ENGINE], today: at('2026-07-31T13:50:00Z') });
+      assert.strictEqual(r.enabled, false, JSON.stringify(r.blocking));
+      assert.ok(r.blocking.some(b => b.startsWith('broker:')), JSON.stringify(r.blocking));
+    });
+
+    await atest('the two definitions now agree, feed by feed, at every hour', async () => {
+      for (const iso of ['2026-07-31T03:00:00Z', '2026-07-31T10:30:00Z',
+                         '2026-07-31T12:40:00Z', '2026-07-31T13:50:00Z']) {
+        const pool = makePool(windowSpec());
+        const rows = await sh.dataFreshness(pool, at(iso));
+        for (const [key, table, col] of [['broker', 'idx_broker_summary', 'date'],
+                                         ['concentration', 'idx_concentration', 'data_date'],
+                                         ['flow_detail', 'idx_broker_flow_detail', 'date']]) {
+          const bf = await sh.brokerFreshness(pool, { asOf: at(iso), table, col });
+          const row = rows.find(x => x.key === key);
+          assert.strictEqual(row.ok, bf.valid,
+            `${key} at ${iso}: freshness table says ok=${row.ok}, the primitive says valid=${bf.valid}`);
+        }
+      }
+    });
+
+    test('the broker family declares which yardstick it is measured by', () => {
+      for (const key of ['broker', 'concentration', 'flow_detail']) {
+        assert.strictEqual(sh.CHECKS.find(c => c.key === key).reference,
+          sh.REFERENCE.BROKER_PIPELINE, `${key} is still judged against the freshest feed`);
+      }
+    });
+  }
+
   console.log('\nassertCompleteSessions validates SQL identifiers (review P2)');
   {
     const pool = makePool(ALL_FRESH);

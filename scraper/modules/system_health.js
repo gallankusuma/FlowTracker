@@ -454,6 +454,50 @@ async function assertCompleteSessions(pool, {
   };
 }
 
+/**
+ * WHICH YARDSTICK A CHECK IS MEASURED AGAINST.
+ *
+ * WHY THIS FIELD EXISTS (2026-08-11). Seen live at 18:55 WIB on 2026-08-10:
+ * /api/signal-scanner and /api/flow-analyzer were returning 503 for a broker feed
+ * that was, by the module's own central primitive, perfectly CURRENT. Two
+ * definitions of freshness had grown in one file:
+ *
+ *   brokerFreshness()  judged the feed against `expectedBrokerSession(asOf)` —
+ *                      time-aware, so before the evening pull the PREVIOUS
+ *                      session is the one being promised.
+ *   dataFreshness()    judged it against the FRESHEST DATE ANY FEED HAD, with a
+ *                      tolerance of 0.
+ *
+ * Those agree only while every feed advances together, and one does not.
+ * `refreshIHSG` writes session D as soon as the WIB day passes 16:15 (see
+ * modules/ihsg.js) and it is called on page open, while the broker pull is the
+ * 19:30 WIB job. So on any day somebody opened the app after the close, the
+ * calendar reached D around 16:15 and the broker table stayed at D-1 until 19:30.
+ * For those ~3¼ hours the freshest-feed reference was D, broker lag computed to 1
+ * against a tolerance of 0, the check went BLOCKING, and both endpoints refused —
+ * every trading day, healing itself at 19:30 so it never looked like a fault.
+ *
+ * The scanner was not wrong to refuse a stale feed. It was measuring lateness
+ * against a feed that is SCHEDULED to run ahead of it, which is not lateness at
+ * all. The freshest-feed reference is right for feeds that land together in the
+ * nightly job; it is wrong for a feed with its own publication deadline, and that
+ * deadline is exactly what `expectedBrokerSession` already knew.
+ *
+ *   'freshest-feed'   lag vs the newest date any monitored feed has produced.
+ *   'broker-pipeline' the verdict comes from brokerFreshness() itself — the same
+ *                     call the scanner, Flow Analyzer and the burn-in gate make.
+ *                     Not "the same tolerance" or "the same rule restated": the
+ *                     same function, because this file has now twice proved that
+ *                     two implementations of one question drift.
+ *
+ * A total ingest outage is still caught, and not by this: the calendar freezes
+ * too, so `expected` freezes with it and the broker feed looks current — which is
+ * precisely what the synthetic `ingest` row below measures against the WALL CLOCK
+ * rather than against another table. That backstop is the reason it is safe for a
+ * per-feed check to be judged relative to its own schedule.
+ */
+const REFERENCE = { FRESHEST_FEED: 'freshest-feed', BROKER_PIPELINE: 'broker-pipeline' };
+
 const CHECKS = [
   { key: 'prices',       table: 'idx_stock_prices',    col: 'date',        maxLag: 1,
     severity: SEVERITY.BLOCKING,
@@ -461,11 +505,13 @@ const CHECKS = [
     why: 'Every factor, regime and backtest reads prices, and the NAV mark values positions from them. Stale prices mean stale everything. Tolerance is 1 rather than 0 because broker rows land 90-360s BEFORE prices in the same nightly job, so the freshest-feed reference briefly reaches session D while the price loop is still writing.' },
 
   { key: 'broker',       table: 'idx_broker_summary',  col: 'date',        maxLag: BROKER_DATA_MAX_LAG_SESSIONS,
+    reference: REFERENCE.BROKER_PIPELINE,
     severity: SEVERITY.BLOCKING,
     affects: [SUBSYSTEM.SIGNAL_ENGINE],
     why: 'BLOCKING, and it was the feed marked non-critical when it died. /api/signal-scanner takes its notion of "today" from this table — it is the clock, not merely a factor input — and the f1 concentration family is computed from it. A score dated to a session this table does not cover is not a stale score, it is a confident score built on inputs that do not exist.' },
 
   { key: 'concentration',table: 'idx_concentration',   col: 'data_date',   maxLag: BROKER_DATA_MAX_LAG_SESSIONS,
+    reference: REFERENCE.BROKER_PIPELINE,
     severity: SEVERITY.BLOCKING,
     affects: [SUBSYSTEM.SIGNAL_ENGINE],
     why: 'Broker-derived, and f1 reads dn0..dn4 from it directly. Listed separately from `broker` even though the same outage takes both, because the derivation step can fail on its own: fresh broker rows with no concentration computed from them is a state the engine would otherwise score straight through.' },
@@ -473,6 +519,7 @@ const CHECKS = [
   // Added 2026-08-09 by the severity sweep. It was never monitored, and it
   // feeds live scoring (server.js:6245, the foreign/domestic divergence factor).
   { key: 'flow_detail',  table: 'idx_broker_flow_detail', col: 'date',     maxLag: BROKER_DATA_MAX_LAG_SESSIONS,
+    reference: REFERENCE.BROKER_PIPELINE,
     severity: SEVERITY.DEGRADED,
     affects: [SUBSYSTEM.SIGNAL_ENGINE],
     why: 'The foreign/domestic split. DEGRADED rather than BLOCKING because it is one factor family and not the clock: with it absent the engine can still date and score a session, but it must say the divergence factor is missing rather than report a neutral value as a measurement.' },
@@ -607,6 +654,31 @@ async function dataFreshness(pool, today = new Date()) {
     try {
       const [r] = await pool.query(`SELECT MAX(${c.col}) AS d, COUNT(*) AS n FROM ${c.table}`);
       const latest = r[0].d;
+
+      // A FEED WITH ITS OWN PUBLICATION DEADLINE IS JUDGED BY IT, not by how far
+      // another feed has run ahead. The verdict is brokerFreshness()'s, verbatim,
+      // so this row and the one the scanner reads cannot disagree — which they
+      // did, daily, between 16:15 and 19:30 WIB. See REFERENCE above.
+      //
+      // It also carries the validity states a lag number cannot express: an empty
+      // table, a weekend bar, a future date, a today-dated bar published before
+      // the EOD window opened. Those were previously asked ONLY of
+      // idx_broker_summary, by readiness(); concentration and flow_detail were
+      // checked for lateness alone and would have called a Saturday row fresh.
+      if (c.reference === REFERENCE.BROKER_PIPELINE) {
+        const f = await brokerFreshness(pool, { asOf: today, table: c.table, col: c.col });
+        out.push(decorate({ key: c.key, table: c.table, severity: c.severity, affects: c.affects, why: c.why,
+          latest: f.latest, lagTradingDays: f.sessionsBehind, maxLag: c.maxLag,
+          rows: latest ? Number(r[0].n) : 0,
+          ok: f.valid,
+          // The state code travels in the text because `blocking` entries are
+          // `key:detail` strings and callers match on them.
+          detail: f.valid ? f.detail : `${f.state}: ${f.detail}`,
+          expected: f.expected,
+          freshness: f }));
+        continue;
+      }
+
       if (!latest) {
         out.push(decorate({ ...c, latest: null, lagTradingDays: null, ok: false, detail: 'table is empty' }));
         continue;
@@ -674,22 +746,22 @@ async function readiness(pool, { subsystems = Object.values(SUBSYSTEM), today = 
   const advisory = failed.filter(f => !binds(f.severity))
     .map(f => `${f.key}:${f.detail}`);
 
-  // VALIDITY, not just lateness. The lag checks above cannot see a broker bar
-  // dated to a session that has not closed, or to a day the exchange never
-  // traded: both make `weekdaysSince` return 0 and therefore read as perfectly
-  // fresh. Asked separately, and only when the broker feed is actually required
-  // by one of the subsystems being judged.
-  let brokerState = null;
-  if ([...wanted].some(s => s === SUBSYSTEM.SIGNAL_ENGINE)) {
-    try {
-      brokerState = await brokerFreshness(pool, { asOf: today });
-      if (!brokerState.valid && brokerState.state !== BROKER_FRESHNESS.STALE) {
-        // STALE is already reported by the lag check; adding it here would
-        // double-count one fault, which is the incident-cardinality mistake.
-        blocking.push(`broker:${brokerState.state}:${brokerState.detail}`);
-      }
-    } catch { /* the lag checks still stand if this cannot run */ }
-  }
+  // VALIDITY, not just lateness — a broker bar dated to a session that has not
+  // closed, or to a day the exchange never traded, is invalid rather than fresh.
+  //
+  // THIS USED TO ASK THE QUESTION ITSELF (fixed 2026-08-11). It called
+  // brokerFreshness() a second time and pushed the non-STALE states into
+  // `blocking`, deliberately skipping STALE so as not to double-count "the lag
+  // check". That split was the bug: STALE was left to a lag check measured
+  // against a DIFFERENT yardstick, so the two could — and every evening did —
+  // return opposite verdicts about the same feed. dataFreshness now carries the
+  // primitive's own verdict for all of its states, so this reads the result
+  // rather than recomputing it. One call, one answer, no branch that decides
+  // which faults each half is allowed to report.
+  const brokerRow = fresh.find(f => f.key === 'broker');
+  const brokerState = [...wanted].some(s => s === SUBSYSTEM.SIGNAL_ENGINE)
+    ? (brokerRow?.freshness || null)
+    : null;
 
   // The session we can honestly speak for: the oldest "latest" among the
   // required feeds. A feed with no rows at all makes this null rather than
@@ -1042,7 +1114,7 @@ module.exports = {
   CHECKS, dataFreshness, missingSessions, phantomSessions, recordJobRun, jobHealth,
   signalState, readiness, ensureTable, weekdaysSince,
   expectedBrokerSession, assertCompleteSessions, brokerFreshness, BROKER_FRESHNESS,
-  MAX_REFERENCE_WEEKDAYS, BROKER_DATA_MAX_LAG_SESSIONS,
+  MAX_REFERENCE_WEEKDAYS, BROKER_DATA_MAX_LAG_SESSIONS, REFERENCE,
   BROKER_PIPELINE_CUTOFF_UTC_MINUTES, BROKER_PIPELINE_GRACE_MINUTES,
   SEVERITY, SEVERITY_RANK, binds, SUBSYSTEM, SUBSYSTEM_DEPENDS_ON,
 };

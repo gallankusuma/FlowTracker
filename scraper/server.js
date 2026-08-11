@@ -6776,11 +6776,36 @@ async function runSignalScan({ persist = false } = {}) {
       concMap[r.stock_code][d] = r;
     }
 
+    // BOUNDED BY THE SESSION THIS SCAN SPEAKS FOR (2026-08-11).
+    //
+    // This query had no upper bound, so the series ended at whatever the price
+    // table's newest row was — while every other read in this function
+    // (concDates, flowDivRows, breadthMap) is keyed on `latestDate`. That was
+    // harmless only because the endpoint happened to be refusing all day: the
+    // freshness bug fixed in modules/system_health.js made readiness block from
+    // the first morning page view until 19:30, so a daytime scan never ran.
+    // Removing that false refusal removes the accident that was covering this.
+    //
+    // What it would have let in: GET /api/stock-prices (line ~1144) writes a row
+    // dated TODAY carrying a LIVE Yahoo quote as close_price, at any hour, on
+    // every weekday somebody opens the app. Unbounded, that provisional bar
+    // becomes the last element of the series ADV20, ATR14, the 252-day high, RSI
+    // and MACD are all computed over — inside a payload dated `latestDate`, the
+    // previous session. A score labelled for a closed session must not be
+    // computed from a bar belonging to one that is still trading.
+    //
+    // Live price is not lost by this: it is fetched deliberately and separately
+    // as `yfMap` below. History here, live quote there — which is the split the
+    // two sources were always meant to have.
+    //
+    // Nightly behaviour is unchanged, and that is checkable rather than hoped:
+    // the cron runs after the pull, so latestDate is the same session as the
+    // newest price row and `date <= latestDate` excludes nothing.
     const [priceRows] = tickers.length > 0
       ? await pool.query(
           `SELECT stock_code, date, open_price, high_price, low_price, close_price, volume, change_pct
-           FROM idx_stock_prices WHERE stock_code IN (?) ORDER BY date ASC`,
-          [tickers]
+           FROM idx_stock_prices WHERE stock_code IN (?) AND date <= ? ORDER BY date ASC`,
+          [tickers, latestDate]
         )
       : [[]];
     const priceMap = {};
