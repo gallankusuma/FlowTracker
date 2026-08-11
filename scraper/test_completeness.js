@@ -105,16 +105,37 @@ async function t(name, fn) {
     assert.strictEqual(r.expectedSessions, 5);
   });
 
+  // THE DATES COME FROM THE CALENDAR, NOT FROM A LITERAL (fixed 2026-08-11).
+  //
+  // These two asserted '2026-08-07' and '2026-08-06' against the LIVE calendar,
+  // which was correct on the day they were written and wrong the moment the
+  // exchange traded again: expectedBrokerSession only ever returns one of the
+  // two NEWEST calendar rows, so once 2026-08-10 landed the intraday case
+  // returned 2026-08-07 and the assertion failed. It had nothing to do with the
+  // behaviour under test — the same class of expiring fixture as the pinned
+  // clock in test_watchdog.js, found in the same run.
+  //
+  // A test against live data must derive its expectations from that data. What
+  // is actually being asserted is a RELATIONSHIP, and that holds on any day.
   console.log('\nexpectedBrokerSession — against the REAL calendar');
+  const [calRows] = await pool.query(
+    'SELECT date FROM idx_ihsg_history ORDER BY date DESC LIMIT 2');
+  const iso = d => new Date(d).toISOString().slice(0, 10);
+  const newest = iso(calRows[0].date);
+  const previous = iso(calRows[1].date);
+  console.log(`         calendar: newest=${newest} previous=${previous}`);
+
   await t('post-cutoff, the newest session is expected', async () => {
-    const v = await sh.expectedBrokerSession(pool, new Date('2026-08-07T13:50:00Z'));
+    // 13:50 UTC on the newest session — after its 13:00 deadline.
+    const v = await sh.expectedBrokerSession(pool, new Date(`${newest}T13:50:00Z`));
     console.log('         expected =', v);
-    assert.strictEqual(v, '2026-08-07');
+    assert.strictEqual(v, newest);
   });
   await t('intraday on the newest session, the PREVIOUS one is expected', async () => {
-    const v = await sh.expectedBrokerSession(pool, new Date('2026-08-07T03:00:00Z'));
+    // 03:00 UTC = 10:00 WIB, still trading, that day's EOD pull hours away.
+    const v = await sh.expectedBrokerSession(pool, new Date(`${newest}T03:00:00Z`));
     console.log('         expected =', v);
-    assert.strictEqual(v, '2026-08-06');
+    assert.strictEqual(v, previous);
   });
 
   console.log(`\n${pass} passed, ${fail} failed`);

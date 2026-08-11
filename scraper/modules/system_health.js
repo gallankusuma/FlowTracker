@@ -254,7 +254,13 @@ const BROKER_FRESHNESS = {
   NON_SESSION: 'NON_SESSION', PREMATURE: 'PREMATURE', NO_DATA: 'NO_DATA',
 };
 
-async function brokerFreshness(pool, { asOf = new Date(), table = 'idx_broker_summary', col = 'date' } = {}) {
+/**
+ * @param {string} [opts.notBefore] A session this feed must ALSO have reached,
+ *   over and above its own publication deadline. Used to hold the broker family
+ *   to each other — see `brokerFamilySession` in dataFreshness. Never relaxes
+ *   the deadline; it can only raise the bar.
+ */
+async function brokerFreshness(pool, { asOf = new Date(), table = 'idx_broker_summary', col = 'date', notBefore = null } = {}) {
   const [[row]] = await pool.query(`SELECT MAX(${col}) AS d FROM ${table}`);
   const latest = toIso(row?.d);
   const expected = await expectedBrokerSession(pool, asOf);
@@ -320,23 +326,53 @@ async function brokerFreshness(pool, { asOf = new Date(), table = 'idx_broker_su
       return { state: BROKER_FRESHNESS.PREMATURE, valid: false, latest, expected, sessionsBehind: 0,
                detail: `${latest} carries broker data before its EOD publication window opens (${new Date(publishFrom).toISOString()}). This feed is end-of-day; a bar for a session still trading cannot be real` };
     }
-    return { state: BROKER_FRESHNESS.CURRENT, valid: true, latest, expected, sessionsBehind: 0,
-             detail: `current (${latest} landed ahead of the ${expected} deadline)` };
   }
 
-  if (latest === expected) {
-    return { state: BROKER_FRESHNESS.CURRENT, valid: true, latest, expected, sessionsBehind: 0, detail: 'current' };
+  // THE SESSION THIS FEED MUST HAVE REACHED.
+  //
+  // `expected` alone is a statement about the CLOCK: has this feed's publication
+  // window closed? That is necessary and not sufficient, because two feeds can
+  // both be inside their window and still disagree about which session they
+  // cover — and a score is built from all of them at once.
+  //
+  // Found live 2026-08-10 19:37 WIB, in the nightly job's own record: the
+  // snapshot stage failed with "concentration:1 trading session(s) behind".
+  // Broker rows for 08-10 had landed at 12:30 UTC, concentration was still
+  // derived only through 08-07, and the calendar had not yet advanced (that runs
+  // 13:05 UTC) so `expected` was still 08-07. Judged against the clock alone,
+  // BOTH feeds were legitimately current — while covering sessions three days
+  // apart. Scoring there would date itself by MAX(broker) = 08-10 and read
+  // concentration from 08-07: the "confident score built on inputs that do not
+  // exist" this whole gate exists to refuse.
+  //
+  // So the bar is the LATER of the two: the feed's own deadline, and whatever
+  // session its siblings have already reached. This never relaxes the deadline —
+  // it only ever raises the requirement.
+  const required = (notBefore && notBefore > expected) ? notBefore : expected;
+
+  if (latest >= required) {
+    return { state: BROKER_FRESHNESS.CURRENT, valid: true, latest, expected, sessionsBehind: 0,
+             detail: latest === expected ? 'current' : `current (${latest} landed ahead of the ${expected} deadline)` };
   }
 
   const [behind] = await pool.query(
-    'SELECT COUNT(*) n FROM idx_ihsg_history WHERE date > ? AND date <= ?', [latest, expected]);
-  const sessionsBehind = Number(behind[0]?.n) || 0;
+    'SELECT COUNT(*) n FROM idx_ihsg_history WHERE date > ? AND date <= ?', [latest, required]);
+  let sessionsBehind = Number(behind[0]?.n) || 0;
+  // The calendar is written 35 minutes AFTER the broker pull, so `required` is
+  // routinely a session it does not yet contain — and counting rows inside a
+  // window the calendar cannot see returns 0, which would report a feed that is
+  // demonstrably behind its own siblings as current. Same blindness, and the
+  // same correction, as `tradingDayLag`'s calEnd clamp.
+  if (sessionsBehind === 0 && latest < required) sessionsBehind = 1;
+
   return {
     state: sessionsBehind > BROKER_DATA_MAX_LAG_SESSIONS ? BROKER_FRESHNESS.STALE : BROKER_FRESHNESS.CURRENT,
     valid: sessionsBehind <= BROKER_DATA_MAX_LAG_SESSIONS,
     latest, expected, sessionsBehind,
     detail: sessionsBehind > BROKER_DATA_MAX_LAG_SESSIONS
-      ? `${sessionsBehind} exchange session(s) behind ${expected} (tolerance ${BROKER_DATA_MAX_LAG_SESSIONS})`
+      ? `${sessionsBehind} exchange session(s) behind ${required}` +
+        (required === expected ? '' : ` (the session its own feed family has already reached)`) +
+        ` (tolerance ${BROKER_DATA_MAX_LAG_SESSIONS})`
       : 'current',
   };
 }
@@ -626,6 +662,25 @@ async function dataFreshness(pool, today = new Date()) {
     } catch { /* a broken table is reported per-check below */ }
   }
 
+  // THE SESSION THE BROKER FAMILY HAS COLLECTIVELY REACHED.
+  //
+  // The broker pipeline is one pull and one derivation, and its three tables are
+  // meant to cover the same session. Holding each to its own deadline alone lets
+  // them drift apart inside the nightly window — see the 2026-08-10 19:37 WIB
+  // incident quoted in brokerFreshness. Holding them to EACH OTHER closes that
+  // without reintroducing the bug this file was just fixed for, because the
+  // reference is drawn from the broker family ONLY: prices and the index
+  // calendar run on their own schedules and can no longer make it refuse.
+  let brokerFamilySession = null;
+  for (const c of CHECKS) {
+    if (c.reference !== REFERENCE.BROKER_PIPELINE) continue;
+    try {
+      const [r] = await pool.query(`SELECT MAX(${c.col}) AS d FROM ${c.table}`);
+      const d = toIso(r[0]?.d);
+      if (d && (brokerFamilySession === null || d > brokerFamilySession)) brokerFamilySession = d;
+    } catch { /* reported per-check below */ }
+  }
+
   // `critical` is still emitted alongside `severity` because the Trade Desk
   // reads it (app/trade-desk/page.tsx). Derived, never authored: one source of
   // truth, so the two can never disagree the way the gate and the warning did.
@@ -666,7 +721,8 @@ async function dataFreshness(pool, today = new Date()) {
       // idx_broker_summary, by readiness(); concentration and flow_detail were
       // checked for lateness alone and would have called a Saturday row fresh.
       if (c.reference === REFERENCE.BROKER_PIPELINE) {
-        const f = await brokerFreshness(pool, { asOf: today, table: c.table, col: c.col });
+        const f = await brokerFreshness(pool, {
+          asOf: today, table: c.table, col: c.col, notBefore: brokerFamilySession });
         out.push(decorate({ key: c.key, table: c.table, severity: c.severity, affects: c.affects, why: c.why,
           latest: f.latest, lagTradingDays: f.sessionsBehind, maxLag: c.maxLag,
           rows: latest ? Number(r[0].n) : 0,

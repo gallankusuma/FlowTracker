@@ -180,8 +180,26 @@ async function build(pool, seriesDates) {
       sh.missingSessions = async () => (++call === 1
         ? { missing: ['2026-07-29', '2026-08-03'], checked: 7, window: null }
         : { missing: ['2026-07-29'], checked: 7, window: null });
+      // THE CLOCK IS DERIVED FROM THE DATA, NOT PINNED (fixed 2026-08-11).
+      //
+      // This passed `now: AFTER_CLOSE`, pinned to 2026-08-04, while `echo` comes
+      // from the LIVE series. The moment production moved past that date — on
+      // 2026-08-05 — dropUnclosedSession() began discarding all three echoed
+      // candles as "future", refreshIHSG returned {skipped:true} before reaching
+      // the reporting code, and res.gapsFilled came back undefined. So the
+      // assertion below stopped being exercised and started failing, and it took
+      // the whole predeploy gate red with it for six days.
+      //
+      // A fixture that pins a clock but sources its rows from data that keeps
+      // moving has a built-in expiry date. The clock now follows the newest row
+      // being echoed, which is what the test meant all along: refresh AFTER the
+      // close of the session being written.
+      const newestEchoed = echo[echo.length - 1].date;
+      const afterEchoedClose = new Date(`${newestEchoed}T13:00:00Z`);   // 20:00 WIB
       try {
-        const res = await ihsgModule.refreshIHSG(pool, async () => ({ candles: echo }), { now: AFTER_CLOSE });
+        const res = await ihsgModule.refreshIHSG(pool, async () => ({ candles: echo }), { now: afterEchoedClose });
+        assert.ok(!res.skipped,
+          `the refresh skipped instead of reporting: ${JSON.stringify(res)} — the clock is behind the data again`);
         assert.deepStrictEqual(res.gapsFilled, ['2026-08-03']);
         assert.deepStrictEqual(res.gapsRemaining, ['2026-07-29'],
           'an unfillable hole must be reported, never quietly interpolated');

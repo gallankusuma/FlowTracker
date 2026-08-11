@@ -432,6 +432,66 @@ const ALL_FRESH = {
       }
     });
 
+    // ── the hole the FIRST cut of this fix opened, found in the nightly job's
+    // own failure record (2026-08-10 19:37 WIB, "concentration:1 trading
+    // session(s) behind"). Between the 12:30 UTC broker pull and the 13:05 UTC
+    // calendar refresh, broker holds session D while concentration is still
+    // derived only through D-1 and `expected` is still D-1. Judged against the
+    // clock alone BOTH are legitimately current — while covering different
+    // sessions. The scan dates itself by MAX(broker) and would read
+    // concentration from the older one.
+    console.log('\nP1b — the broker family must agree with EACH OTHER, not just with the clock');
+    {
+      // 12:37 UTC: broker landed, concentration not yet derived, calendar not
+      // yet advanced. Sessions deliberately stop at 07-30 — the calendar has not
+      // reached 07-31, exactly as at 19:37 WIB.
+      const midPipeline = () => ({
+        tables: { idx_stock_prices: '2026-07-31', idx_broker_summary: '2026-07-31',
+                  idx_concentration: '2026-07-30', idx_broker_flow_detail: '2026-07-30',
+                  idx_ihsg_history: '2026-07-30', ft_signals: '2026-07-30' },
+        lag: { '2026-07-31': 0, '2026-07-30': 0 },
+        sessions: ['2026-07-27', '2026-07-28', '2026-07-29', '2026-07-30'],
+      });
+      const MID = at('2026-07-31T12:37:00Z');
+
+      await atest('concentration lagging the broker pull is STALE, not "within its window"', async () => {
+        const rows = await sh.dataFreshness(makePool(midPipeline()), MID);
+        const conc = rows.find(r => r.key === 'concentration');
+        assert.strictEqual(conc.ok, false,
+          `concentration reported fresh at ${conc.latest} while broker is at 2026-07-31: ${conc.detail}`);
+      });
+
+      await atest('so the scan REFUSES rather than dating itself by MAX(broker)', async () => {
+        const r = await sh.readiness(makePool(midPipeline()), {
+          subsystems: [sh.SUBSYSTEM.SIGNAL_ENGINE], today: MID });
+        assert.strictEqual(r.enabled, false, JSON.stringify(r.blocking));
+        assert.ok(r.blocking.some(b => b.startsWith('concentration:')), JSON.stringify(r.blocking));
+      });
+
+      await atest('the broker feed that is AHEAD is not itself blamed', async () => {
+        const rows = await sh.dataFreshness(makePool(midPipeline()), MID);
+        const broker = rows.find(r => r.key === 'broker');
+        assert.strictEqual(broker.ok, true, `broker wrongly faulted: ${broker.detail}`);
+      });
+
+      // The family reference must come from the family ALONE. If prices or the
+      // calendar could raise it, the original bug would be back by another name.
+      await atest('prices running ahead still cannot make the family refuse', async () => {
+        const spec = windowSpec();
+        // A page view minted today's price row at 17:30 WIB — the exact trigger
+        // of the original bug. The broker family is untouched at 2026-07-30.
+        spec.tables.idx_stock_prices = '2026-07-31';
+        const rows = await sh.dataFreshness(makePool(spec), at('2026-07-31T10:30:00Z'));
+        for (const key of ['broker', 'concentration', 'flow_detail']) {
+          const r = rows.find(x => x.key === key);
+          assert.strictEqual(r.ok, true, `${key} refused because PRICES moved: ${r.detail}`);
+        }
+        const r = await sh.readiness(makePool(spec), {
+          subsystems: [sh.SUBSYSTEM.SIGNAL_ENGINE], today: at('2026-07-31T10:30:00Z') });
+        assert.strictEqual(r.enabled, true, JSON.stringify(r.blocking));
+      });
+    }
+
     test('the broker family declares which yardstick it is measured by', () => {
       for (const key of ['broker', 'concentration', 'flow_detail']) {
         assert.strictEqual(sh.CHECKS.find(c => c.key === key).reference,
