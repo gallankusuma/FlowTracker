@@ -1105,6 +1105,8 @@ confidence fell from a flat 80/100 to **48/100** once it was measured honestly.
 
 ## EXP-2026-08-11-026 — Market Regime Conditionality: the conditionality is real, but the premise it was meant to test is not
 
+> **SUPERSEDED BY EXP-026 R1 at the end of this entry.** The review of 2026-08-11 found 3 P1 + 2 P2 methodology defects. All are fixed; two findings below did NOT survive the fix and are formally withdrawn there. Read R1 before quoting anything in this section.
+
 - **Script**: `scraper/backtest_market_regime_conditionality.js`
 - **Why**: the 2026-08-11 review round argued that the scanner answers "which stock is relatively strong?" while the question being asked of it is "is a long worth taking?", and proposed a Market State layer above the frozen stock engine. It explicitly asked that the FIRST step be measurement, not a rule — "jangan mulai dari rule mana yang bagus" — and named EXP-026 as *how does the existing system perform conditional on market state*, ahead of the EXP-025 OOS precursor test.
 - **Data**: `idx_signal_history`, source `backfill_v3_f5v1` only (uniform `f5_benchmark_version = v1-idx245-2026-08-10`). The 4,131 `live` rows carry no benchmark stamp at all and are excluded: 14 sessions hold rows from both sources with no duplicate ticker-days, so including them would put two F5 benchmark definitions inside a single session's cross-section — and F5 is the factor under discussion. **117 sessions, 26,739 scored ticker-sessions, 2026-01-19 .. 2026-07-21, 200 resolved BUY/STRONG BUY.**
@@ -1179,3 +1181,50 @@ Mean forward return minus the session's own universe mean, per `composite_score`
 - **In-sample.** These are the same sessions the engine and EXP-024/EXP-025 were developed against.
 
 **Status**: MEASURED, no rule proposed and no gate enabled. Answers the review's question as asked, and reports that the hypothesis behind it does not hold on this window. EXP-027 (regime model) is **not** unblocked by this — the sample cannot support a regime classifier — and the decile finding in §4 is recommended ahead of it.
+
+### EXP-026 R1 (2026-08-11) — three P1 corrections, and two of the findings above did not survive them
+
+The review round of the same day held the result at 9.0/10 with 3 P1 + 2 P2 methodology blockers. All five are fixed. **Every number in the section above is superseded by this one.** The original is left in place because two of its claims were wrong in ways worth being able to see.
+
+**P1-1 — forward outcomes were not guaranteed canonical.** The first pass read `return_1d/3d/5d/10d`, `max_profit` and `max_drawdown` from `idx_signal_history`, which `regenerate_signal_history.js` builds with `candles.slice(i + 1, i + 11)` — the next N *rows* of `idx_stock_prices`, not the next N exchange sessions. Correct objection. **Measured before changing anything, and the impact on this window is exactly zero**: inside 2026-01-19 .. 2026-08-06 the price table holds precisely the 129 canonical sessions (0 phantom dates, 0 absent sessions), and all 26,739 stored returns reproduce a canonical recomputation to within their own 2-decimal rounding — 0 rows differ. The recomputation is kept regardless: the stored columns are right here by a property of the data that no code enforces, and the purge that made them right (2026-08-04) landed four days before this window was read. EXP-026 now computes outcomes itself and refuses a window it cannot complete (`refused: 0` on this data).
+
+**P1-2 — breadth was row-based, and it had a real instance.** `breadthByDate()` walked each ticker's rows in table order, taking "the last 20 rows" as MA20 and "the previous row" as yesterday. 245 of the 253 tickers in `idx_stock_prices` cover all 129 canonical sessions; the 8 that do not — BOSS, FASW, SCPI, SMCB, SRIL, TELE, WIKA, WSKT, holding 20 to 33 rows each — are suspended names whose "20 rows back" reached across months of halted trading, and they were in the breadth denominator on every session. Breadth is now computed on the canonical axis and a ticker is included on session D only if all 20 canonical sessions ending at D are present: **245 included, 8 excluded, per session.**
+
+**P1-3 — the breakout metric was not EXP-025's, and this reverses the finding.** The text claimed "defined exactly as EXP-025" and tested `max_profit >= 5%`, an intraday high touching +5% at any point. EXP-025 freezes something much stricter: forward 5-session return >= +5% **AND the exit close clears the highest close of the 20 sessions ending at entry** (`HIGH_LOOKBACK = 20`). Close, not high; the exit bar, not any bar.
+
+| breakout rate | BUY | universe | reading |
+|---|---|---|---|
+| ORIGINAL (`max_profit >= 5%`, wrong metric) | 19.6% | 45.7% | "BUYs break out LESS than average" |
+| **EXP-025 parity (correct)** | **13.4%** | **4.0%** | **BUYs break out 3.4x MORE than average** |
+
+**The original claim was not merely non-comparable, it pointed the wrong way.** An intraday +5% touch is common for everything in a volatile universe, so the loose metric mostly measured volatility. On the frozen definition BUY signals achieve a genuine breakout far more often than the base rate, in every tercile (BUY 11–24% vs universe 3–9%). Hand-verified: 26 of 208 BUY signals (12.5%) by direct recomputation from raw closes.
+
+**P2-1 — non-overlap spacing** used `sessions.filter((_, i) => i % H === 0)`, an index into an array that has already had sessions dropped. Anchors are now chosen on the exchange session index; verified every anchor is >= H canonical sessions from the previous.
+
+**P2-2 — "excess" was not index-adjusted, and this matters more than it sounds.** `BUY − universe` is an equal-weight, universe-relative return, not beta- or index-adjusted alpha. Both are now reported:
+
+| Horizon | rank IC | 95% CI | BUY absolute | BUY − universe | BUY − **IHSG** | universe − IHSG |
+|---|---|---|---|---|---|---|
+| 1D | −0.0550 | [−0.0793, −0.0307] | −0.68% | −0.47% [−1.33, +0.39] | **−0.23% [−1.10, +0.63]** | +0.13% |
+| 3D | −0.0494 | [−0.0716, −0.0253] | −1.73% | −0.90% [−2.10, +0.32] | **−0.31% [−1.56, +0.88]** | +0.44% |
+| 5D | −0.0481 | [−0.0720, −0.0241] | −2.63% | −1.11% [−2.53, +0.22] | **−0.20% [−1.68, +1.19]** | +0.73% |
+| 10D | −0.0676 | [−0.0904, −0.0445] | −4.72% | −2.11% [−3.87, −0.48] | **−0.33% [−2.24, +1.41]** | +1.36% |
+
+**The headline claim of the original entry does not survive.** It reported BUY excess as "significantly negative at 10D (−2.11%)" and concluded the scanner picks relative losers. Against IHSG the same signals are **flat at every horizon** (−0.20% to −0.33%, every CI spanning zero). The equal-weight universe beat the cap-weighted index by +0.13 to +1.36pp over this window — large caps fell harder — so the entire "significant" 10D result was measured against a basket that itself outperformed the index. Benchmark choice, not signal quality, produced that number.
+
+### What survives R1
+
+1. **Rank IC is significantly negative at every horizon** (1D −0.0550, and 1D needs no overlap correction at all — 121 genuinely independent windows). Unchanged by the corrections.
+2. **BUY absolute return is significantly negative** (−0.68% to −4.72%). Unchanged. In a falling market this is largely the market, which is exactly why the benchmark comparison matters.
+3. **The decile hump survives intact** — the reviewer's stated condition for moving on. Excess over the session's own universe mean, 5D, canonical: D1 −0.25, **D2 +0.51 [+0.13, +0.88]**, **D3 +0.51 [+0.15, +0.85]**, D4 +0.19, D5 +0.27, D6 +0.07, D7 −0.32, D8 −0.27, D9 −0.07, **D10 −0.83 [−1.21, −0.45]**. D10 − D1 = **−0.58pp**.
+4. **The conditional pattern survives**: IC −0.1286 in the falling-MA60 tercile vs +0.0065 in the rising one; −0.1179 in the high-volatility tercile vs +0.0075 in the low. Stressed states are where the damage is concentrated.
+
+### Revised reading
+
+The scanner is **not** established as picking relative losers — against the index its BUY signals are flat, and they achieve genuine EXP-025 breakouts 3.4x more often than the base rate. What is established is narrower and sharper: **the top decile of its own ranking is bad while D2/D3 are good**, consistently, on canonical data. The score contains real information and the classifier reads it at the wrong end.
+
+That makes the review's proposed next step the right one, and for a better-supported reason than before. **EXP-027A — composite decile decomposition**: which factors put a name in D10 rather than D2/D3, how much of D10 is same-day-return exposure (the composite is contemporaneous, corr 0.35 with the same session's move), and whether "quality/setup" separates from "extension/timing". A regime classifier remains unsupportable on this sample regardless — IHSG was above its MA60 on 12 of 121 sessions.
+
+**Verification of R1**: 5/5 independent checks — the calendar holds no weekend sessions; the EXP-025 breakout rate hand-recomputed from raw closes over 208 BUY signals gives 12.5%, matching the script (INDS 2026-01-19 entry 600 → exit 745, +24.17%, prior-20 high close 600 → breakout); exactly 245 tickers cover all 129 canonical sessions; every non-overlap anchor is >= H canonical sessions apart. Plus the original 8/8 harness checks, which are unaffected.
+
+**Status**: MEASURED, corrected, no rule proposed and no gate enabled. Two findings from the first pass are formally withdrawn: the breakout comparison (reversed) and the "significantly negative excess" (an artifact of benchmark choice).

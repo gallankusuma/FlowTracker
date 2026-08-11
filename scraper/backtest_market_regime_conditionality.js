@@ -20,14 +20,21 @@
  *
  * THE MEASUREMENT THAT SEPARATES THEM, and it is the point of the whole script:
  *
- *   ABSOLUTE   mean forward return of BUY signals in a regime.
- *              Answers "would a long have made money here".
- *   EXCESS     the same, minus the mean forward return of every scored stock
- *              in that same session.
- *              Answers "did the scanner PICK well here", with the market's own
- *              move divided out.
+ *   ABSOLUTE       mean forward return of BUY signals in a regime.
+ *                  Answers "would a long have made money here".
+ *   BUY - UNIVERSE the same, minus the mean forward return of every scored stock
+ *                  in that same session. Answers "did the scanner PICK well
+ *                  here" against an EQUAL-WEIGHT basket of what it could have
+ *                  picked from.
+ *   BUY - IHSG     the same, minus the index's own forward return.
  *
- * If EXCESS stays positive across regimes while ABSOLUTE goes negative in the
+ * The middle one is NOT alpha and is deliberately no longer described as "the
+ * market's move removed" (review P2, fair catch): IHSG is capitalisation-
+ * weighted and this is equal-weight, no beta is estimated, and in a window where
+ * large caps and the average name diverge the two disagree. Both are reported so
+ * the difference is visible rather than assumed away.
+ *
+ * If BUY - UNIVERSE stays positive across regimes while ABSOLUTE goes negative in the
  * bad ones, the review's hypothesis is confirmed in the precise form it was
  * stated: the stock engine is not broken, the market-permission layer is
  * missing. If EXCESS collapses too, that is a different and more serious
@@ -60,10 +67,52 @@ const cs = require('./modules/cross_sectional');
 // differently-benchmarked stocks inside a single session's ranking.
 const SOURCE = 'backfill_v3_f5v1';
 
-// A breakout, defined exactly as EXP-025 defined it, so the two experiments
-// mean the same thing by the word: +5% at any point within the 5 forward
-// sessions. max_profit is already that quantity, in percent.
-const BREAKOUT_PCT = 5;
+/**
+ * CANONICALITY (review round 2026-08-11, P1).
+ *
+ * The first version of this script read `return_1d/3d/5d/10d`, `max_profit` and
+ * `max_drawdown` straight out of `idx_signal_history`. Those columns are built
+ * by `regenerate_signal_history.js` with `candles.slice(i + 1, i + 11)` — the
+ * next N ROWS of `idx_stock_prices`, not the next N sessions of the exchange
+ * calendar. `idx_stock_prices` has carried weekend and holiday phantom rows
+ * before (75 purged 2026-08-04, one more 2026-08-08), and any of those inside a
+ * window silently makes "5D" span something other than five sessions.
+ *
+ * MEASURED BEFORE CHANGING ANYTHING, and the honest result is that on THIS
+ * window it made no difference: inside 2026-01-19 .. 2026-08-06 the price table
+ * holds exactly the 129 canonical sessions, no phantoms and no absences, and all
+ * 26,739 stored return_1d/5d/10d reproduce the canonical recomputation to within
+ * the stored columns' own 2-decimal rounding. Zero rows differ.
+ *
+ * The recomputation is kept anyway, and not out of ceremony: the stored columns
+ * are correct here by a property of the data that no code enforces, and the
+ * purge that made them correct happened four days before this window was read.
+ * Computing the axis here means the experiment states its own definition and
+ * REFUSES a window it cannot complete, instead of inheriting whatever an
+ * upstream job happened to write.
+ */
+
+/**
+ * BREAKOUT, EXACTLY AS EXP-025 FREEZES IT — and the first version of this file
+ * did NOT do this while claiming it did (review P1, correct catch).
+ *
+ * It said "defined exactly as EXP-025" and then tested `max_profit >= 5`, which
+ * is an INTRADAY HIGH touching +5% at any point in the window. EXP-025's frozen
+ * definition is a different and much stricter thing:
+ *
+ *     forward 5-session return >= +5%
+ *     AND the EXIT CLOSE clears the highest CLOSE of the 20 sessions ending at
+ *         entry
+ *
+ * (see backtest_precursor_trajectory.js, HIGH_LOOKBACK = 20). Close, not high;
+ * the exit bar, not any bar. So the two experiments were not comparing the same
+ * event and the "19.6% vs 45.7%" figure was not apples to apples.
+ *
+ * Both are now reported, under names that say what they are.
+ */
+const WIN_THRESHOLD = 5;      // percent, same as EXP-025
+const HORIZON_BREAKOUT = 5;   // forward sessions, same as EXP-025
+const HIGH_LOOKBACK = 20;     // the range a breakout must clear, same as EXP-025
 
 const iso = d => new Date(d).toISOString().slice(0, 10);
 const mean = a => (a.length ? a.reduce((s, x) => s + x, 0) / a.length : null);
@@ -107,71 +156,158 @@ function marketFeatures(close, i) {
   };
 }
 
-/* ── 2. BREADTH ─────────────────────────────────────────────────────────────
-   % of tracked stocks above their own 20-day MA, and % closing up. Computed
-   from the price table per ticker rather than read from any factor, so it is an
-   independent description of the market and not a restatement of F6. */
-async function breadthByDate(pool, fromDate) {
-  const [rows] = await pool.query(
-    `SELECT stock_code, date, close_price c FROM idx_stock_prices
-      WHERE date >= DATE_SUB(?, INTERVAL 60 DAY) ORDER BY stock_code, date ASC`, [fromDate]);
-  const byTicker = new Map();
-  for (const r of rows) {
-    if (!byTicker.has(r.stock_code)) byTicker.set(r.stock_code, []);
-    byTicker.get(r.stock_code).push({ d: iso(r.date), c: Number(r.c) });
-  }
-  const above = new Map(), up = new Map(), total = new Map();
-  for (const series of byTicker.values()) {
-    const cl = series.map(x => x.c);
-    for (let i = 0; i < series.length; i++) {
-      const d = series[i].d;
-      const ma20 = smaAt(cl, i, 20);
-      if (ma20 === null || i === 0) continue;
-      total.set(d, (total.get(d) || 0) + 1);
-      if (cl[i] > ma20) above.set(d, (above.get(d) || 0) + 1);
-      if (cl[i] > cl[i - 1]) up.set(d, (up.get(d) || 0) + 1);
+/* ── 2. BREADTH, ON THE CANONICAL AXIS (review P1) ──────────────────────────
+   % of tracked stocks above their own 20-SESSION MA, and % closing up against
+   the previous SESSION. Computed from the price table rather than read from any
+   factor, so it stays an independent description of the market and not a
+   restatement of F6.
+
+   THE BUG THIS REPLACES. The first version walked each ticker's rows in table
+   order and took "the last 20 rows" as MA20, and "the previous row" as
+   yesterday. On a clean axis those coincide; on a ticker whose series has holes
+   they do not, and this window contains exactly that case. 245 of the 253
+   tickers in `idx_stock_prices` cover all 129 canonical sessions — and the 8
+   that do not (BOSS, FASW, SCPI, SMCB, SRIL, TELE, WIKA, WSKT, holding 20 to 33
+   rows each) are suspended names outside the 245-ticker scored universe. Their
+   "20 rows back" reached across months of halted trading, and they were being
+   counted in the breadth denominator on every session.
+
+   A ticker is now included on session D only if the 20 canonical sessions
+   ending at D are ALL present for it. Missing is not zero and it is not
+   "reach further back": it is excluded, and the exclusion is counted. */
+function breadthByDate(priceByTicker, sessions, sessIdx) {
+  const out = new Map();
+  const excluded = new Map();
+  for (let i = HIGH_LOOKBACK - 1; i < sessions.length; i++) {
+    const d = sessions[i];
+    let above = 0, up = 0, n = 0, skipped = 0;
+    for (const series of priceByTicker.values()) {
+      const bar = series.get(d);
+      const prev = series.get(sessions[i - 1]);
+      if (!bar || !prev) { skipped++; continue; }
+      // the 20 canonical sessions ending at D, all of them or none
+      let sum = 0, ok = true;
+      for (let k = i - (HIGH_LOOKBACK - 1); k <= i; k++) {
+        const b = series.get(sessions[k]);
+        if (!b) { ok = false; break; }
+        sum += b.c;
+      }
+      if (!ok) { skipped++; continue; }
+      n++;
+      if (bar.c > sum / HIGH_LOOKBACK) above++;
+      if (bar.c > prev.c) up++;
+    }
+    if (n > 0) {
+      out.set(d, { pctAboveMa20: above / n * 100, pctUp: up / n * 100, breadthN: n });
+      excluded.set(d, skipped);
     }
   }
-  const out = new Map();
-  for (const [d, n] of total) {
-    out.set(d, { pctAboveMa20: (above.get(d) || 0) / n * 100, pctUp: (up.get(d) || 0) / n * 100, breadthN: n });
+  return { breadth: out, excluded };
+}
+
+/* ── 2b. CANONICAL FORWARD OUTCOMES (review P1) ─────────────────────────────
+   Every outcome the experiment uses, computed here from prices on the exchange
+   calendar, so the horizon words mean sessions. A window that cannot be
+   completed is REFUSED rather than shortened — the same rule EXP-025 applies,
+   and the reason `assertCompleteSessions` exists in modules/system_health.js. */
+function canonicalOutcomes(series, sessions, sessIdx, date) {
+  const i = sessIdx.get(date);
+  if (i === undefined) return null;
+  const entry = series.get(date);
+  if (!entry) return null;
+
+  const fwd = H => {
+    const t = sessions[i + H];
+    if (!t) return null;
+    const b = series.get(t);
+    return b ? (b.c / entry.c - 1) * 100 : null;
+  };
+
+  // path over the next 5 canonical sessions — all present or the path is unknown
+  let maxProfit = null, maxDrawdown = null;
+  const path = [];
+  for (let k = 1; k <= HORIZON_BREAKOUT; k++) {
+    const t = sessions[i + k];
+    const b = t ? series.get(t) : null;
+    if (!b) { path.length = 0; break; }
+    path.push(b);
   }
-  return out;
+  if (path.length === HORIZON_BREAKOUT) {
+    maxProfit = (Math.max(...path.map(b => b.h)) / entry.c - 1) * 100;
+    maxDrawdown = (Math.min(...path.map(b => b.l)) / entry.c - 1) * 100;
+  }
+
+  // EXP-025 parity: exit close must clear the highest CLOSE of the 20 sessions
+  // ENDING AT ENTRY. Fewer than 20 prior sessions means we cannot say whether
+  // this is new ground, so the name is excluded rather than assumed either way.
+  let breakoutExp025 = null;
+  const ret5 = fwd(HORIZON_BREAKOUT);
+  if (ret5 !== null && i >= HIGH_LOOKBACK - 1) {
+    let priorHigh = -Infinity, ok = true;
+    for (let k = i - (HIGH_LOOKBACK - 1); k <= i; k++) {
+      const b = series.get(sessions[k]);
+      if (!b) { ok = false; break; }
+      if (b.c > priorHigh) priorHigh = b.c;
+    }
+    const exitBar = series.get(sessions[i + HORIZON_BREAKOUT]);
+    if (ok && exitBar) breakoutExp025 = (ret5 >= WIN_THRESHOLD && exitBar.c > priorHigh);
+  }
+
+  return {
+    return_1d: fwd(1), return_3d: fwd(3), return_5d: fwd(5), return_10d: fwd(10),
+    max_profit: maxProfit, max_drawdown: maxDrawdown,
+    breakoutExp025,
+    hit5pct: maxProfit === null ? null : maxProfit >= WIN_THRESHOLD,
+  };
 }
 
 /* ── 3. PER-SESSION SCANNER STATISTICS ──────────────────────────────────────
    One row per session. This is the unit of observation for everything after
    it — see the date-blocking note in the header. */
-function sessionStats(rows, horizonCol) {
-  const scored = rows.filter(r => r.composite_score !== null && r[horizonCol] !== null);
+function sessionStats(rows, horizonCol, ihsgFwd) {
+  const scored = rows.filter(r => r.composite_score !== null && r.out && r.out[horizonCol] !== null);
   if (scored.length < 10) return null;
 
   const scores = scored.map(r => Number(r.composite_score));
-  const rets = scored.map(r => Number(r[horizonCol]));
+  const rets = scored.map(r => r.out[horizonCol]);
   const universeMean = mean(rets);
 
   const buys = scored.filter(r => r.signal_type === 'BUY' || r.signal_type === 'STRONG BUY');
-  const buyRets = buys.map(r => Number(r[horizonCol]));
-  const withPath = buys.filter(r => r.max_profit !== null && r.max_drawdown !== null);
+  const buyRets = buys.map(r => r.out[horizonCol]);
+  const buyMean = buyRets.length ? mean(buyRets) : null;
+
+  const rate = (list, key) => {
+    const w = list.filter(r => r.out[key] !== null && r.out[key] !== undefined);
+    return w.length ? w.filter(r => r.out[key]).length / w.length * 100 : null;
+  };
 
   return {
     n: scored.length,
     ic: cs.spearmanIC(scores, rets),
     universeMean,
+    ihsgFwd,
     buyN: buys.length,
-    buyMean: buyRets.length ? mean(buyRets) : null,
-    // The whole point of the experiment: the market's own move removed.
-    buyExcess: buyRets.length ? mean(buyRets) - universeMean : null,
+    buyMean,
+    /* TWO BENCHMARKS, NAMED FOR WHAT THEY ARE (review P2).
+       The first version called `buyMean - universeMean` "the market's own move
+       removed", which overstates it: it is an EQUAL-WEIGHT, UNIVERSE-RELATIVE
+       return, not a beta- or index-adjusted alpha. IHSG is capitalisation-
+       weighted, so the two answer different questions and can disagree —
+       especially in a window where large caps and the average name moved
+       differently. Both are reported; neither is called alpha. */
+    buyVsUniverse: buyMean === null ? null : buyMean - universeMean,
+    buyVsIhsg: (buyMean === null || ihsgFwd === null) ? null : buyMean - ihsgFwd,
+    universeVsIhsg: ihsgFwd === null ? null : universeMean - ihsgFwd,
     buyWinRate: buyRets.length ? buyRets.filter(x => x > 0).length / buyRets.length * 100 : null,
-    buyBreakoutRate: withPath.length
-      ? withPath.filter(r => Number(r.max_profit) >= BREAKOUT_PCT).length / withPath.length * 100 : null,
-    buyMaxDD: withPath.length ? mean(withPath.map(r => Number(r.max_drawdown))) : null,
-    // The same breakout rate over EVERY scored name, so the BUY rate can be
-    // read against its own session's base rate rather than in the abstract.
-    universeBreakoutRate: (() => {
-      const w = scored.filter(r => r.max_profit !== null);
-      return w.length ? w.filter(r => Number(r.max_profit) >= BREAKOUT_PCT).length / w.length * 100 : null;
+    buyMaxDD: (() => {
+      const w = buys.filter(r => r.out.max_drawdown !== null);
+      return w.length ? mean(w.map(r => r.out.max_drawdown)) : null;
     })(),
+    // EXP-025's frozen definition, and the looser intrawindow touch, kept apart.
+    buyBreakoutExp025: rate(buys, 'breakoutExp025'),
+    universeBreakoutExp025: rate(scored, 'breakoutExp025'),
+    buyHit5pct: rate(buys, 'hit5pct'),
+    universeHit5pct: rate(scored, 'hit5pct'),
   };
 }
 
@@ -217,7 +353,8 @@ function agg(rows, field) {
 
   console.log('='.repeat(94));
   console.log('EXP-026 — MARKET REGIME CONDITIONALITY');
-  console.log(`horizon ${horizonDays}D (${horizonCol})   source '${SOURCE}'   breakout = max_profit >= ${BREAKOUT_PCT}% within 5 sessions`);
+  console.log(`horizon ${horizonDays}D (${horizonCol})   source '${SOURCE}'   outcomes recomputed on the canonical IDX calendar`);
+  console.log(`breakout = EXP-025 parity: forward ${HORIZON_BREAKOUT}-session return >= +${WIN_THRESHOLD}% AND exit close clears the prior ${HIGH_LOOKBACK}-session high close`);
   console.log('='.repeat(94));
 
   // index series
@@ -226,10 +363,10 @@ function agg(rows, field) {
   const iclose = ih.map(r => Number(r.c));
   const idxOf = new Map(idates.map((d, i) => [d, i]));
 
-  // signals
+  // SCORES AND CLASSIFICATIONS come from the snapshot; every OUTCOME is
+  // recomputed here from prices on the canonical axis (review P1).
   const [sig] = await pool.query(
-    `SELECT data_date, stock_code, composite_score, signal_type,
-            return_1d, return_3d, return_5d, return_10d, max_profit, max_drawdown
+    `SELECT data_date, stock_code, composite_score, signal_type
        FROM idx_signal_history WHERE data_source = ? ORDER BY data_date ASC`, [SOURCE]);
   const byDate = new Map();
   for (const r of sig) {
@@ -237,9 +374,38 @@ function agg(rows, field) {
     if (!byDate.has(d)) byDate.set(d, []);
     byDate.get(d).push(r);
   }
-
   const firstDate = [...byDate.keys()].sort()[0];
-  const breadth = await breadthByDate(pool, firstDate);
+
+  // price series keyed by canonical date, per ticker
+  const [px] = await pool.query(
+    `SELECT stock_code, date, close_price c, high_price h, low_price l
+       FROM idx_stock_prices WHERE date >= DATE_SUB(?, INTERVAL 120 DAY) ORDER BY stock_code, date`,
+    [firstDate]);
+  const priceByTicker = new Map();
+  for (const r of px) {
+    if (!priceByTicker.has(r.stock_code)) priceByTicker.set(r.stock_code, new Map());
+    priceByTicker.get(r.stock_code).set(iso(r.date), { c: Number(r.c), h: Number(r.h), l: Number(r.l) });
+  }
+
+  const { breadth, excluded: breadthExcluded } = breadthByDate(priceByTicker, idates, idxOf);
+
+  // attach canonical outcomes to every scored row
+  let refusedOutcome = 0, attached = 0;
+  for (const [d, rows] of byDate) {
+    for (const r of rows) {
+      const series = priceByTicker.get(r.stock_code);
+      r.out = series ? canonicalOutcomes(series, idates, idxOf, d) : null;
+      if (!r.out) { refusedOutcome++; r.out = null; } else attached++;
+    }
+  }
+
+  // IHSG's own forward return over the same canonical horizon, for the
+  // index-relative benchmark the review asked for (P2).
+  const ihsgFwdAt = (d, H) => {
+    const i = idxOf.get(d);
+    if (i === undefined || !idates[i + H]) return null;
+    return (iclose[i + H] / iclose[i] - 1) * 100;
+  };
 
   // one row per session
   const sessions = [];
@@ -247,13 +413,19 @@ function agg(rows, field) {
   for (const [d, rows] of [...byDate.entries()].sort()) {
     const i = idxOf.get(d);
     if (i === undefined) { skippedNoIndex++; continue; }
-    const stats = sessionStats(rows, horizonCol);
+    const stats = sessionStats(rows, horizonCol, ihsgFwdAt(d, Number(horizonDays)));
     if (!stats) { skippedThin++; continue; }
     sessions.push({
-      date: d,
+      date: d, sessionIndex: i,
       market: { ...marketFeatures(iclose, i), ...(breadth.get(d) || { pctAboveMa20: null, pctUp: null }) },
       stats,
     });
+  }
+  console.log(`\ncanonical outcomes attached: ${attached}   refused (incomplete window): ${refusedOutcome}`);
+  const exVals = [...breadthExcluded.values()];
+  if (exVals.length) {
+    console.log(`breadth: ${fmt(mean([...breadth.values()].map(b => b.breadthN)), 1)} tickers/session included, ` +
+      `${fmt(mean(exVals), 1)} excluded for an incomplete 20-session window`);
   }
 
   console.log(`\nsessions used: ${sessions.length}` +
@@ -267,7 +439,9 @@ function agg(rows, field) {
 
   // ── the unconditional picture, so every conditional number has a baseline ──
   const allIC = agg(sessions, 'ic');
-  const allExcess = agg(sessions.filter(s => s.stats.buyN > 0), 'buyExcess');
+  const allExcess = agg(sessions.filter(s => s.stats.buyN > 0), 'buyVsUniverse');
+  const allVsIhsg = agg(sessions.filter(s => s.stats.buyN > 0), 'buyVsIhsg');
+  const allUniVsIhsg = agg(sessions, 'universeVsIhsg');
   const allAbs = agg(sessions.filter(s => s.stats.buyN > 0), 'buyMean');
   const allUni = agg(sessions, 'universeMean');
   const icSeries = sessions.map(s => s.stats.ic).filter(x => x !== null);
@@ -279,8 +453,11 @@ function agg(rows, field) {
   console.log(`  universe mean ${horizonDays}D return                  : ${fmt(allUni.mean)}%   <- what the market did`);
   console.log(`  BUY mean ${horizonDays}D return   (ABSOLUTE)          : ${fmt(allAbs.mean)}%` +
     (allAbs.ci ? `  95% CI [${fmt(allAbs.ci.lower)}, ${fmt(allAbs.ci.upper)}]` : ''));
-  console.log(`  BUY minus universe same session (EXCESS)        : ${fmt(allExcess.mean)}%` +
+  console.log(`  BUY minus EQUAL-WEIGHT universe, same session   : ${fmt(allExcess.mean)}%` +
     (allExcess.ci ? `  95% CI [${fmt(allExcess.ci.lower)}, ${fmt(allExcess.ci.upper)}]` : ''));
+  console.log(`  BUY minus IHSG (cap-weighted index), same session: ${fmt(allVsIhsg.mean)}%` +
+    (allVsIhsg.ci ? `  95% CI [${fmt(allVsIhsg.ci.lower)}, ${fmt(allVsIhsg.ci.upper)}]` : ''));
+  console.log(`  universe minus IHSG                             : ${fmt(allUniVsIhsg.mean)}%   <- the two benchmarks are not the same thing`);
 
   // ── conditional tables ──
   const FEATURES = [
@@ -297,23 +474,24 @@ function agg(rows, field) {
   ];
 
   const jsonOut = { horizon: horizonDays, source: SOURCE, sessions: sessions.length, unconditional: {
-    ic: allIC, buyAbsolute: allAbs, buyExcess: allExcess, universe: allUni }, features: {} };
+    ic: allIC, buyAbsolute: allAbs, buyVsUniverse: allExcess, buyVsIhsg: allVsIhsg, universe: allUni }, features: {} };
 
   for (const [key, label] of FEATURES) {
     const groups = terciles(sessions, key);
     if (!groups) { console.log(`\n${label}: not enough sessions with this feature`); continue; }
     console.log(`\n${label}`);
     console.log('-'.repeat(94));
-    console.log('        range                sess  BUYs |  market   BUY abs   BUY excess [95% CI]      IC     breakout');
+    console.log('        range                sess  BUYs |  market   BUY abs  BUY-univ [95% CI]        IC    brkout B/U');
     const rec = [];
     for (const g of groups) {
       const withBuys = g.rows.filter(r => r.stats.buyN > 0);
       const ic = agg(g.rows, 'ic');
       const uni = agg(g.rows, 'universeMean');
       const abs = agg(withBuys, 'buyMean');
-      const exc = agg(withBuys, 'buyExcess');
-      const brk = agg(withBuys, 'buyBreakoutRate');
-      const ubrk = agg(g.rows, 'universeBreakoutRate');
+      const exc = agg(withBuys, 'buyVsUniverse');
+      const excI = agg(withBuys, 'buyVsIhsg');
+      const brk = agg(withBuys, 'buyBreakoutExp025');
+      const ubrk = agg(g.rows, 'universeBreakoutExp025');
       const nBuys = g.rows.reduce((s, r) => s + r.stats.buyN, 0);
       console.log(
         `  ${g.label}  ${String(fmt(g.range[0]) + '..' + fmt(g.range[1])).padEnd(18)} ` +
@@ -324,7 +502,7 @@ function agg(rows, field) {
         `${fmt(ic.mean, 4).padStart(7)} ` +
         `${fmt(brk.mean, 1).padStart(5)}%/${fmt(ubrk.mean, 1)}%`);
       rec.push({ bucket: g.label.trim(), range: g.range, sessions: g.rows.length, buys: nBuys,
-                 universeMean: uni.mean, buyAbsolute: abs, buyExcess: exc, ic, breakout: brk.mean, universeBreakout: ubrk.mean });
+                 universeMean: uni.mean, buyAbsolute: abs, buyVsUniverse: exc, buyVsIhsg: excI, ic, breakoutExp025: brk.mean, universeBreakoutExp025: ubrk.mean });
     }
     jsonOut.features[key] = rec;
   }
@@ -341,10 +519,10 @@ function agg(rows, field) {
      reason as everything else here. */
   const decilesBySession = [];
   for (const [d, rows] of [...byDate.entries()].sort()) {
-    const scored = rows.filter(r => r.composite_score !== null && r[horizonCol] !== null);
+    const scored = rows.filter(r => r.composite_score !== null && r.out && r.out[horizonCol] !== null);
     if (scored.length < 30) continue;
     const b = cs.bucketByScore(scored.map(r => Number(r.composite_score)),
-                              scored.map(r => Number(r[horizonCol])), 10);
+                              scored.map(r => r.out[horizonCol]), 10);
     // EXCESS per decile, so a falling market cannot make every decile look bad.
     decilesBySession.push(b.buckets.map(x => (x.meanReturn === null ? null : x.meanReturn - b.universeMean)));
   }
@@ -372,18 +550,27 @@ function agg(rows, field) {
   // statistics serially correlated, so the CIs above are too NARROW. Re-run the
   // headline numbers on a subsample spaced H sessions apart, where the forward
   // windows do not overlap at all.
+  // ANCHORS ARE PICKED ON THE EXCHANGE'S OWN INDEX, not on this array's (P2).
+  // `sessions.filter((_, i) => i % H === 0)` counts positions in a list that has
+  // already had sessions dropped (no index bar, too thin), so two consecutive
+  // picks could be fewer than H canonical sessions apart — which is exactly the
+  // overlap the subsample exists to remove.
   const H = Number(horizonDays);
-  const spaced = sessions.filter((_, i) => i % H === 0);
+  const spaced = [];
+  let nextEligible = -Infinity;
+  for (const s of sessions) {
+    if (s.sessionIndex >= nextEligible) { spaced.push(s); nextEligible = s.sessionIndex + H; }
+  }
   const sIC = agg(spaced, 'ic');
-  const sExc = agg(spaced.filter(s => s.stats.buyN > 0), 'buyExcess');
+  const sExc = agg(spaced.filter(s => s.stats.buyN > 0), 'buyVsUniverse');
   const sAbs = agg(spaced.filter(s => s.stats.buyN > 0), 'buyMean');
   console.log('\n\nROBUSTNESS — non-overlapping subsample (every ' + H + 'th session, windows cannot overlap)');
   console.log('-'.repeat(94));
   console.log(`  sessions: ${spaced.length} of ${sessions.length}`);
   console.log(`  rank IC        ${fmt(sIC.mean, 4)}` + (sIC.ci ? `  95% CI [${fmt(sIC.ci.lower, 4)}, ${fmt(sIC.ci.upper, 4)}]` : ''));
   console.log(`  BUY absolute   ${fmt(sAbs.mean)}%` + (sAbs.ci ? `  95% CI [${fmt(sAbs.ci.lower)}, ${fmt(sAbs.ci.upper)}]` : ''));
-  console.log(`  BUY excess     ${fmt(sExc.mean)}%` + (sExc.ci ? `  95% CI [${fmt(sExc.ci.lower)}, ${fmt(sExc.ci.upper)}]` : ''));
-  jsonOut.robustness = { spacedSessions: spaced.length, ic: sIC, buyAbsolute: sAbs, buyExcess: sExc };
+  console.log(`  BUY - universe ${fmt(sExc.mean)}%` + (sExc.ci ? `  95% CI [${fmt(sExc.ci.lower)}, ${fmt(sExc.ci.upper)}]` : ''));
+  jsonOut.robustness = { spacedSessions: spaced.length, ic: sIC, buyAbsolute: sAbs, buyVsUniverse: sExc };
 
   const outFile = arg('json', null);
   if (outFile) {
