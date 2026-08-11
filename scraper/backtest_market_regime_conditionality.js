@@ -54,6 +54,80 @@
 require('dotenv').config();
 const mysql = require('mysql2/promise');
 const cs = require('./modules/cross_sectional');
+const { BENCHMARK_TICKERS, BENCHMARK_UNIVERSE_VERSION } = require('./modules/benchmark_universe');
+const breakoutLib = require('./modules/breakout');
+
+/**
+ * THE MARKET-BREADTH UNIVERSE — known and versioned, not "whatever is in the
+ * price table" (review round 2, P1).
+ *
+ * R1 computed breadth by iterating `priceByTicker.values()`, i.e. every ticker
+ * that happened to have rows in `idx_stock_prices`. On today's data that gives
+ * 253 − 8 incomplete = 245, which is exactly the scored universe — and that
+ * coincidence is the whole problem. It is right by accident of what the table
+ * contains today, not by construction. A new listing, a historical backfill, a
+ * restored delisting or one more fully-populated series and breadth silently
+ * becomes 246 or 247 with no model or version change to show for it.
+ *
+ * This is the F5 lesson exactly, and modules/benchmark_universe.js was written
+ * because of it: "the answer only means anything if 'the market' means the same
+ * thing every time it is asked." Breadth is a market-wide measurement and needs
+ * the same guarantee.
+ *
+ * DELIBERATELY DERIVED FROM THE SAME FROZEN LIST rather than a second copy of
+ * 245 names. Two hand-maintained lists of one universe is a drift risk of its
+ * own, and the F5 benchmark already IS "the deployed universe, frozen
+ * 2026-08-10". What makes that safe is that this file pins the MEMBERSHIP with
+ * its own digest below and carries its own version string, so a re-freeze done
+ * for F5's reasons fails this run loudly instead of quietly moving the market
+ * breadth is measured over.
+ *
+ * NOT aliased to IDX_TICKERS, for the reason benchmark_universe.js states: that
+ * list is already 600 in the working tree and held back from deploy.
+ */
+const MARKET_BREADTH_UNIVERSE_V1 = Object.freeze([...BENCHMARK_TICKERS].sort());
+const MARKET_BREADTH_UNIVERSE_VERSION = `mbu-v1/${BENCHMARK_UNIVERSE_VERSION}`;
+const MARKET_BREADTH_EXPECTED_SIZE = 245;
+
+/**
+ * MEMBERSHIP IS WHAT IS FROZEN, NOT THE COUNT (review round 3, and the first
+ * attempt at this P1 got it wrong by asserting only `length === 245`).
+ *
+ * A size check cannot see a SWAP. Drop one ticker, add another, and the count is
+ * still 245 while "the market" breadth is measured over is a different set of
+ * companies — which is precisely the silent change this guard exists to stop.
+ * The digest is over the sorted membership, so any substitution, addition or
+ * removal fails the run.
+ *
+ * FAIL CLOSED. Not a warning: a breadth series computed over a different
+ * universe is not a degraded version of this one, it is a different measurement
+ * wearing the same name.
+ */
+const MARKET_BREADTH_UNIVERSE_SHA256 =
+  '21686059a872d887f712b9c957f6813fa42559d8d67f981e29ca98a68122e975';
+
+(function assertFrozenBreadthUniverse() {
+  const digest = require('crypto').createHash('sha256')
+    .update(MARKET_BREADTH_UNIVERSE_V1.join(',')).digest('hex');
+  const problems = [];
+  if (MARKET_BREADTH_UNIVERSE_V1.length !== MARKET_BREADTH_EXPECTED_SIZE) {
+    problems.push(`size ${MARKET_BREADTH_UNIVERSE_V1.length} != ${MARKET_BREADTH_EXPECTED_SIZE}`);
+  }
+  if (new Set(MARKET_BREADTH_UNIVERSE_V1).size !== MARKET_BREADTH_UNIVERSE_V1.length) {
+    problems.push('the universe contains duplicate tickers');
+  }
+  if (digest !== MARKET_BREADTH_UNIVERSE_SHA256) {
+    problems.push(`membership digest ${digest} != pinned ${MARKET_BREADTH_UNIVERSE_SHA256}`);
+  }
+  if (problems.length) {
+    throw new Error(
+      `MARKET_BREADTH_UNIVERSE_V1 is not the frozen universe: ${problems.join('; ')}.\n` +
+      'Breadth is not comparable across universes. If this change is intended, mint a NEW ' +
+      'version (MARKET_BREADTH_UNIVERSE_V2) with its own digest and re-run the whole ' +
+      'experiment under it — never re-point v1, because published EXP-026 numbers are ' +
+      'stated against v1 membership.');
+  }
+})();
 
 // ── provenance ──────────────────────────────────────────────────────────────
 // One source only. `idx_signal_history` also holds 4,131 rows tagged `live`,
@@ -181,7 +255,13 @@ function breadthByDate(priceByTicker, sessions, sessIdx) {
   for (let i = HIGH_LOOKBACK - 1; i < sessions.length; i++) {
     const d = sessions[i];
     let above = 0, up = 0, n = 0, skipped = 0;
-    for (const series of priceByTicker.values()) {
+    // The FROZEN universe, not the table's contents. A name in the universe with
+    // no series at all counts as excluded, exactly like one with a short series:
+    // missing is missing, and it is reported rather than silently shrinking the
+    // denominator.
+    for (const tk of MARKET_BREADTH_UNIVERSE_V1) {
+      const series = priceByTicker.get(tk);
+      if (!series) { skipped++; continue; }
       const bar = series.get(d);
       const prev = series.get(sessions[i - 1]);
       if (!bar || !prev) { skipped++; continue; }
@@ -240,23 +320,37 @@ function canonicalOutcomes(series, sessions, sessIdx, date) {
   // EXP-025 parity: exit close must clear the highest CLOSE of the 20 sessions
   // ENDING AT ENTRY. Fewer than 20 prior sessions means we cannot say whether
   // this is new ground, so the name is excluded rather than assumed either way.
-  let breakoutExp025 = null;
-  const ret5 = fwd(HORIZON_BREAKOUT);
-  if (ret5 !== null && i >= HIGH_LOOKBACK - 1) {
-    let priorHigh = -Infinity, ok = true;
-    for (let k = i - (HIGH_LOOKBACK - 1); k <= i; k++) {
-      const b = series.get(sessions[k]);
-      if (!b) { ok = false; break; }
-      if (b.c > priorHigh) priorHigh = b.c;
-    }
-    const exitBar = series.get(sessions[i + HORIZON_BREAKOUT]);
-    if (ok && exitBar) breakoutExp025 = (ret5 >= WIN_THRESHOLD && exitBar.c > priorHigh);
+  // THE WINDOW IS `i-20 .. i-1`, STRICTLY BEFORE ENTRY, byte-for-byte the bounds
+  // backtest_precursor_trajectory.js uses (`for k = i - HIGH_LOOKBACK; k < i`).
+  // R1 used `i-19 .. i`, which includes the entry bar itself — 20 sessions
+  // ENDING AT entry rather than 20 sessions BEFORE it (review round 2, P2).
+  // The reviewer judged it unlikely to flip any classification, and that is
+  // probably right: with forward return >= +5% the exit close exceeds entry, so
+  // an entry bar that was itself the window high is cleared anyway. "Probably
+  // right" is not the contract though — two definitions of "EXP-025 parity" is
+  // exactly the drift this project keeps paying for, so the bounds now match and
+  // the difference is MEASURED rather than argued (see parityFlips below).
+  // ONE DEFINITION, IMPORTED (review round 3). EXP-026 has now twice written its
+  // own version of EXP-025's frozen contract and twice got it wrong, so it no
+  // longer holds a copy at all — modules/breakout.js is the single definition and
+  // test_breakout_parity.js proves it equals EXP-025's implementation on 7,200
+  // generated cases, in CI, without a database.
+  const bk = breakoutLib.genuineBreakout(series, sessions, i);
+  const breakoutExp025 = bk === null ? null : bk.winner;
+
+  // The superseded R1 bounds (i-19..i, entry bar included), computed ONLY to
+  // count how many classifications the parity fix actually moved. Reported as a
+  // measured number rather than the assumption that it "probably changes nothing".
+  let breakoutR1Bounds = null;
+  if (bk !== null) {
+    const withEntry = Math.max(bk.priorHigh, entry.c);
+    breakoutR1Bounds = bk.forwardReturnPct >= WIN_THRESHOLD && bk.exitClose > withEntry;
   }
 
   return {
     return_1d: fwd(1), return_3d: fwd(3), return_5d: fwd(5), return_10d: fwd(10),
     max_profit: maxProfit, max_drawdown: maxDrawdown,
-    breakoutExp025,
+    breakoutExp025, breakoutR1Bounds,
     hit5pct: maxProfit === null ? null : maxProfit >= WIN_THRESHOLD,
   };
 }
@@ -544,6 +638,48 @@ function agg(rows, field) {
     `   (a working ranking is POSITIVE here; this is the spread the score is supposed to create)`);
   jsonOut.deciles = { excessByDecile: decileMeans, topMinusBottom: topBottom, sessions: decilesBySession.length };
 
+  /* ── THE BUY RETURN DISTRIBUTION ────────────────────────────────────────────
+     The review's reading of the two results that look contradictory — BUY hits
+     the EXP-025 breakout 3.4x more often than base rate, yet BUY mean return is
+     negative — is that they are not contradictory at all, and that the shape is
+     probably a few large winners against many small losers.
+
+     That is a claim about the DISTRIBUTION, so it is checkable rather than
+     interpretive, and the difference matters: "breaks out more often" and
+     "better expected return" are different statements and this experiment
+     should stop letting one stand in for the other. Pooled over signals, since
+     it describes the shape of one signal's outcome rather than a regime effect. */
+  const allBuys = [];
+  for (const rows of byDate.values()) {
+    for (const r of rows) {
+      if ((r.signal_type !== 'BUY' && r.signal_type !== 'STRONG BUY') || !r.out) continue;
+      if (r.out[horizonCol] === null) continue;
+      allBuys.push({ ret: r.out[horizonCol], brk: r.out.breakoutExp025 });
+    }
+  }
+  if (allBuys.length) {
+    const sorted = [...allBuys].map(x => x.ret).sort((a, b) => a - b);
+    const q = p => sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+    const brk = allBuys.filter(x => x.brk === true);
+    const non = allBuys.filter(x => x.brk === false);
+    console.log(`\n\nBUY RETURN DISTRIBUTION at ${horizonDays}D (pooled over ${allBuys.length} signals)`);
+    console.log('-'.repeat(94));
+    console.log(`  p10 ${fmt(q(0.10)).padStart(7)}%   p25 ${fmt(q(0.25)).padStart(7)}%   median ${fmt(q(0.50)).padStart(7)}%` +
+      `   p75 ${fmt(q(0.75)).padStart(7)}%   p90 ${fmt(q(0.90)).padStart(7)}%`);
+    console.log(`  mean ${fmt(mean(sorted))}%   share positive ${fmt(sorted.filter(x => x > 0).length / sorted.length * 100, 1)}%`);
+    if (brk.length && non.length) {
+      console.log(`\n  EXP-025 breakout   n=${String(brk.length).padStart(4)}  mean ${fmt(mean(brk.map(x => x.ret))).padStart(7)}%   median ${fmt([...brk.map(x => x.ret)].sort((a, b) => a - b)[Math.floor(brk.length / 2)]).padStart(7)}%`);
+      console.log(`  everything else    n=${String(non.length).padStart(4)}  mean ${fmt(mean(non.map(x => x.ret))).padStart(7)}%   median ${fmt([...non.map(x => x.ret)].sort((a, b) => a - b)[Math.floor(non.length / 2)]).padStart(7)}%`);
+      console.log('\n  "breaks out more often" and "better expected return" are different claims;');
+      console.log('  this is where they come apart, and neither may be quoted as the other.');
+    }
+    jsonOut.buyDistribution = {
+      n: allBuys.length, mean: mean(sorted), p10: q(0.10), p25: q(0.25), median: q(0.50), p75: q(0.75), p90: q(0.90),
+      breakout: brk.length ? { n: brk.length, mean: mean(brk.map(x => x.ret)) } : null,
+      nonBreakout: non.length ? { n: non.length, mean: mean(non.map(x => x.ret)) } : null,
+    };
+  }
+
   // ── ROBUSTNESS: overlapping forward windows ────────────────────────────────
   // modules/cross_sectional.js states the limit its own bootstrap cannot fix:
   // daily sampling with an H-day forward return makes consecutive sessions'
@@ -572,6 +708,51 @@ function agg(rows, field) {
   console.log(`  BUY - universe ${fmt(sExc.mean)}%` + (sExc.ci ? `  95% CI [${fmt(sExc.ci.lower)}, ${fmt(sExc.ci.upper)}]` : ''));
   jsonOut.robustness = { spacedSessions: spaced.length, ic: sIC, buyAbsolute: sAbs, buyVsUniverse: sExc };
 
+  /* ── THE SIGNIFICANCE VERDICT, COMPUTED RATHER THAN WRITTEN ────────────────
+     Review round 3: for H > 1 the daily-sampled CI must not carry the word
+     "significant", because overlapping forward windows make it too narrow by
+     construction. R1's prose said "significantly negative at every horizon"
+     while R1's own non-overlapping 5D CI crossed zero — the exact mistake.
+
+     So the label is DERIVED here, from whichever CI is admissible for this
+     horizon, and printed. Prose cannot drift from the data if the data states
+     the verdict itself. */
+  const admissible = H === 1
+    ? { ci: allIC.ci, basis: 'daily-sampled (H=1: consecutive windows do not overlap)', n: allIC.n }
+    : { ci: sIC.ci, basis: `non-overlapping subsample, anchors >= ${H} canonical sessions apart`, n: sIC.n };
+  const verdict = !admissible.ci ? 'INSUFFICIENT DATA'
+    : (admissible.ci.upper < 0 ? 'SIGNIFICANTLY NEGATIVE'
+      : admissible.ci.lower > 0 ? 'SIGNIFICANTLY POSITIVE'
+        : 'DIRECTIONALLY NEGATIVE (CI spans zero — NOT significant)');
+  console.log(`\nSIGNIFICANCE VERDICT for the ${horizonDays}D rank IC`);
+  console.log('-'.repeat(94));
+  console.log(`  admissible evidence : ${admissible.basis}, n=${admissible.n} sessions`);
+  console.log(`  CI used             : [${fmt(admissible.ci?.lower, 4)}, ${fmt(admissible.ci?.upper, 4)}]`);
+  console.log(`  VERDICT             : ${verdict}`);
+  if (H > 1) {
+    console.log(`  (the daily-sampled CI [${fmt(allIC.ci?.lower, 4)}, ${fmt(allIC.ci?.upper, 4)}] is reported above as a`);
+    console.log('   DESCRIPTIVE effect estimate only, and must not be quoted as significance)');
+  }
+  jsonOut.significance = { horizon: H, basis: admissible.basis, n: admissible.n,
+                           ci: admissible.ci, verdict, dailySampledCI: allIC.ci };
+
+  // PROVENANCE — what this run measured, so a rerun can be shown to be the same
+  // measurement rather than assumed to be (review round 3, P1 acceptance).
+  jsonOut.provenance = {
+    signalSource: SOURCE,
+    breadthUniverse: MARKET_BREADTH_UNIVERSE_VERSION,
+    breadthUniverseSha256: MARKET_BREADTH_UNIVERSE_SHA256,
+    breadthUniverseExpectedN: MARKET_BREADTH_EXPECTED_SIZE,
+    breakoutDefinition: `modules/breakout.js: forward ${breakoutLib.HORIZON_SESSIONS}-session return >= ` +
+      `+${breakoutLib.WIN_THRESHOLD_PCT}% AND exit close > max close over the ${breakoutLib.HIGH_LOOKBACK} ` +
+      'sessions STRICTLY BEFORE entry',
+    breakoutParityFlips: parityFlips,
+    breakoutParityCompared: parityCompared,
+    outcomeAxis: 'idx_ihsg_history canonical sessions; incomplete windows refused',
+  };
+  console.log(`\nprovenance: breadth universe ${MARKET_BREADTH_UNIVERSE_VERSION} ` +
+    `(n=${MARKET_BREADTH_EXPECTED_SIZE}, sha256 ${MARKET_BREADTH_UNIVERSE_SHA256.slice(0, 12)}…)`);
+
   const outFile = arg('json', null);
   if (outFile) {
     require('fs').writeFileSync(outFile, JSON.stringify(jsonOut, null, 1));
@@ -586,6 +767,12 @@ function agg(rows, field) {
   console.log('  - ONE window, 2026-01-19 .. 2026-08-06, ~7 months, and a predominantly falling');
   console.log('    one. This is in-sample and describes this period, not IDX in general.');
   console.log('  - No rule is proposed here. Terciles are a way of reading the data, not a gate.');
+  console.log('  - SIGNIFICANCE IS NOT UNIFORM ACROSS HORIZONS, and the daily-sampled CI above');
+  console.log('    must not be quoted as if it were. Daily sampling at horizon H > 1 overlaps,');
+  console.log('    so those bootstrap CIs are too narrow by construction:');
+  console.log('       1D  -> no overlap at all. The daily-sampled CI stands as it is.');
+  console.log('       3/5/10D -> read significance from the NON-OVERLAPPING sample above,');
+  console.log('                  not from the daily-sampled CI.');
   console.log('  - BUY counts per bucket are small; treat ABSOLUTE/EXCESS cells with <30 BUYs as');
   console.log('    directional at best. The IC column uses every scored name and is the stronger');
   console.log('    statistic of the two.');
