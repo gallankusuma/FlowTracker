@@ -49,3 +49,13 @@ jobs:
 
       - name: Unit tests
         run: npm run test:unit
+
+      # Carried over from the workflow this one replaced. A green tick here is
+      # NOT the whole suite, and the run should say so itself rather than
+      # relying on a reader knowing which jobs exist.
+      - name: Remind what did NOT run
+        if: always()
+        run: |
+          echo "::notice::This job runs test:unit only. verify_strategy_book.js and"
+          echo "::notice::test:integration need the populated database and run on the VPS"
+          echo "::notice::via scraper/predeploy_check.sh. A green tick here is not the full suite."
