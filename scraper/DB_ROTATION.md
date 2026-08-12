@@ -144,3 +144,25 @@ standalone via the raw `mysql` CLI before `.env` was touched. `.env.example`
 updated afterward to document `DB_USER=flowtracker_app` and drop the
 "coordinate with other apps before rotating" warning, which is no longer
 true for FlowTracker's own credential.
+
+**Lesson from this cutover, worth remembering next time**: `SHOW GRANTS FOR
+'erp_user'@'localhost'` listed EIGHT grants, not one — `erp_manufacturing.*`
+plus `blackboxs.*`, `erp_genjaya.*`, `erp_genjaya_dev.*`, `erp_rheologi.*`,
+`erp_rheologi_dev.*` (other apps' schemas, deliberately NOT mirrored — that
+broad access was exactly the blast-radius problem this cutover exists to
+fix), and `` `zz\_%`.* `` — a wildcard covering throwaway schemas
+(`zz_fresh_*`, `zz_stageup_*`) that `test_virtual_portfolio.js` creates on
+the fly to test migration/setup logic in real isolation. That last one was
+missed on the first pass: `flowtracker_app` was granted `erp_manufacturing.*`
+only, and `predeploy_check.sh`'s full suite (not `db:check`, which only
+proves `SELECT 1` — this is exactly why the full suite is still run before
+restarting, not skipped once the preflight passes) caught two real
+`Access denied ... to database 'zz_fresh_...'` failures that had passed
+cleanly under `erp_user` moments before. Fixed by granting
+`` `zz\_%`.* `` to `flowtracker_app` too, matching `erp_user` exactly for
+that pattern. **The general rule this leaves behind**: enumerate every grant
+line for the account being replaced, not just the one schema that seems
+obviously relevant — a shared credential can pick up test/tooling
+dependencies on other schema patterns that are easy to miss by inspection
+alone, and only a full test-suite run against the new credential (not just
+a `SELECT 1`) will surface them.
