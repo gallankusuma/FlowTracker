@@ -1,6 +1,11 @@
 #!/bin/bash
+# DB_USER/DB_NAME default to the pre-flowtracker_app-cutover values only as a
+# fallback for convenience — the real source of truth is scraper/.env
+# (see modules/db_config.js, DB_ROTATION.md). Pass them via env if different.
+DB_USER="${DB_USER:-erp_user}"
+DB_NAME="${DB_NAME:-erp_manufacturing}"
 DB_PASSWORD="${DB_PASSWORD:?DB_PASSWORD environment variable must be set}"
-mysql -u erp_user -p"$DB_PASSWORD" erp_manufacturing 2>/dev/null <<'EOF'
+mysql -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" 2>/dev/null <<'EOF'
 SELECT 
   date,
   COUNT(*) as rows,

@@ -1,10 +1,8 @@
 require('dotenv').config();
 const m = require('mysql2/promise');
+const dbConfig = require('./modules/db_config');
 (async () => {
-  const c = await m.createConnection({
-    host: 'localhost', user: 'erp_user',
-    password: process.env.DB_PASSWORD, database: 'erp_manufacturing'
-  });
+  const c = await m.createConnection(dbConfig.getPoolConfig());
 
   console.log('=== Table schema ===');
   const [cols] = await c.query('DESCRIBE idx_broker_summary');

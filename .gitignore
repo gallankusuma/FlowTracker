@@ -32,6 +32,11 @@ yarn-error.log*
 
 # env files (can opt-in for committing if needed)
 .env*
+# ...except the template itself — a fresh clone should get a documented
+# config contract, not silence (2026-08-12 review: this repo had no tracked
+# .env.example anywhere, which was part of why nobody had one place to look
+# when a DB credential went stale). Real .env/.env.local/etc. still ignored.
+!.env.example
 
 # vercel
 .vercel

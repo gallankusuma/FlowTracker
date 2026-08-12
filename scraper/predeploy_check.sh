@@ -29,6 +29,14 @@ run() {
   fi
 }
 
+# First, always — a bad/rotated DB credential should fail here, in five
+# seconds, with a DB_AUTH_FAILED/DB_UNREACHABLE message naming host/user/
+# database, not twenty minutes into the integration suite as one confusing
+# failure among many (2026-08-12 review, after a rotated password went
+# undetected because a stale pooled connection kept the server looking
+# healthy — see modules/db_config.js).
+run "database credential preflight (fresh connection)" npm run --silent db:check
+
 # The deployed-commit stamp is what the charter records as the code that
 # produced a track record. It is written by hand at deploy time and has now been
 # forgotten twice, each time freezing a charter that named the wrong commit.

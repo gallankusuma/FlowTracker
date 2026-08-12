@@ -12,7 +12,6 @@
 require('dotenv').config();
 const express = require('express');
 const cors    = require('cors');
-const mysql   = require('mysql2/promise');
 const puppeteerExtra = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteerExtra.use(StealthPlugin());
@@ -26,6 +25,7 @@ const { optimizeWeights, saveOptimizationResult, loadOptimizationResult, rescore
 const { detectRegime, getRegimeWeights, getRegimeHistory, REGIME_WEIGHTS } = require('./awo_regime');
 const tradePolicy = require('./modules/trade_policy');
 const systemHealth = require('./modules/system_health');
+const dbConfig = require('./modules/db_config');
 const fs = require('fs');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -36,12 +36,11 @@ const PORT = 3100;
 // inside main() would be invisible to it — the exact shape of the 2026-07-30
 // production crash documented near updateRecommendationStatuses below.
 const TRADE_POLICY = tradePolicy.active();
-const DB = {
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'erp_user',
-  password: process.env.DB_PASSWORD,
-  database: process.env.DB_NAME || 'erp_manufacturing',
-};
+// DB connection config lives in modules/db_config.js (single source of
+// truth, 2026-08-12 — see its header comment for the incident that made
+// this necessary: a rotated password went undetected because server.js's
+// pooled connections, opened before the rotation, kept working while every
+// fresh connection silently failed).
 
 // Index Alpha API — Primary data source for broker summary
 const INDEX_ALPHA_KEY = process.env.INDEX_ALPHA_KEY;
@@ -255,8 +254,19 @@ let pool;
 
 // ─── Database Setup ───────────────────────────────────────────────────────────
 async function setupDB() {
-  pool = mysql.createPool(DB);
-  
+  // Explicit fresh-connection preflight before the pool is even created.
+  // Previously this fail-fast existed only by accident (the CREATE TABLE
+  // below happened to force mysql2 to open a real connection) — now it's
+  // intentional, safely logged (host/user/database, NEVER the password),
+  // and distinguishes "can't authenticate" from "authenticated but missing
+  // a DDL privilege" (which would still surface a few lines down, from the
+  // CREATE TABLE/ALTER TABLE calls themselves).
+  const check = await dbConfig.checkConnection();
+  console.log(`[DB] host=${check.host} user=${check.user} database=${check.database} config_source=${check.configSource} version=${check.version} -> ${check.ok ? 'PASS' : 'FAIL ' + check.errorCode}`);
+  if (!check.ok) throw new Error(`DB_AUTH_FAILED: ${check.errorMessage}`);
+
+  pool = dbConfig.createPool({ connectionLimit: 10 });
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS idx_broker_summary (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -2149,7 +2159,15 @@ app.get('/api/full-broker-list', (req, res) => {
   res.json({ data: FULL_BROKER_LIST });
 });
 
-// GET /api/health
+// GET /api/health — deliberately cheap, in-memory only, no DB query. Kept
+// this way on purpose: this is the endpoint a monitor hits frequently, and
+// this MySQL instance is (until the flowtracker_app cutover) shared with
+// unrelated apps — adding connection churn here for every liveness check
+// works against the exact blast-radius concern that motivated that cutover.
+// For "is the database actually reachable," use /api/health/db instead —
+// they answer different questions ("is the process alive" vs "is the
+// database alive") and conflating them is exactly how a stale-pool masked a
+// real credential failure before (see modules/db_config.js's header).
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -2158,6 +2176,15 @@ app.get('/api/health', (req, res) => {
     sectors_api: SECTORS_API_KEY ? 'configured' : 'not_configured',
     total_brokers: FULL_BROKER_LIST.length,
   });
+});
+
+// GET /api/health/db — the check /api/health deliberately doesn't do: a
+// genuinely FRESH connection (never the pool) + SELECT 1. 503 (not 200) on
+// failure so a load balancer/monitor can tell "process down" apart from
+// "database down" without parsing the response body.
+app.get('/api/health/db', async (req, res) => {
+  const check = await dbConfig.checkConnection();
+  res.status(check.ok ? 200 : 503).json(check);
 });
 
 // ─── Sectors.app API Integration ─────────────────────────────────────────────
