@@ -493,6 +493,23 @@ function agg(rows, field) {
     }
   }
 
+  // How many classifications the i-20..i-1 parity fix actually moved, per the
+  // comment above canonicalOutcomes's breakoutR1Bounds field: measured, not
+  // assumed "probably right". Compared only where BOTH definitions could be
+  // evaluated (excludes rows canonicalOutcomes already refused for missing
+  // window/exit data) — a name absent from R1's classification for a data
+  // reason is not evidence either way about what the bounds fix changed.
+  let parityCompared = 0, parityFlips = 0;
+  for (const rows of byDate.values()) {
+    for (const r of rows) {
+      if (!r.out) continue;
+      const { breakoutExp025, breakoutR1Bounds } = r.out;
+      if (breakoutExp025 === null || breakoutR1Bounds === null) continue;
+      parityCompared++;
+      if (breakoutExp025 !== breakoutR1Bounds) parityFlips++;
+    }
+  }
+
   // IHSG's own forward return over the same canonical horizon, for the
   // index-relative benchmark the review asked for (P2).
   const ihsgFwdAt = (d, H) => {
@@ -752,6 +769,8 @@ function agg(rows, field) {
   };
   console.log(`\nprovenance: breadth universe ${MARKET_BREADTH_UNIVERSE_VERSION} ` +
     `(n=${MARKET_BREADTH_EXPECTED_SIZE}, sha256 ${MARKET_BREADTH_UNIVERSE_SHA256.slice(0, 12)}…)`);
+  console.log(`breakout parity fix (i-20..i-1 vs superseded i-19..i): ${parityFlips} of ${parityCompared} classifications moved` +
+    (parityCompared > 0 ? ` (${fmt(parityFlips / parityCompared * 100, 2)}%)` : ''));
 
   const outFile = arg('json', null);
   if (outFile) {
