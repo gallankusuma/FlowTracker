@@ -1228,3 +1228,39 @@ That makes the review's proposed next step the right one, and for a better-suppo
 **Verification of R1**: 5/5 independent checks — the calendar holds no weekend sessions; the EXP-025 breakout rate hand-recomputed from raw closes over 208 BUY signals gives 12.5%, matching the script (INDS 2026-01-19 entry 600 → exit 745, +24.17%, prior-20 high close 600 → breakout); exactly 245 tickers cover all 129 canonical sessions; every non-overlap anchor is >= H canonical sessions apart. Plus the original 8/8 harness checks, which are unaffected.
 
 **Status**: MEASURED, corrected, no rule proposed and no gate enabled. Two findings from the first pass are formally withdrawn: the breakout comparison (reversed) and the "significantly negative excess" (an artifact of benchmark choice).
+
+### EXP-026 R2 (2026-08-12) — the contract-cleanup commit finally gets to run
+
+Commit `7147256` (2026-08-11) closed the three items an R2 review round held EXP-026 at 8.7/10 for — a frozen `MARKET_BREADTH_UNIVERSE_V1` (sha256-pinned, fails closed on drift instead of a size check that can't see a swap), a single imported breakout definition (`modules/breakout.js`, proven equal to EXP-025's frozen contract by `test_breakout_parity.js` on 7,200 generated cases), and a significance verdict *derived* from whichever CI is admissible per horizon rather than written in prose. That commit's own message says it plainly: **"Results NOT re-run yet — the database is down... so the corrected numbers come in a follow-up."** The DB outage was `erp_user`'s password rotation going undetected (see the 2026-08-12 DB credential lifecycle fix, same day) — this entry is that follow-up, now that it's fixed.
+
+**A second gap found on the way**: `parityFlips`/`parityCompared` were referenced in the provenance block and promised by a code comment ("computed ONLY to count how many classifications the parity fix actually moved... measured, not assumed") but the comparison loop itself was never written — every run crashed with `ReferenceError: parityFlips is not defined` before reaching the significance verdict. Fixed by adding the loop (compares `breakoutExp025` vs the superseded `breakoutR1Bounds`, already computed per-row, counted only where both resolved) — a missing implementation of already-declared intent, not a new metric.
+
+**Verified before trusting any number**: `test_breakout_parity.js` — 16/16 passing on the VPS against real production data paths (agrees with the frozen reference on all 7,200 generated cases, gets the strictly-before-entry window right, both breakout conditions load-bearing, incomplete windows excluded not silently false).
+
+**Results, all four horizons, `--horizon 1|3|5|10`**:
+
+| H | D2 (95% CI) | D3 (95% CI) | D10 (95% CI) | D10−D1 |
+|---|---|---|---|---|
+| 1D | +0.23 [0.07,0.41] | +0.15 [-0.01,0.31] | -0.20 [-0.44,0.02] | -0.16pp |
+| 3D | +0.24 [-0.05,0.52] | **+0.44 [0.16,0.74]** | **-0.43 [-0.76,-0.12]** | -0.39pp |
+| 5D | **+0.50 [0.12,0.85]** | **+0.50 [0.15,0.85]** | **-0.83 [-1.22,-0.46]** | -0.63pp |
+| 10D | **+0.74 [0.30,1.18]** | **+0.93 [0.46,1.43]** | **-1.36 [-1.90,-0.84]** | -1.36pp |
+
+(bold = 95% CI excludes zero.) **The decile hump from R1 survives intact** — direction correct at every horizon, statistically significant at 3D (D3/D10)/5D/10D; 1D and D2@3D are directionally right but don't clear significance, expected given how little separation a 1-3 day window gives a cross-sectional score room to produce.
+
+**Breakout enrichment survives the i-20..i-1 fix at every horizon** (breakout mean vs everything-else mean): 1D 4.76% vs -1.15% (n=28/196) · 3D 8.20% vs -2.70% · 5D 10.03% vs -4.14% · 10D 8.63% vs -6.04% (n=26/174 — a few breakout windows can't resolve that far out).
+
+**Parity flips: 0 of 27,474** compared classifications, at every horizon. Confirms the R1 reviewer's own prediction exactly ("unlikely to flip any classification... with forward return >= +5% the exit close exceeds entry, so an entry bar that was itself the window high is cleared anyway") — the bounds fix was correct to make for contract-integrity reasons, and changed zero actual historical outcomes in this dataset.
+
+**Significance verdict, horizon-admissible CI (not defaulting to the overlapping daily one)**:
+
+| H | admissible basis | n | CI | verdict |
+|---|---|---|---|---|
+| 1D | daily-sampled (H=1, no overlap by construction) | 121 | [-0.0793,-0.0307] | SIGNIFICANTLY NEGATIVE |
+| 3D | non-overlapping subsample | 41 | [-0.0781,-0.0038] | SIGNIFICANTLY NEGATIVE |
+| 5D | non-overlapping subsample | 25 | [-0.1032,0.0033] | DIRECTIONALLY NEGATIVE — not significant |
+| 10D | non-overlapping subsample | **12** | [-0.1706,-0.0012] | SIGNIFICANTLY NEGATIVE, but thin |
+
+5D matches R1's own already-corrected finding exactly. 10D's verdict is technically significant but rests on only 12 non-overlapping sessions with a CI upper bound of -0.0012 — a hair from zero; treat it as suggestive, not load-bearing, until more history accumulates.
+
+**Status**: All four of the review's stated acceptance checks (decile hump direction, breakout enrichment, parity-flip count, per-horizon CI admissibility) come back clean, with the two honest caveats above (1D/D2@3D short of significance; 10D's n=12 thinness) — neither is a methodology defect, both are sample-size facts. **GREEN/FREEZE** per the review's own criteria. No rule proposed, no gate enabled — same discipline as R1. Next: **EXP-027A — composite decile decomposition**, not a regime classifier (the sample still can't support one — IHSG was above its MA60 on only 12 of 121 sessions).
