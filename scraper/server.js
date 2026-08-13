@@ -2696,6 +2696,48 @@ let cronStatus = { lastRun: null, lastResult: null, nextRun: null, running: fals
 // so a silent gap like that is visible without needing historical logs.
 let auxRefreshStatus = { ihsg: null, sp500: null, usStocks: null };
 
+/**
+ * Fill concentration for recent sessions that have broker data but no
+ * concentration row.
+ *
+ * autoCalculateConcentration is only ever asked about ONE date, so a session
+ * whose broker rows arrived through any other path — /api/indexalpha/pull,
+ * /api/scrape, a backfill, or a manual cron run — never gets its concentration
+ * derived, and nothing goes back for it later. The hole is permanent until a
+ * human notices a blank page. 2026-08-12 was exactly that: broker data landed
+ * at 16:55 UTC through the manual endpoint and idx_concentration stayed on
+ * 08-11 until it was backfilled by hand a day later.
+ *
+ * The sweep is bounded to the recent calendar because old holes are a research
+ * question (was the session ever pulled at all?), not something a nightly job
+ * should silently rewrite.
+ */
+async function repairMissingConcentration(lookbackSessions = 30) {
+  const toStr = d => (d instanceof Date ? d.toISOString().split('T')[0] : String(d).split('T')[0]);
+  // Integer-clamped rather than parameterised: LIMIT does not take a bound
+  // parameter reliably across mysql2's query/execute paths.
+  const n = Math.max(1, Math.min(200, Math.floor(Number(lookbackSessions) || 30)));
+  const [sessions] = await pool.query(
+    `SELECT date FROM idx_ihsg_history ORDER BY date DESC LIMIT ${n}`);
+
+  const repaired = [];
+  for (const row of sessions) {
+    const d = toStr(row.date);
+    const [[conc]] = await pool.query(
+      'SELECT COUNT(*) AS cnt FROM idx_concentration WHERE data_date = ?', [d]);
+    if (conc.cnt > 50) continue;
+    // No broker rows means there is nothing to derive FROM. That is a pull gap,
+    // a different failure with a different fix, and inventing concentration for
+    // it would hide it.
+    const [[brok]] = await pool.query(
+      'SELECT COUNT(*) AS cnt FROM idx_broker_summary WHERE date = ?', [d]);
+    if (brok.cnt === 0) continue;
+    const r = await autoCalculateConcentration(d);
+    if (r?.stocks > 0) repaired.push(d);
+  }
+  return repaired;
+}
+
 async function runDailyCron(dateOverride) {
   if (cronRunning) {
     console.log('⏳ Cron already running, skipping...');
@@ -2809,6 +2851,47 @@ async function runDailyCron(dateOverride) {
   
   try { await saveIHSGFactorSnapshot(); console.log('  📊 IHSG factor snapshot saved'); } catch (e) { console.log('  ⚠️ IHSG factor snapshot failed:', e.message); }
 
+  // ── CONCENTRATION — derived HERE, not by the caller ───────────────────────
+  //
+  // This used to be chained onto runDailyCron() by its callers, and that
+  // placement caused two distinct failures.
+  //
+  // 1. Only two of the three callers had the chain. `POST /api/cron/run` was
+  //    `runDailyCron(date).catch(...)` and nothing else, so a manual run pulled
+  //    broker data and never derived concentration from it.
+  // 2. Worse, the chain ran AFTER this function returned — therefore after the
+  //    signal snapshot below, whose own comment claims it runs "after prices,
+  //    broker data and concentration have landed". It did not. During a run for
+  //    session D the readiness gate saw broker at D and concentration still at
+  //    D-1, refused at tolerance 0, and D's snapshot was never written.
+  //
+  // The second one hid the first. Snapshots still appeared, so nothing looked
+  // broken — but 2026-08-11's snapshot only exists because 2026-08-12's pull
+  // failed: with no new broker rows yet, the inputs agreed on 08-11 and the gate
+  // let it through. The snapshot was landing by accident, and only when the
+  // pipeline was already misbehaving. 08-10, 08-12 and 08-13 have none.
+  //
+  // Deriving it here, before the snapshot, fixes both at once: every caller gets
+  // concentration, and it is current by the time readiness is checked.
+  try {
+    const conc = await autoCalculateConcentration(date);
+    results.concentration = conc;
+    console.log(`  📊 [CONC] ${date}: ${conc?.stocks || 0} stocks (${conc?.source || 'n/a'})`);
+  } catch (e) {
+    results.concentration = { error: e.message };
+    console.log('  ⚠️ [CONC] failed:', e.message);
+  }
+
+  try {
+    const repaired = await repairMissingConcentration(30);
+    if (repaired.length) {
+      results.concentrationRepaired = repaired;
+      console.log(`  🔧 [CONC] back-filled ${repaired.length} missed session(s): ${repaired.join(', ')}`);
+    }
+  } catch (e) {
+    console.log('  ⚠️ [CONC] repair sweep failed:', e.message);
+  }
+
   // ── SIGNAL SNAPSHOT — a scheduled stage, not a page-view side effect ──────
   //
   // Runs last, after prices, broker data and concentration have landed, so it
@@ -2830,6 +2913,11 @@ async function runDailyCron(dateOverride) {
       }).catch(() => {});
     } else {
       const why = scan.payload?.error || `HTTP ${scan.status}`;
+      // Surfaced on the run result, not only in the log. The 2026-08-12 run
+      // printed this refusal and then closed with "✅ Complete! 7229 total
+      // records" — a step declined and the run still reported success, so the
+      // missing snapshot was invisible to anything reading cronStatus.
+      results.signalSnapshotRefused = String(why).slice(0, 500);
       console.log(`  ⏭  [SNAPSHOT] refused: ${why}`);
       await systemHealth.recordJobRun(pool, {
         job: 'signal_snapshot', status: 'FAILED', error: String(why).slice(0, 500),
@@ -3033,12 +3121,13 @@ function scheduleDailyCron() {
           console.log(`   🔄 [CRON] Catch-up: last data is ${lastDataDate}, today is ${today}`);
           // Run for today
           lastCronDate = today;
-          runDailyCron().then(() => {
-            console.log('📊 [CRON] Catch-up: auto-calculating concentration...');
-            return autoCalculateConcentration(today);
-          }).then(r => {
-            console.log(`✅ [CRON] Catch-up complete: ${r?.stocks || 0} stocks`);
-          }).catch(e => console.error('Catch-up cron error:', e.message));
+          // Concentration is derived inside runDailyCron now — see the note
+          // there. Chaining it here made it run after the snapshot that needs it.
+          runDailyCron()
+            .then(r => console.log(
+              `✅ [CRON] Catch-up complete: ${r?.totalRecords || 0} records, ` +
+              `concentration ${r?.concentration?.stocks || 0} stocks`))
+            .catch(e => console.error('Catch-up cron error:', e.message));
         }
       } else {
         lastCronDate = lastDataDate; // Already up to date, prevent re-run
@@ -3065,15 +3154,11 @@ function scheduleDailyCron() {
       lastCronDate = today; // Mark as run IMMEDIATELY to prevent double-trigger
       console.log(`🕐 [CRON] Scheduled daily pull triggered for ${today}!`);
       updateRecommendationStatuses().catch(e => console.error('rec update err:', e.message));
+      // Concentration is NOT chained here any more. It is derived inside
+      // runDailyCron, before the signal snapshot that reads it — chaining it
+      // out here is what made the snapshot refuse every night, and what let
+      // /api/cron/run skip it entirely. One definition of "a daily run".
       runDailyCron()
-        .then(() => {
-          // PRIMARY: Auto-calculate concentration from our own broker data
-          console.log('📊 [CRON] Auto-calculating concentration from broker data...');
-          return autoCalculateConcentration(today);
-        })
-        .then(calcResult => {
-          console.log(`✅ [CRON] Concentration auto-calc complete: ${calcResult?.stocks || 0} stocks`);
-        })
         .then(() => {
           // AUTO: Run harmonic pattern scan on all tracked stocks
           console.log('🔍 [CRON] Running daily harmonic pattern scan...');
@@ -3279,7 +3364,11 @@ app.post('/api/cron/run', requireAdminKey, async (req, res) => {
   const { date } = req.body;
   if (cronRunning) return res.json({ error: 'Cron already running', status: cronStatus });
   
-  // Run async, don't wait
+  // Run async, don't wait. This deliberately calls runDailyCron and NOTHING
+  // else: concentration, the repair sweep and the snapshot are all inside it
+  // now. This endpoint used to be the odd one out — the scheduled path chained
+  // concentration afterwards and this one did not, so a manual run produced
+  // broker data with no concentration derived from it.
   runDailyCron(date).catch(err => console.error('Manual cron error:', err));
   res.json({ started: true, date: date || getTodayDate(), message: 'Cron started in background' });
 });
