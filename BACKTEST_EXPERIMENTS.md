@@ -1264,3 +1264,51 @@ Commit `7147256` (2026-08-11) closed the three items an R2 review round held EXP
 5D matches R1's own already-corrected finding exactly. 10D's verdict is technically significant but rests on only 12 non-overlapping sessions with a CI upper bound of -0.0012 — a hair from zero; treat it as suggestive, not load-bearing, until more history accumulates.
 
 **Status**: All four of the review's stated acceptance checks (decile hump direction, breakout enrichment, parity-flip count, per-horizon CI admissibility) come back clean, with the two honest caveats above (1D/D2@3D short of significance; 10D's n=12 thinness) — neither is a methodology defect, both are sample-size facts. **GREEN/FREEZE** per the review's own criteria. No rule proposed, no gate enabled — same discipline as R1. Next: **EXP-027A — composite decile decomposition**, not a regime classifier (the sample still can't support one — IHSG was above its MA60 on only 12 of 121 sessions).
+
+## EXP-027A (2026-08-13) — Composite Decile Decomposition: is D10 bad QUALITY or bad TIMING?
+
+Purely observational, per the review's explicit instruction — no F1-F14 weight changes, no new score. New file `scraper/backtest_composite_decile_decomposition.js`, same `SOURCE = 'backfill_v3_f5v1'`, same canonical outcomes and breakout definition (duplicated from `backtest_market_regime_conditionality.js`, not imported — that file was just frozen "jangan utak-atik lagi"). Every scored row gets, in addition to F1-F14: same-session return, distance from own MA20/MA60, distance from prior 20D/60D high (own inclusive-of-today convention, same as EXP-026's IHSG features), ATR percentile (`regime_engine.js`, 252-session lookback — needed a wider 500-calendar-day price pull than EXP-026's own 120 days), and EMA21 extension (same formula `backtest_momentum_leadership.js` already established). Decile assignment is computed **once per session** off `composite_score` (mirroring `cs.bucketByScore`'s own rank math via the already-exported `rankTransform`, so every dimension is measured against the identical set of names in each decile) — not re-bucketed per dimension, which would let differing null patterns quietly shift who counts as "D10" from one dimension to the next.
+
+**Cross-check against EXP-026 R2 (the safety net for the duplicated logic)**: first pass reported raw forward returns and came out roughly 2x the published magnitude at longer horizons. Root cause: EXP-026's decile table is **excess return** (bucket mean minus that session's own universe mean — "so a falling market cannot make every decile look bad"), not raw. Fixed by applying the same excess-of-universe-mean adjustment to the four return horizons and the breakout-rate dimension only (the F1-F14/timing dimensions are same-day cross-sectional levels, not returns accumulated across a shifting-regime window — there's no market drift to net out of a level). After the fix, and after matching EXP-026's own 30-scored-per-session floor, **all four horizons reproduce EXP-026 R2's published D2/D3/D10 numbers exactly** (1D −0.20/0.15/0.23, 3D −0.43/0.44/0.24, 5D −0.83/0.50/0.50, 10D −1.36/0.93/0.74 — every value identical). 121 sessions, 2026-01-19..2026-08-06, matches R2's window exactly. Also hand-verified one stock's new MA20/MA60/prior-high features (BBCA, 2026-05-13) against raw `idx_stock_prices` SQL — exact match. F1-F14 coverage is 100% (no gaps); outcome coverage degrades only from expected right-censoring near the data cutoff (96.5% at 10D).
+
+### Quality factors — mostly point the "intended" direction in D10
+
+| Factor | D1 | D10 | direction |
+|---|---|---|---|
+| F1 Concentration | 42.73 | 66.16 | ✓ higher in D10 |
+| F2 Trend | 19.85 | 70.99 | ✓ higher in D10 |
+| F4 Momentum | 23.38 | 73.66 | ✓ higher in D10 |
+| F5 Relative Strength | 24.58 | 76.28 | ✓ higher in D10 |
+| F6 Buyer Breadth | 64.84 | 40.08 | ✗ **inverted** — lower in D10 |
+| F7 Price-Broker Alignment | 41.11 | 57.59 | ✓ higher in D10 |
+| F8 Accumulation Streak | 24.90 | 70.33 | ✓ higher in D10 |
+
+Six of seven quality factors are monotonically higher D1→D10 — the composite is picking D10 for the reasons it was built to. The one exception, F6 (buyer breadth), is not new evidence of general quality breakage: it reproduces [[project-exp016-broker-inverted|EXP-016's already-documented finding]] that persistent top-3-broker buying predicts underperformance, now showing up independently in a decile decomposition rather than a direct IC.
+
+### Timing/extension factors — D10 is the most-extended decile in the sample, cleanly
+
+| Feature | D1 | D10 | |
+|---|---|---|---|
+| Same-session return | −2.47% | +3.52% | already moved most today |
+| Distance from own MA20 | −8.56% | +7.09% | |
+| Distance from own MA60 | −11.26% | +5.81% | |
+| Distance from prior 20D high | −16.85% | −4.47% | |
+| Distance from prior 60D high | −25.52% | −12.22% | |
+| Extension from EMA21 | −8.11% | +5.91% | |
+| ATR percentile | 60.18 | 63.35 | flat — D10 is not meaningfully more volatile |
+
+Every extension measure moves monotonically D1→D10 except ATR percentile, which stays flat (~59-63) across all ten deciles — D10 is extended in *price*, not in volatility regime.
+
+### The honest complication: F4/F5 are not independent of "extension"
+
+Momentum and relative-strength factors are, by construction, largely a restatement of recent price movement — a stock cannot score high on F4/F5 without having risen, which mechanically also puts it above its moving averages and extended from EMA21. F4/F5 carry the largest D1-D10 spread of any quality factor (~50 points, vs ~15-45 for the broker factors), so they dominate the "quality" side of the review's split while overlapping heavily with the "timing" side. The genuinely independent quality signal is the broker-flow group (F1/F2/F6/F7/F8, which measure ownership flow, not price level) — and 4 of those 5 still point the intended direction in D10.
+
+### Breakout enrichment vs forward return — the tension survives decomposition
+
+D10 has both the **highest** excess breakout rate of any decile (+5.12pp vs universe, 95% CI [4.07, 6.20]) and the **worst** excess forward return at every horizon. D10 catches genuine EXP-025 breakouts more often than any other decile, and still loses on average — consistent with EXP-026 R1's framing ("a few large winners against many small losers"), not contradictory. Distribution/skew within D10 is a candidate follow-up, not attempted here (purely observational scope).
+
+### Answer to the review's question
+
+Leans toward **quality is mostly fine, extension is what stands out** — but not cleanly, because two of the seven quality factors are entangled with extension by construction. The broker-flow-only view (the part of "quality" that's genuinely independent of price level) is intact in D10 except for the separately-known F6 inversion; every timing/extension measure except volatility is at its sample extreme in D10. This gives real, if qualified, empirical grounding for `MARKET STATE → SETUP QUALITY → TIMING/EXTENSION → RISK → EXECUTION` — with the caveat that a future implementation cannot treat F4/F5 as clean "quality" inputs independent of the "extension" gate; they measure overlapping things and will need to be split or residualized, not just passed through both stages.
+
+**Status**: MEASURED, purely observational as instructed — no F1-F14 weight change, no new composite score. Cross-checked against EXP-026 R2 (exact match, all 4 horizons) and hand-verified against raw SQL. Next step is for the review to decide, not implied here.
