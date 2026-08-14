@@ -126,22 +126,37 @@ let _yfCacheAt  = 0;
  * Each symbol now carries its own timestamp, and only symbols that are missing
  * or stale are fetched. Callers get exactly the set they asked for.
  */
-async function fetchYahooPrices(tickers) {
-  const now = Date.now();
-  const wanted = [...new Set(tickers)];
-  const fresh = {}, stale = [];
-  for (const t of wanted) {
-    const e = _yfCache[t];
-    if (e && (now - (e.__at || 0)) < YF_CACHE_MS) fresh[t] = e;
-    else stale.push(t);
-  }
-  if (stale.length === 0) return fresh;
 
-  const https  = require('https');
-  const result = {};
+/**
+ * THE BURST HAS A CEILING (2026-08-14).
+ *
+ * This used to be one `Promise.allSettled` over every stale symbol — every
+ * request in flight at once. At 245 tickers Yahoo tolerated it. The universe
+ * went to 600 the same day and the warm-up reported `267/600 fetched`: Yahoo
+ * drops most of a 600-way burst, and because every failure path here resolves
+ * empty, the shortfall was visible only as a ratio in one log line.
+ *
+ * Two symbols missing because they are delisted and 333 missing because we
+ * flooded the endpoint look identical from the outside, which is the actual
+ * defect — the count told us something was wrong but nothing said what.
+ *
+ * So: bounded concurrency, a pause between chunks, and ONE retry pass over the
+ * misses. The retry is what separates the two cases. A symbol that fails twice,
+ * spaced out and un-flooded, is genuinely unavailable; one that succeeds on the
+ * second pass was a casualty of our own burst, and that number is now logged
+ * instead of inferred.
+ */
+const YF_FETCH_CONCURRENCY = 40;   // requests in flight at once
+const YF_CHUNK_PAUSE_MS    = 150;  // breather between chunks
 
-  await Promise.allSettled(stale.map(ticker => new Promise(resolve => {
-    const cryptoNames = ['BTC','ETH','BNB','SOL','XRP','ADA','AVAX','DOGE','DOT','LINK','MATIC','SHIB','LTC','UNI','BCH','ATOM','XLM','INJ','RNDR','FET','OP','ARB','SUI','SEI','APT','FIL','NEAR','TON','TIA','JUP'];
+/** One symbol → its cache entry, or null when Yahoo returned nothing usable. */
+function fetchOneYahooPrice(ticker) {
+  return new Promise(resolve => {
+    // Required locally rather than leaning on the module-scope `https` declared
+    // ~700 lines below: that only resolves because this runs after module
+    // evaluation, which is too subtle a thing to depend on. require() is cached.
+    const https = require('https');
+    const cryptoNames =['BTC','ETH','BNB','SOL','XRP','ADA','AVAX','DOGE','DOT','LINK','MATIC','SHIB','LTC','UNI','BCH','ATOM','XLM','INJ','RNDR','FET','OP','ARB','SUI','SEI','APT','FIL','NEAR','TON','TIA','JUP'];
     let sym = ticker;
     if (cryptoNames.includes(ticker)) sym = ticker + '-USD';
     else if (!ticker.includes('-USD')) sym = ticker + '.JK';
@@ -164,11 +179,11 @@ async function fetchYahooPrices(tickers) {
           const ts    = json?.chart?.result?.[0]?.timestamp || [];
           const close = json?.chart?.result?.[0]?.indicators?.quote?.[0]?.close || [];
 
-          if (!meta || ts.length < 2) { resolve(); return; }
+          if (!meta || ts.length < 2) { resolve(null); return; }
 
           // Find last two valid (non-null) closes
           const validCloses = close.map((c, i) => ({ c, t: ts[i] })).filter(x => x.c != null);
-          if (validCloses.length < 1) { resolve(); return; }
+          if (validCloses.length < 1) { resolve(null); return; }
 
           const latest  = validCloses[validCloses.length - 1];
           const prev    = validCloses.length > 1 ? validCloses[validCloses.length - 2] : null;
@@ -176,22 +191,65 @@ async function fetchYahooPrices(tickers) {
           const prevCl  = prev ? Math.round(prev.c) : 0;
           const chgPct  = prevCl > 0 ? Math.round(((price - prevCl) / prevCl) * 10000) / 100 : 0;
 
-          result[ticker] = { price, prevClose: prevCl, changePct: chgPct };
-        } catch (_) {}
-        resolve();
+          resolve({ price, prevClose: prevCl, changePct: chgPct });
+        } catch (_) { resolve(null); }
       });
     });
-    req.on('error', () => resolve());
-    req.on('timeout', () => { req.destroy(); resolve(); });
-  })));
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
+  });
+}
+
+async function fetchYahooPrices(tickers) {
+  const now = Date.now();
+  const wanted = [...new Set(tickers)];
+  const fresh = {}, stale = [];
+  for (const t of wanted) {
+    const e = _yfCache[t];
+    if (e && (now - (e.__at || 0)) < YF_CACHE_MS) fresh[t] = e;
+    else stale.push(t);
+  }
+  if (stale.length === 0) return fresh;
+
+  const result = {};
+
+  /** Run `list` in bounded chunks; returns the symbols that came back empty. */
+  const runPass = async (list) => {
+    const missed = [];
+    for (let i = 0; i < list.length; i += YF_FETCH_CONCURRENCY) {
+      const chunk = list.slice(i, i + YF_FETCH_CONCURRENCY);
+      const settled = await Promise.all(
+        chunk.map(async t => [t, await fetchOneYahooPrice(t)])
+      );
+      for (const [t, v] of settled) {
+        if (v) result[t] = v; else missed.push(t);
+      }
+      if (i + YF_FETCH_CONCURRENCY < list.length) {
+        await new Promise(r => setTimeout(r, YF_CHUNK_PAUSE_MS));
+      }
+    }
+    return missed;
+  };
+
+  const missedFirst = await runPass(stale);
+  const missedFinal = missedFirst.length ? await runPass(missedFirst) : [];
+  const recovered = missedFirst.length - missedFinal.length;
 
   if (Object.keys(result).length > 0) {
     // Merge rather than replace: a partial fetch must not evict symbols another
     // caller still holds a fresh reading for.
     for (const [k, v] of Object.entries(result)) _yfCache[k] = { ...v, __at: now };
     _yfCacheAt = now;
-    console.log(`📈 Yahoo prices: ${Object.keys(result).length}/${stale.length} fetched (${Object.keys(fresh).length} from cache)`);
   }
+  // Logged unconditionally, including the all-empty case. "0 fetched" is the
+  // single most important thing this function can say and it used to say nothing.
+  console.log(
+    `📈 Yahoo prices: ${Object.keys(result).length}/${stale.length} fetched ` +
+    `(${Object.keys(fresh).length} from cache` +
+    (recovered ? `, ${recovered} recovered on retry` : '') +
+    (missedFinal.length ? `, ${missedFinal.length} unavailable after 2 passes` : '') + ')'
+  );
+
   // The caller asked for `tickers`; give back everything we have for them —
   // freshly fetched AND still-valid cache — not just this call's fetches.
   return { ...fresh, ...result };
