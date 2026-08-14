@@ -129,6 +129,64 @@ const MARKET_BREADTH_UNIVERSE_SHA256 =
   }
 })();
 
+/* ── THE SESSION WINDOW, FROZEN THE SAME WAY THE UNIVERSE IS ─────────────────
+ *
+ * The breadth freeze above closed one half of the review's P1 and demonstrably
+ * held: the tracked ticker list went 245 -> 600 on 2026-08-14 and every EXP-026
+ * number stayed put, because breadth reads MARKET_BREADTH_UNIVERSE_V1 rather
+ * than whatever the price table contains.
+ *
+ * The other half was still open, and it broke within 48 hours. This query used
+ * to be:
+ *
+ *     FROM idx_signal_history WHERE data_source = ? ORDER BY data_date ASC
+ *
+ * with no date bound at all. The population was whatever the table happened to
+ * hold, and `2026-01-19 .. 2026-08-06` existed only as prose in a caveat string.
+ * On 2026-08-14 two genuinely missing snapshots (08-10 and 08-12) were
+ * regenerated to close a data gap — a correct repair, under the default
+ * `--source backfill_v3_f5v1`, which is this source. The frozen experiment
+ * silently grew from 121 sessions to 123 and its 1D rank IC moved.
+ *
+ * 3D/5D/10D happened to reproduce byte-for-byte, but only because the two new
+ * sessions were too close to the data edge to resolve those horizons yet. That
+ * is luck expiring on a timer, not stability.
+ *
+ * The review predicted this exact shape — "besok kalau database mendapat ticker
+ * IPO baru, delisted history, test symbol ... historical EXP-026 bisa berubah
+ * tanpa perubahan source code" — and asked for frozen MEMBERSHIP, not a count,
+ * because a count cannot see a swap. So the dates are pinned by digest too.
+ *
+ * NOTE the fix is NOT to delete the two sessions. They fill real gaps and are
+ * good data. The defect was an experiment that did not state its own window.
+ */
+const MARKET_REGIME_WINDOW_V1 = Object.freeze({ from: '2026-01-19', to: '2026-08-06' });
+const MARKET_REGIME_WINDOW_VERSION = 'mrw-v1/2026-01-19..2026-08-06';
+const MARKET_REGIME_WINDOW_EXPECTED_SESSIONS = 121;
+const MARKET_REGIME_WINDOW_SHA256 =
+  'dbd375e68d800683deac3a88a946e5d93c2b89baa51def2cd33aa4e4e9b9671d';
+
+/** Fail closed if the sessions inside the frozen window are not the frozen set. */
+function assertFrozenSessionWindow(dates) {
+  const sorted = [...dates].sort();
+  const digest = require('crypto').createHash('sha256').update(sorted.join(',')).digest('hex');
+  const problems = [];
+  if (sorted.length !== MARKET_REGIME_WINDOW_EXPECTED_SESSIONS) {
+    problems.push(`${sorted.length} sessions != ${MARKET_REGIME_WINDOW_EXPECTED_SESSIONS}`);
+  }
+  if (new Set(sorted).size !== sorted.length) problems.push('duplicate session dates');
+  if (digest !== MARKET_REGIME_WINDOW_SHA256) {
+    problems.push(`session digest ${digest} != pinned ${MARKET_REGIME_WINDOW_SHA256}`);
+  }
+  if (problems.length) {
+    throw new Error(
+      `MARKET_REGIME_WINDOW_V1 is not the frozen population: ${problems.join('; ')}.\n` +
+      'Published EXP-026 R2 numbers are stated against this exact set of 121 sessions. ' +
+      'If the window is meant to move, mint MARKET_REGIME_WINDOW_V2 with its own bounds ' +
+      'and digest and re-run the whole experiment under it — never re-point v1.');
+  }
+}
+
 // ── provenance ──────────────────────────────────────────────────────────────
 // One source only. `idx_signal_history` also holds 4,131 rows tagged `live`,
 // which carry no f5_benchmark_version stamp at all, while the backfill is
@@ -461,13 +519,20 @@ function agg(rows, field) {
   // recomputed here from prices on the canonical axis (review P1).
   const [sig] = await pool.query(
     `SELECT data_date, stock_code, composite_score, signal_type
-       FROM idx_signal_history WHERE data_source = ? ORDER BY data_date ASC`, [SOURCE]);
+       FROM idx_signal_history
+      WHERE data_source = ? AND data_date BETWEEN ? AND ?
+      ORDER BY data_date ASC`,
+    [SOURCE, MARKET_REGIME_WINDOW_V1.from, MARKET_REGIME_WINDOW_V1.to]);
   const byDate = new Map();
   for (const r of sig) {
     const d = iso(r.data_date);
     if (!byDate.has(d)) byDate.set(d, []);
     byDate.get(d).push(r);
   }
+  // Bounding the query is not enough on its own: it stops the window GROWING,
+  // but a session vanishing or being rewritten inside the bounds would still
+  // pass unnoticed. Check membership, not just the range.
+  assertFrozenSessionWindow([...byDate.keys()]);
   const firstDate = [...byDate.keys()].sort()[0];
 
   // price series keyed by canonical date, per ticker
@@ -757,6 +822,9 @@ function agg(rows, field) {
   // measurement rather than assumed to be (review round 3, P1 acceptance).
   jsonOut.provenance = {
     signalSource: SOURCE,
+    sessionWindow: MARKET_REGIME_WINDOW_VERSION,
+    sessionWindowSha256: MARKET_REGIME_WINDOW_SHA256,
+    sessionWindowExpectedSessions: MARKET_REGIME_WINDOW_EXPECTED_SESSIONS,
     breadthUniverse: MARKET_BREADTH_UNIVERSE_VERSION,
     breadthUniverseSha256: MARKET_BREADTH_UNIVERSE_SHA256,
     breadthUniverseExpectedN: MARKET_BREADTH_EXPECTED_SIZE,
@@ -769,6 +837,8 @@ function agg(rows, field) {
   };
   console.log(`\nprovenance: breadth universe ${MARKET_BREADTH_UNIVERSE_VERSION} ` +
     `(n=${MARKET_BREADTH_EXPECTED_SIZE}, sha256 ${MARKET_BREADTH_UNIVERSE_SHA256.slice(0, 12)}…)`);
+  console.log(`            session window ${MARKET_REGIME_WINDOW_VERSION} ` +
+    `(n=${MARKET_REGIME_WINDOW_EXPECTED_SESSIONS}, sha256 ${MARKET_REGIME_WINDOW_SHA256.slice(0, 12)}…)`);
   console.log(`breakout parity fix (i-20..i-1 vs superseded i-19..i): ${parityFlips} of ${parityCompared} classifications moved` +
     (parityCompared > 0 ? ` (${fmt(parityFlips / parityCompared * 100, 2)}%)` : ''));
 
@@ -783,7 +853,10 @@ function agg(rows, field) {
   console.log('='.repeat(94));
   console.log(`  - N is ${sessions.length} SESSIONS, not ${totalObs} rows. Every stock in a session shares its`);
   console.log('    regime, so the rows are not independent observations of a regime effect.');
-  console.log('  - ONE window, 2026-01-19 .. 2026-08-06, ~7 months, and a predominantly falling');
+  // Interpolated, never typed. This line said "2026-01-19 .. 2026-08-06" while
+  // the query had no date bound at all, so it kept asserting the intended window
+  // for two days after the actual one had moved to 08-12.
+  console.log(`  - ONE window, ${MARKET_REGIME_WINDOW_V1.from} .. ${MARKET_REGIME_WINDOW_V1.to}, ~7 months, and a predominantly falling`);
   console.log('    one. This is in-sample and describes this period, not IDX in general.');
   console.log('  - No rule is proposed here. Terciles are a way of reading the data, not a gate.');
   console.log('  - SIGNIFICANCE IS NOT UNIFORM ACROSS HORIZONS, and the daily-sampled CI above');
