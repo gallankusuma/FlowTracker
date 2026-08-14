@@ -1231,6 +1231,8 @@ That makes the review's proposed next step the right one, and for a better-suppo
 
 ### EXP-026 R2 (2026-08-12) — the contract-cleanup commit finally gets to run
 
+> **See the 2026-08-14 addendum at the end of this entry before quoting any number here.** The results below are unchanged and now reproduce exactly, but at the time they were published the session window was frozen only in prose — the query had no date bound, and a routine snapshot repair moved the population from 121 sessions to 123 two days later. Fixed in `5599bfb`; the addendum records what moved, what did not, and one tail-censoring caveat that is still open.
+
 Commit `7147256` (2026-08-11) closed the three items an R2 review round held EXP-026 at 8.7/10 for — a frozen `MARKET_BREADTH_UNIVERSE_V1` (sha256-pinned, fails closed on drift instead of a size check that can't see a swap), a single imported breakout definition (`modules/breakout.js`, proven equal to EXP-025's frozen contract by `test_breakout_parity.js` on 7,200 generated cases), and a significance verdict *derived* from whichever CI is admissible per horizon rather than written in prose. That commit's own message says it plainly: **"Results NOT re-run yet — the database is down... so the corrected numbers come in a follow-up."** The DB outage was `erp_user`'s password rotation going undetected (see the 2026-08-12 DB credential lifecycle fix, same day) — this entry is that follow-up, now that it's fixed.
 
 **A second gap found on the way**: `parityFlips`/`parityCompared` were referenced in the provenance block and promised by a code comment ("computed ONLY to count how many classifications the parity fix actually moved... measured, not assumed") but the comparison loop itself was never written — every run crashed with `ReferenceError: parityFlips is not defined` before reaching the significance verdict. Fixed by adding the loop (compares `breakoutExp025` vs the superseded `breakoutR1Bounds`, already computed per-row, counted only where both resolved) — a missing implementation of already-declared intent, not a new metric.
@@ -1264,6 +1266,28 @@ Commit `7147256` (2026-08-11) closed the three items an R2 review round held EXP
 5D matches R1's own already-corrected finding exactly. 10D's verdict is technically significant but rests on only 12 non-overlapping sessions with a CI upper bound of -0.0012 — a hair from zero; treat it as suggestive, not load-bearing, until more history accumulates.
 
 **Status**: All four of the review's stated acceptance checks (decile hump direction, breakout enrichment, parity-flip count, per-horizon CI admissibility) come back clean, with the two honest caveats above (1D/D2@3D short of significance; 10D's n=12 thinness) — neither is a methodology defect, both are sample-size facts. **GREEN/FREEZE** per the review's own criteria. No rule proposed, no gate enabled — same discipline as R1. Next: **EXP-027A — composite decile decomposition**, not a regime classifier (the sample still can't support one — IHSG was above its MA60 on only 12 of 121 sessions).
+
+#### EXP-026 R2 addendum (2026-08-14) — the freeze was real in prose, not in code
+
+Re-running R2 to confirm reproducibility returned **1D over 123 sessions, not 121**, with a CI of [-0.0802,-0.0313] instead of the [-0.0793,-0.0307] published above. 3D/5D/10D came back byte-for-byte identical. Cause, confirmed rather than guessed: the population query was
+
+```sql
+FROM idx_signal_history WHERE data_source = ? ORDER BY data_date ASC
+```
+
+with **no date bound**. The window was whatever the table happened to hold; `2026-01-19 .. 2026-08-06` existed only as prose, in a caveat string and in this entry. Earlier the same day, two genuinely missing snapshots (2026-08-10 and 2026-08-12) were regenerated to close a data gap — a correct repair — under the default `--source backfill_v3_f5v1`, which is this experiment's source. The frozen population silently became 123 sessions ending 08-12.
+
+The per-horizon arithmetic pins the mechanism exactly: 1D resolves both new sessions (+2), 3D resolves only 08-10 (+1), 5D and 10D resolve neither (unchanged). **3D/5D/10D reproducing identically was the dangerous part, not the reassuring one** — the new sessions were merely too close to the data edge to resolve those horizons yet. Left alone, all four would have drifted within days, with no source-code change to point at.
+
+This is the second axis of the R1 review's own P1. The first — breadth membership — was fixed in `7147256` and demonstrably holds: the tracked universe went 245 → 600 on 2026-08-14 and every number here stayed put. The session population had the identical hole and took under 48 hours to trigger.
+
+**Fixed in `5599bfb`**: `MARKET_REGIME_WINDOW_V1 = {from: 2026-01-19, to: 2026-08-06}`, 121 sessions, pinned by **sha256 `dbd375e68d80…`** — by digest and not by count, because the review's own objection to a size check applies here too: a count cannot see a session swapped inside the bounds. Bounding the query stops the window growing; `assertFrozenSessionWindow()` fails closed on anything moving within it. Provenance now records the window version and digest on every run, and the caveat line interpolates the dates from the constant instead of restating them — a string asserting the intended window while the query had none is precisely how this hid.
+
+The two new snapshots were **not** deleted. They fill real gaps and are good data; the defect was an experiment that did not state its own window.
+
+**Every number in the tables above is unchanged and now reproduces exactly** — 1D [-0.0793,-0.0307] n=121 · 3D [-0.0781,-0.0038] n=41 · 5D [-0.1032,0.0033] n=25 · 10D [-0.1706,-0.0012] n=12, parity flips 0 at all four horizons. The published results were right; what was missing was the guarantee that they stay reproducible. GREEN/FREEZE stands, and is now enforced rather than asserted.
+
+**Still open, and a different axis this does NOT fix**: outcome right-censoring at the window's tail. 10D resolves only **117 of the 121** frozen sessions, because sessions after ~2026-07-30 need prices beyond the current data edge. Those figures will keep moving until roughly 2026-08-20, and `parityCompared` drifts for the same reason (27,474 at the original run, 27,719 now — flips 0 either way). The population is frozen; per-row outcome availability still grows. Anyone re-running before the tail fills should expect 10D to differ and should not read it as a methodology change.
 
 ## EXP-027A (2026-08-13) — Composite Decile Decomposition: is D10 bad QUALITY or bad TIMING?
 
