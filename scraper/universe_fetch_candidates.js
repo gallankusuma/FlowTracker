@@ -42,11 +42,17 @@ function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 function parseArgs() {
   const args = process.argv.slice(2);
-  const out = { range: '10y', limit: 0, resume: false };
+  const out = { range: '10y', limit: 0, resume: false, rosterAll: false };
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--range') out.range = args[++i];
     else if (args[i] === '--limit') out.limit = parseInt(args[++i], 10);
     else if (args[i] === '--resume') out.resume = true;
+    // The default list is "roster minus what we already track", which is the
+    // right question when staging CANDIDATES. It is the wrong question when the
+    // table is being used as an OHLCV source for research: after the universe
+    // went 245 -> 600, that subtraction silently shrank the list from 628 codes
+    // to 270 and quietly stopped covering names already staged.
+    else if (args[i] === '--roster-all') out.rosterAll = true;
   }
   if (!DAILY_SAFE_RANGES.includes(out.range)) {
     console.error(`Refusing range="${out.range}" — not a verified daily-bar range (${DAILY_SAFE_RANGES.join('/')}).`);
@@ -70,13 +76,37 @@ async function ensureTables(pool) {
     CREATE TABLE IF NOT EXISTS idx_price_candidates (
       stock_code  VARCHAR(10) NOT NULL,
       date        DATE        NOT NULL,
-      close_price DECIMAL(15,2) NULL,
+      open_price  DECIMAL(15,2) NULL,
       high_price  DECIMAL(15,2) NULL,
+      low_price   DECIMAL(15,2) NULL,
+      close_price DECIMAL(15,2) NULL,
       volume      BIGINT      NULL,
       value       BIGINT      NULL,
       PRIMARY KEY (stock_code, date),
       KEY idx_cand_date (date)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  // OPEN and LOW were not stored originally. This table was built to measure
+  // traded value for the universe reselection, where close x volume is all that
+  // matters, so two of the four OHLC legs were dropped on the floor. EXP-028
+  // needs candle GEOMETRY — body, wicks, close_location — and none of it is
+  // computable without open and low. The fetch already returned them; only the
+  // write discarded them.
+  //
+  // Checked against information_schema rather than `ADD COLUMN IF NOT EXISTS`,
+  // which is MariaDB syntax that MySQL rejects outright. The first version of
+  // this used that syntax with a bare `.catch(() => {})`, so the ALTER failed,
+  // the swallow hid it, and all 270 inserts then failed on a missing column
+  // while the log said only "err=270". Exactly the shape this codebase keeps
+  // getting bitten by: a failure with nowhere to report itself.
+  const [existing] = await pool.query(
+    `SELECT COLUMN_NAME AS c FROM information_schema.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'idx_price_candidates'`);
+  const have = new Set(existing.map(r => r.c));
+  for (const [col, where] of [['open_price', 'AFTER date'], ['low_price', 'AFTER high_price']]) {
+    if (have.has(col)) continue;
+    await pool.query(`ALTER TABLE idx_price_candidates ADD COLUMN ${col} DECIMAL(15,2) NULL ${where}`);
+    console.log(`  schema: added ${col}`);
+  }
   // Fetch outcomes are data too: "Yahoo has no symbol for this code" is itself a
   // finding (delisted / renamed), and must not be silently indistinguishable
   // from "we forgot to fetch it".
@@ -105,12 +135,14 @@ async function logFetch(pool, code, status, bars, d0, d1, note) {
 async function saveCandles(pool, code, candles) {
   if (!candles.length) return 0;
   const values = candles.map(c => [
-    code, c.date, c.close, c.high, c.volume, c.close * c.volume,
+    code, c.date, c.open, c.high, c.low, c.close, c.volume, c.close * c.volume,
   ]);
   const [result] = await pool.query(
-    `INSERT INTO idx_price_candidates (stock_code, date, close_price, high_price, volume, value)
+    `INSERT INTO idx_price_candidates
+       (stock_code, date, open_price, high_price, low_price, close_price, volume, value)
      VALUES ?
-     ON DUPLICATE KEY UPDATE close_price=VALUES(close_price), high_price=VALUES(high_price),
+     ON DUPLICATE KEY UPDATE open_price=VALUES(open_price), high_price=VALUES(high_price),
+       low_price=VALUES(low_price), close_price=VALUES(close_price),
        volume=VALUES(volume), value=VALUES(value)`,
     [values]
   );
@@ -128,7 +160,16 @@ async function main() {
   // the CODE LIST is a valid roster of real IDX tickers.
   const [roster] = await pool.query('SELECT DISTINCT stock_code FROM idx_concentration ORDER BY stock_code');
   const tracked = new Set(IDX_TICKERS);
-  let candidates = roster.map(r => r.stock_code).filter(c => !tracked.has(c));
+  const rosterCodes = roster.map(r => r.stock_code);
+  let candidates;
+  if (opts.rosterAll) {
+    // Every roster code plus anything already staged — so re-runs cannot drop
+    // coverage that a previous run established.
+    const [staged] = await pool.query('SELECT DISTINCT stock_code FROM idx_price_candidates');
+    candidates = [...new Set([...rosterCodes, ...staged.map(r => r.stock_code)])].sort();
+  } else {
+    candidates = rosterCodes.filter(c => !tracked.has(c));
+  }
 
   if (opts.resume) {
     const [done] = await pool.query('SELECT stock_code FROM idx_price_candidate_fetch_log');
