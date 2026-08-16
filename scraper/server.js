@@ -2261,7 +2261,22 @@ app.post('/api/sectors/configure', (req, res) => {
 });
 
 // POST /api/sectors/pull — Pull data from Sectors.app API (requires API key)
-app.post('/api/sectors/pull', async (req, res) => {
+//
+// requireAdminKey added 2026-08-16 (Codex review P0-01). Port 3100 listens on
+// 0.0.0.0 with no firewall — verified reachable from outside the VPS — so every
+// unguarded mutation route here was anonymously callable from the internet.
+//
+// This one is worse than "triggers a workload". It takes `endpoint` from the
+// request body, concatenates it onto SECTORS_BASE, and forwards OUR
+// Authorization header. Concatenation keeps the request on sectors.app (an
+// absolute URL in `endpoint` lands as a path segment, and `../` normalises
+// within the origin), so it is not a route to arbitrary hosts — but it did let
+// an anonymous caller spend our paid API key against any path on that vendor.
+//
+// Locked first because it has NO frontend caller: nothing in app/, components/
+// or lib/ references it, so the guard cannot break a page. The routes the UI
+// does call need the client moved to adminFetch before they can be closed.
+app.post('/api/sectors/pull', requireAdminKey, async (req, res) => {
   if (!SECTORS_API_KEY) {
     return res.json({
       success: false,
@@ -2290,7 +2305,9 @@ app.post('/api/sectors/pull', async (req, res) => {
 });
 
 // POST /api/sectors/pull-broker — Pull broker-specific data from Sectors.app
-app.post('/api/sectors/pull-broker', async (req, res) => {
+// Same reasoning as /api/sectors/pull above: spends our vendor API key, and has
+// no caller anywhere in the frontend, so locking it has no blast radius.
+app.post('/api/sectors/pull-broker', requireAdminKey, async (req, res) => {
   if (!SECTORS_API_KEY) {
     return res.json({ success: false, error: 'Sectors.app API key not configured' });
   }
