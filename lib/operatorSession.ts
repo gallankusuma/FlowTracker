@@ -81,3 +81,59 @@ export async function opFetch(path: string, init: RequestInit = {}): Promise<Res
 
 /** True when a token is held — used only to decide whether to re-run whoami(). */
 export function hasCsrfToken(): boolean { return csrfToken !== null; }
+
+/**
+ * The kind of failure, kept distinct on purpose (correction 6).
+ *
+ * The first version called `.json()` on every response and spread the result
+ * into state, so a 401, a 403 and a 503 all arrived as `d.data || []` — an empty
+ * array that renders as a legitimately empty broker list. "You are signed out",
+ * "you are forbidden" and "the backend is down" became indistinguishable from
+ * "there is nothing here", which is the same fail-open UI pattern the review
+ * objects to on the market pages.
+ */
+export type OpFailureKind = 'auth' | 'forbidden' | 'unavailable' | 'error';
+
+export class OpError extends Error {
+  kind: OpFailureKind;
+  status: number;
+  constructor(kind: OpFailureKind, status: number, message: string) {
+    super(message);
+    this.name = 'OpError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+function kindFor(status: number): OpFailureKind {
+  if (status === 401) return 'auth';
+  if (status === 403) return 'forbidden';
+  if (status === 429 || status === 503 || status >= 500) return 'unavailable';
+  return 'error';
+}
+
+/**
+ * The single checked path every protected call must go through. Non-2xx THROWS
+ * an OpError rather than returning a body, so no caller can accidentally treat
+ * a refusal as data. A caller that wants to tolerate failure has to say so.
+ */
+export async function opJson<T = any>(path: string, init: RequestInit = {}): Promise<T> {
+  let res: Response;
+  try {
+    res = await opFetch(path, init);
+  } catch (e: any) {
+    // Transport failure is not "no data" either.
+    throw new OpError('unavailable', 0, e?.message || 'network error');
+  }
+  if (!res.ok) {
+    let detail = '';
+    try { detail = (await res.json())?.error || ''; } catch { /* body may not be JSON */ }
+    throw new OpError(kindFor(res.status), res.status,
+      detail || `HTTP ${res.status}`);
+  }
+  try {
+    return await res.json() as T;
+  } catch (e: any) {
+    throw new OpError('error', res.status, 'response was not valid JSON');
+  }
+}

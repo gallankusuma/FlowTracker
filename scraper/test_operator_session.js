@@ -14,11 +14,34 @@
 const assert = require('assert');
 const os = require('./modules/operator_session');
 
+// THE RUNNER AWAITS. The previous version called fn() without awaiting, so an
+// async test that threw resolved into an unhandled rejection AFTER the try/catch
+// had already counted it as a pass. Three audit tests were green while asserting
+// nothing, and the "23/23" figure that went into a commit message and the
+// remediation log was not evidence for those three.
+//
+// The self-check at the bottom is the part that matters: a runner nobody has
+// watched fail is a runner nobody should trust.
 let pass = 0, fail = 0;
-function test(name, fn) {
-  try { fn(); pass++; console.log(`  PASS  ${name}`); }
-  catch (e) { fail++; console.log(`  FAIL  ${name}\n        ${e.message}`); }
+const queue = [];
+function test(name, fn) { queue.push({ name, fn }); }
+
+async function runAll() {
+  for (const { name, fn } of queue) {
+    try {
+      await fn();                       // <- the whole point
+      pass++; console.log(`  PASS  ${name}`);
+    } catch (e) {
+      fail++; console.log(`  FAIL  ${name}\n        ${e.message}`);
+    }
+  }
 }
+
+// An unhandled rejection anywhere must not be swallowed into a green run.
+process.on('unhandledRejection', (e) => {
+  console.log(`  FAIL  <unhandled rejection>\n        ${e && e.message}`);
+  process.exit(1);
+});
 
 const REAL_KEY = 'test-admin-key-0123456789';
 process.env.ADMIN_API_KEY = REAL_KEY;
@@ -140,11 +163,22 @@ test('no cookie ever carries the admin key', () => {
   os.destroySession(s.sid);
 });
 
-test('Secure is set when the request arrived over TLS, and not otherwise', () => {
-  const s = os.createSession({ actor: 'operator' });
-  assert.ok(!/Secure/.test(os.cookieHeaders(s, { headers: {} })[0]), 'plain HTTP: no Secure');
-  const tls = os.cookieHeaders(s, { headers: { 'x-forwarded-proto': 'https' } })[0];
-  assert.ok(/Secure/.test(tls), 'behind a TLS proxy: Secure must be set');
+test('Secure follows the ACTUAL transport, not a header anyone can send', () => {
+  // This test previously asserted that `x-forwarded-proto: https` alone was
+  // enough. Correction 3 removed that, so the old assertion encoded the very
+  // defect being fixed — a caller could set the header on a plaintext
+  // connection and get Secure on a cookie the browser would then never send
+  // back. Updated to the corrected contract rather than relaxed.
+  const s = os.createSession({ ip: '1.2.3.4' });
+  const plain = { headers: {}, socket: {}, app: { get: () => false } };
+  const spoofed = { headers: { 'x-forwarded-proto': 'https' }, socket: {}, app: { get: () => false } };
+  const behindTrustedProxy = { headers: { 'x-forwarded-proto': 'https' }, socket: {}, app: { get: () => true } };
+  const realTls = { headers: {}, socket: { encrypted: true }, app: { get: () => false } };
+
+  assert.ok(!/Secure/.test(os.cookieHeaders(s, plain)[0]), 'plain HTTP: no Secure');
+  assert.ok(!/Secure/.test(os.cookieHeaders(s, spoofed)[0]), 'spoofed header must NOT set Secure');
+  assert.ok(/Secure/.test(os.cookieHeaders(s, behindTrustedProxy)[0]), 'trusted proxy: Secure');
+  assert.ok(/Secure/.test(os.cookieHeaders(s, realTls)[0]), 'real TLS socket: Secure');
   os.destroySession(s.sid);
 });
 
@@ -218,5 +252,140 @@ test('recordAudit swallows failure so a denial stays a denial', async () => {
   assert.strictEqual(id, null, 'a 401 must never be upgraded to a 503 by the audit path');
 });
 
-console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+console.log('\naudit fail-closed — missing infrastructure is a failure, not a pass');
+test('a MISSING POOL makes recordAttempt throw, so the middleware can refuse', async () => {
+  await assert.rejects(() => os.recordAttempt(null, {
+    actor: 'op', via: 'session', method: 'DELETE', route: '/x', outcome: 'ATTEMPTED', statusCode: 0,
+  }), /audit pool unavailable/, 'returning null here let the one unaudited configuration through');
+});
+
+test('a failed finalize is reported, not swallowed', async () => {
+  const broken = { query: async () => { throw new Error('update failed'); } };
+  assert.strictEqual(await os.finalizeAudit(broken, 7, 200), false);
+  assert.strictEqual(await os.finalizeAudit({ query: async () => [{}] }, 7, 200), true);
+});
+
+test('unfinalized rows are observable so they can be reconciled', async () => {
+  let seen = null;
+  const pool = { query: async (sql, params) => { seen = { sql, params }; return [[{ id: 9 }]]; } };
+  const rows = await os.findUnfinalized(pool, { olderThanMinutes: 5 });
+  assert.strictEqual(rows.length, 1);
+  assert.ok(/ATTEMPTED/.test(seen.sql) && /status_code = 0/.test(seen.sql),
+    'must look for admitted-but-unresolved rows specifically');
+});
+
+console.log('\nbrute force — this slice introduced the public login');
+test('failures accumulate and lock out after the bound', () => {
+  os._loginFailures.clear();
+  const id = '10.0.0.1';
+  for (let i = 0; i < os.LOGIN_MAX_FAILURES - 1; i++) os.recordLoginFailure(id);
+  assert.strictEqual(os.loginState(id).locked, false, 'must not lock before the bound');
+  os.recordLoginFailure(id);
+  const st = os.loginState(id);
+  assert.strictEqual(st.locked, true);
+  assert.ok(st.retryAfterMs > 0);
+});
+
+test('a successful login clears the counter, so real use never locks itself out', () => {
+  os._loginFailures.clear();
+  const id = '10.0.0.2';
+  os.recordLoginFailure(id); os.recordLoginFailure(id);
+  os.clearLoginFailures(id);
+  assert.strictEqual(os.loginState(id).remaining, os.LOGIN_MAX_FAILURES);
+});
+
+test('lockout expires, and the window rolls over', () => {
+  os._loginFailures.clear();
+  const id = '10.0.0.3';
+  for (let i = 0; i < os.LOGIN_MAX_FAILURES; i++) os.recordLoginFailure(id);
+  assert.strictEqual(os.loginState(id).locked, true);
+  assert.strictEqual(os.loginState(id, Date.now() + os.LOGIN_LOCKOUT_MS + 1000).locked, false);
+});
+
+test('clients are limited independently', () => {
+  os._loginFailures.clear();
+  for (let i = 0; i < os.LOGIN_MAX_FAILURES; i++) os.recordLoginFailure('10.0.0.4');
+  assert.strictEqual(os.loginState('10.0.0.4').locked, true);
+  assert.strictEqual(os.loginState('10.0.0.5').locked, false);
+});
+
+console.log('\nactor identity is server-derived, never caller-supplied');
+test('createSession ignores any actor the caller offers', () => {
+  const s = os.createSession({ actor: 'admin-impersonator', ip: '1.2.3.4' });
+  assert.ok(!s.actor.includes('impersonator'), `caller-supplied actor leaked: ${s.actor}`);
+  assert.ok(s.actor.startsWith('operator:'), s.actor);
+  os.destroySession(s.sid);
+});
+
+test('identity is a key fingerprint, and never the key itself', () => {
+  const a = os.serverActorIdentity();
+  assert.ok(a.startsWith('operator:key-'), a);
+  assert.ok(!a.includes(REAL_KEY), 'the key must not appear in the audit actor');
+});
+
+test('an explicit OPERATOR_IDENTITY label wins', () => {
+  process.env.OPERATOR_IDENTITY = 'gallan';
+  assert.strictEqual(os.serverActorIdentity(), 'operator:gallan');
+  delete process.env.OPERATOR_IDENTITY;
+});
+
+test('rotating the key changes the actor — it is a different credential', () => {
+  const before = os.serverActorIdentity();
+  process.env.ADMIN_API_KEY = REAL_KEY + '-rotated';
+  const after = os.serverActorIdentity();
+  process.env.ADMIN_API_KEY = REAL_KEY;
+  assert.notStrictEqual(before, after);
+});
+
+console.log('\nforwarded headers are not trusted without a configured proxy');
+const withApp = (trust, headers, socket = {}) => ({ headers, socket, app: { get: () => trust } });
+
+test('a spoofed X-Forwarded-For is IGNORED when no proxy is trusted', () => {
+  const ip = os.clientIp(withApp(false, { 'x-forwarded-for': '9.9.9.9' }, { remoteAddress: '10.1.1.1' }));
+  assert.strictEqual(ip, '10.1.1.1', 'audit IP must not be forgeable by a header');
+});
+
+test('X-Forwarded-For is honoured only when a proxy IS trusted', () => {
+  const ip = os.clientIp(withApp(true, { 'x-forwarded-for': '9.9.9.9, 10.0.0.1' }, { remoteAddress: '10.1.1.1' }));
+  assert.strictEqual(ip, '9.9.9.9');
+});
+
+test('a spoofed X-Forwarded-Proto cannot claim HTTPS on a plaintext socket', () => {
+  const req = withApp(false, { 'x-forwarded-proto': 'https' });
+  assert.strictEqual(os.requestIsSecure(req), false);
+  const [sess] = os.cookieHeaders({ sid: 'a', csrf: 'b', expiresAt: Date.now() + 1000 }, req);
+  assert.ok(!/Secure/.test(sess),
+    'Secure on a plaintext connection means the cookie is never sent back — a self-inflicted outage');
+});
+
+test('a real TLS socket is secure regardless of headers or proxy config', () => {
+  assert.strictEqual(os.requestIsSecure(withApp(false, {}, { encrypted: true })), true);
+});
+
+// ── the runner must be able to FAIL ─────────────────────────────────────────
+// Proved in-band, because the previous runner reported 23/23 while three async
+// tests asserted nothing, and a moment ago this file reported "0 passed" and
+// exited zero because nothing invoked the queue at all. A self-check that is
+// never exercised is the same class of mistake it exists to catch.
+async function selfCheck() {
+  let caught = false;
+  try { await (async () => { assert.strictEqual(1, 2, 'deliberate'); })(); }
+  catch { caught = true; }
+  if (!caught) {
+    console.log('  FAIL  <self-check> the runner cannot observe async failures');
+    process.exit(1);
+  }
+  if (queue.length === 0) {
+    console.log('  FAIL  <self-check> no tests were registered');
+    process.exit(1);
+  }
+  console.log(`  PASS  <self-check> runner observes async rejections; ${queue.length} tests registered`);
+  pass++;
+}
+
+runAll()
+  .then(selfCheck)
+  .then(() => {
+    console.log(`\n${pass} passed, ${fail} failed`);
+    process.exit(fail ? 1 : 0);
+  });

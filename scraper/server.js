@@ -4163,21 +4163,36 @@ app.get('/api/stockbit-status', async (req, res) => {
 // is obtained in the first place.
 app.post('/api/operator/login', async (req, res) => {
   const key = (req.body && req.body.key) || '';
-  const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').toString().split(',')[0].trim();
+  const ip = operatorSession.clientIp(req);
+  const limiterId = ip || 'unknown';
 
   if (!process.env.ADMIN_API_KEY) {
     return res.status(503).json({ error: 'ADMIN_API_KEY not configured on server' });
   }
+
+  // Brute-force gate BEFORE the comparison: a locked-out client must not even
+  // learn whether its guess was right, or the lockout leaks the answer.
+  const gate = operatorSession.loginState(limiterId);
+  if (gate.locked) {
+    operatorSession.recordAudit(pool, {
+      actor: 'anonymous', via: 'login', method: 'POST', route: '/api/operator/login',
+      target: null, outcome: 'DENIED', statusCode: 429, ip,
+    }).catch(() => {});
+    res.setHeader('Retry-After', Math.ceil(gate.retryAfterMs / 1000));
+    return res.status(429).json({ error: 'too many failed attempts', retryAfterMs: gate.retryAfterMs });
+  }
+
   if (!operatorSession.safeEqual(key, process.env.ADMIN_API_KEY)) {
-    // Failed logins are the ones worth having a record of.
+    const after = operatorSession.recordLoginFailure(limiterId);
     operatorSession.recordAudit(pool, {
       actor: 'anonymous', via: 'login', method: 'POST', route: '/api/operator/login',
       target: null, outcome: 'DENIED', statusCode: 401, ip,
     }).catch(() => {});
-    return res.status(401).json({ error: 'invalid operator key' });
+    return res.status(401).json({ error: 'invalid operator key', attemptsRemaining: after.remaining });
   }
 
-  const s = operatorSession.createSession({ actor: 'operator', ip });
+  operatorSession.clearLoginFailures(limiterId);
+  const s = operatorSession.createSession({ ip });
   operatorSession.recordAudit(pool, {
     actor: s.actor, via: 'login', method: 'POST', route: '/api/operator/login',
     target: null, outcome: 'ALLOWED', statusCode: 200, ip,
@@ -4196,7 +4211,7 @@ app.post('/api/operator/logout', (req, res) => {
     actor: existed ? 'operator' : 'anonymous', via: 'logout', method: 'POST',
     route: '/api/operator/logout', target: null,
     outcome: 'ALLOWED', statusCode: 200,
-    ip: (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').toString().split(',')[0].trim(),
+    ip: operatorSession.clientIp(req),
   }).catch(() => {});
   res.setHeader('Set-Cookie', operatorSession.clearCookieHeaders());
   res.json({ ok: true, revoked: existed });

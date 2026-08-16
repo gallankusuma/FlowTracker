@@ -54,6 +54,46 @@ const MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 /** sid -> { actor, csrf, createdAt, expiresAt, ip } */
 const sessions = new Map();
 
+// ── Brute-force protection for the public login (correction 1) ───────────────
+// This slice INTRODUCED a public endpoint that accepts a static key, so making
+// it expensive to guess belongs to this slice rather than to a later hardening
+// pass. Bounded, in-memory, keyed by client identity.
+//
+// Counting FAILURES only, and clearing on success, means a working operator is
+// never locked out by their own activity — the limiter exists to slow guessing,
+// not to punish use.
+const LOGIN_MAX_FAILURES = 5;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_LOCKOUT_MS = 15 * 60 * 1000;
+const loginFailures = new Map();   // id -> { count, first, lockedUntil }
+
+function loginState(id, at = Date.now()) {
+  const e = loginFailures.get(id);
+  if (!e) return { locked: false, remaining: LOGIN_MAX_FAILURES, retryAfterMs: 0 };
+  if (e.lockedUntil && e.lockedUntil > at) {
+    return { locked: true, remaining: 0, retryAfterMs: e.lockedUntil - at };
+  }
+  if (at - e.first > LOGIN_WINDOW_MS) {           // window rolled over
+    loginFailures.delete(id);
+    return { locked: false, remaining: LOGIN_MAX_FAILURES, retryAfterMs: 0 };
+  }
+  return { locked: false, remaining: Math.max(0, LOGIN_MAX_FAILURES - e.count), retryAfterMs: 0 };
+}
+
+function recordLoginFailure(id, at = Date.now()) {
+  const e = loginFailures.get(id);
+  if (!e || at - e.first > LOGIN_WINDOW_MS) {
+    loginFailures.set(id, { count: 1, first: at, lockedUntil: 0 });
+    return loginState(id, at);
+  }
+  e.count += 1;
+  if (e.count >= LOGIN_MAX_FAILURES) e.lockedUntil = at + LOGIN_LOCKOUT_MS;
+  loginFailures.set(id, e);
+  return loginState(id, at);
+}
+
+function clearLoginFailures(id) { loginFailures.delete(id); }
+
 function now() { return Date.now(); }
 function token(bytes = 32) { return crypto.randomBytes(bytes).toString('base64url'); }
 
@@ -100,13 +140,38 @@ function sweep() {
   for (const [sid, s] of sessions) if (s.expiresAt <= t) sessions.delete(sid);
 }
 
-function createSession({ actor, ip }) {
+/**
+ * ACTOR IDENTITY IS SERVER-DERIVED (correction 2).
+ *
+ * `operator` is a ROLE, not an identity — every session carried the same string,
+ * so the audit trail could say what was done but never by which credential. The
+ * actor is now derived from server-controlled configuration only: a label from
+ * `OPERATOR_IDENTITY` when set, otherwise a stable fingerprint of the configured
+ * key. Never from request input, which the caller controls and could therefore
+ * forge into someone else's name.
+ *
+ * The fingerprint is a truncated SHA-256 of the key, so it identifies WHICH
+ * credential was used without being reversible to the key itself. When the key
+ * is rotated the actor changes, which is the correct behaviour: it is a
+ * different credential.
+ */
+function serverActorIdentity() {
+  const label = (process.env.OPERATOR_IDENTITY || '').trim();
+  if (label) return `operator:${label.slice(0, 40)}`;
+  const key = process.env.ADMIN_API_KEY || '';
+  if (!key) return 'operator:unconfigured';
+  const fp = crypto.createHash('sha256').update(key).digest('hex').slice(0, 10);
+  return `operator:key-${fp}`;
+}
+
+function createSession({ ip } = {}) {
   sweep();
   const sid = token();
   const csrf = token(24);
-  const s = { actor: actor || 'operator', csrf, createdAt: now(), expiresAt: now() + SESSION_TTL_MS, ip: ip || null };
+  const actor = serverActorIdentity();          // never taken from the caller
+  const s = { actor, csrf, createdAt: now(), expiresAt: now() + SESSION_TTL_MS, ip: ip || null };
   sessions.set(sid, s);
-  return { sid, csrf, expiresAt: s.expiresAt, actor: s.actor };
+  return { sid, csrf, expiresAt: s.expiresAt, actor };
 }
 
 function getSession(sid) {
@@ -119,9 +184,46 @@ function getSession(sid) {
 
 function destroySession(sid) { return sessions.delete(sid); }
 
+/**
+ * CLIENT IDENTITY AND TRANSPORT, WITHOUT TRUSTING THE CALLER (correction 3).
+ *
+ * `x-forwarded-for` and `x-forwarded-proto` are set by anyone who can reach the
+ * port. Reading them unconditionally let an attacker write whatever IP they
+ * liked into the audit trail and claim HTTPS on a plaintext connection — which
+ * would have set `Secure` on a cookie that then never gets sent back.
+ *
+ * They are honoured ONLY when Express is configured to trust a proxy
+ * (`app.set('trust proxy', …)`, surfaced as `req.app.get('trust proxy')`), which
+ * is a deployment statement the operator makes deliberately. Otherwise the
+ * direct socket wins — it cannot be forged by a header.
+ */
+function proxyIsTrusted(req) {
+  try { return Boolean(req && req.app && req.app.get && req.app.get('trust proxy')); }
+  catch { return false; }
+}
+
+function clientIp(req) {
+  if (!req) return null;
+  if (proxyIsTrusted(req)) {
+    const fwd = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    if (fwd) return fwd;
+  }
+  return (req.socket && req.socket.remoteAddress) || null;
+}
+
+function requestIsSecure(req) {
+  if (!req) return false;
+  if (req.socket && req.socket.encrypted) return true;      // real TLS, unforgeable
+  if (proxyIsTrusted(req)) {
+    if (req.secure) return true;
+    return String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim() === 'https';
+  }
+  return false;
+}
+
 /** Cookie attributes. Secure is set only when the request actually arrived over TLS. */
 function cookieHeaders({ sid, csrf, expiresAt }, req) {
-  const secure = req && (req.secure || String(req.headers['x-forwarded-proto'] || '').startsWith('https'));
+  const secure = requestIsSecure(req);
   const maxAge = Math.max(0, Math.floor((expiresAt - now()) / 1000));
   const base = `Path=/; SameSite=Strict; Max-Age=${maxAge}` + (secure ? '; Secure' : '');
   return [
@@ -203,7 +305,11 @@ function authorize(req) {
  * The real response status replaces the placeholder on `res.finish`.
  */
 async function recordAttempt(pool, entry) {
-  if (!pool) return null;
+  // A MISSING POOL IS A FAILURE, NOT A PASS. The first version returned null
+  // here, which the middleware read as "nothing to do" and let the mutation
+  // through — so the one configuration where auditing is completely absent was
+  // also the one configuration that skipped the fail-closed check entirely.
+  if (!pool) throw new Error('audit pool unavailable');
   const [r] = await pool.query(
     `INSERT INTO ft_operator_audit
        (actor, via, method, route, target, outcome, status_code, ip, created_at)
@@ -224,18 +330,47 @@ async function recordAudit(pool, entry) {
   }
 }
 
-/** Stamp the real outcome once the response is actually finished. */
+/**
+ * Stamp the real outcome once the response is actually finished.
+ *
+ * A row that never gets finalized stays `ATTEMPTED` with status 0. That is
+ * deliberate and is the reconcilable state the review asked for: it means "this
+ * mutation was admitted and we never learned how it ended", which is a different
+ * and more alarming fact than "it failed". `findUnfinalized()` below makes those
+ * rows observable so they can be reconciled rather than sitting unnoticed.
+ */
 async function finalizeAudit(pool, id, statusCode) {
-  if (!pool || !id) return;
+  if (!pool || !id) return false;
   const outcome = statusCode >= 200 && statusCode < 400 ? 'ALLOWED' : 'FAILED';
   try {
     await pool.query(
       'UPDATE ft_operator_audit SET status_code = ?, outcome = ? WHERE id = ?',
       [statusCode, outcome, id]
     );
+    return true;
   } catch (e) {
-    console.error('[audit] FAILED to finalize audit row', id, e.message);
+    // Loud, and reported to the caller — a silent false here is how an
+    // unfinalized row would become invisible.
+    console.error('[audit] UNFINALIZED audit row', id, '— reconcile required:', e.message);
+    return false;
   }
+}
+
+/**
+ * Admitted mutations whose outcome was never recorded. Exposed so the gap is
+ * observable and retryable instead of being a hole nobody can see.
+ */
+async function findUnfinalized(pool, { olderThanMinutes = 5, limit = 100 } = {}) {
+  if (!pool) return [];
+  const [rows] = await pool.query(
+    `SELECT id, actor, via, method, route, target, created_at
+       FROM ft_operator_audit
+      WHERE outcome = 'ATTEMPTED' AND status_code = 0
+        AND created_at < (NOW() - INTERVAL ? MINUTE)
+      ORDER BY id DESC LIMIT ?`,
+    [olderThanMinutes, limit]
+  );
+  return rows;
 }
 
 async function ensureAuditTable(pool) {
@@ -272,7 +407,7 @@ function requireOperator(pool) {
       verdict = { ok: false, status: 401, reason: 'malformed credentials' };
     }
 
-    const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').toString().split(',')[0].trim();
+    const ip = clientIp(req);
     const method = String(req.method || '').toUpperCase();
     const entry = {
       actor: verdict.ok ? verdict.actor : 'anonymous',
@@ -315,6 +450,9 @@ module.exports = {
   COOKIE_SESSION, COOKIE_CSRF, HEADER_CSRF, HEADER_KEY, SESSION_TTL_MS,
   createSession, getSession, destroySession, authorize, requireOperator,
   cookieHeaders, clearCookieHeaders, parseCookies, safeEqual,
-  ensureAuditTable, recordAudit, recordAttempt, finalizeAudit,
-  _sessions: sessions,
+  ensureAuditTable, recordAudit, recordAttempt, finalizeAudit, findUnfinalized,
+  serverActorIdentity, clientIp, requestIsSecure, proxyIsTrusted,
+  loginState, recordLoginFailure, clearLoginFailures,
+  LOGIN_MAX_FAILURES, LOGIN_WINDOW_MS, LOGIN_LOCKOUT_MS,
+  _sessions: sessions, _loginFailures: loginFailures,
 };

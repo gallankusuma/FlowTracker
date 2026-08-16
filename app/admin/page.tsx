@@ -3,7 +3,7 @@ import Navbar from "@/components/Navbar";
 import SectorsApiPanel from "@/components/SectorsApiPanel";
 import TampermonkeyPanel from "@/components/TampermonkeyPanel";
 import { API_BASE } from "@/lib/apiConfig";
-import { opFetch, whoami, login, logout, type OperatorState } from "@/lib/operatorSession";
+import { opFetch, opJson, OpError, whoami, login, logout, type OperatorState } from "@/lib/operatorSession";
 import { useState, useEffect, useRef } from "react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -55,10 +55,31 @@ export default function AdminDataHub() {
   const [opKey, setOpKey]     = useState("");
   const [opError, setOpError] = useState("");
   const [opBusy, setOpBusy]   = useState(false);
+  const [dataError, setDataError] = useState("");
 
-  const loadOperatorData = () => {
-    opFetch(`/api/admin/broker-config`).then(r => r.json()).then(d => setBrokerCfg(d.data || [])).catch(() => {});
-    opFetch(`/api/admin/watchlist`).then(r => r.json()).then(d => setWatchlist(d.data || [])).catch(() => {});
+  // A refused or unavailable read leaves the previous data in place and raises a
+  // banner. Overwriting it with [] would render "no brokers configured", which is
+  // a claim about the DATA rather than about the connection.
+  const handleOpFailure = (e: unknown, what: string) => {
+    const err = e instanceof OpError ? e : new OpError("error", 0, String(e));
+    if (err.kind === "auth") { setOp({ authenticated: false }); setDataError(""); return; }
+    setDataError(
+      err.kind === "forbidden"   ? `${what}: not permitted for this operator (${err.status})` :
+      err.kind === "unavailable" ? `${what}: backend unavailable (${err.status || "no response"}) - data shown may be stale` :
+                                   `${what}: ${err.message}`
+    );
+  };
+
+  const loadOperatorData = async () => {
+    setDataError("");
+    try {
+      const d = await opJson<{ data: BrokerConfig[] }>(`/api/admin/broker-config`);
+      setBrokerCfg(d.data || []);
+    } catch (e) { handleOpFailure(e, "Broker config"); }
+    try {
+      const d = await opJson<{ data: WatchItem[] }>(`/api/admin/watchlist`);
+      setWatchlist(d.data || []);
+    } catch (e) { handleOpFailure(e, "Watchlist"); }
   };
 
   useEffect(() => {
@@ -75,13 +96,20 @@ export default function AdminDataHub() {
 
   const handleOperatorLogin = async () => {
     setOpBusy(true); setOpError("");
-    const r = await login(opKey);
-    if (!r.ok) { setOpError(r.error || "login failed"); setOpBusy(false); return; }
-    setOpKey("");                       // never keep the key around after the exchange
-    const state = await whoami();
-    setOp(state);
-    if (state.authenticated) loadOperatorData();
-    setOpBusy(false);
+    try {
+      const r = await login(opKey);
+      if (!r.ok) { setOpError(r.error || "login failed"); return; }
+      setOpKey("");                     // never keep the key around after the exchange
+      const state = await whoami();
+      setOp(state);
+      if (state.authenticated) await loadOperatorData();
+    } catch (e: any) {
+      // Transport failure previously left opBusy true forever, disabling the
+      // form with no way back except a page reload.
+      setOpError(e?.message || "could not reach the server");
+    } finally {
+      setOpBusy(false);
+    }
   };
 
   const handleOperatorLogout = async () => {
@@ -102,20 +130,28 @@ export default function AdminDataHub() {
     if (!updates.length) return;
     setBrokerSaving(true);
     try {
-      await opFetch(`/api/admin/broker-config/bulk`, {
+      await opJson(`/api/admin/broker-config/bulk`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ updates }),
       });
-      // Refresh and reload config
-      const d = await opFetch(`/api/admin/broker-config`).then(r => r.json());
+      const d = await opJson<{ data: BrokerConfig[] }>(`/api/admin/broker-config`);
       setBrokerCfg(d.data || []);
-      setBrokerDirty({});
-      await opFetch(`/api/admin/reload-config`, { method: "POST" });
+      setBrokerDirty({});               // cleared only after the write really succeeded
+      await opJson(`/api/admin/reload-config`, { method: "POST" });
       setReloadMsg("✅ Broker config saved & server reloaded!");
       setTimeout(() => setReloadMsg(""), 3000);
-    } catch (e) { setReloadMsg("❌ Save failed"); }
-    setBrokerSaving(false);
+    } catch (e) {
+      // Pending edits are DELIBERATELY kept: a rejected write must not read as a
+      // save that produced no change, and the operator must not lose work.
+      const err = e instanceof OpError ? e : null;
+      setReloadMsg(err?.kind === "auth" ? "🔒 Session expired - sign in again"
+                 : err?.kind === "forbidden" ? "⛔ Not permitted"
+                 : `❌ Save failed - ${err?.message || "unknown error"}`);
+      if (err?.kind === "auth") setOp({ authenticated: false });
+    } finally {
+      setBrokerSaving(false);
+    }
   };
 
   const filteredBrokers = brokerCfg.filter(b => {
@@ -128,33 +164,43 @@ export default function AdminDataHub() {
   // ── Watchlist helpers ───────────────────────────────────────────────────────
   const handleToggleWatch = async (ticker: string, active: number) => {
     setWatchSaving(true);
-    await opFetch(`/api/admin/watchlist/${ticker}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ active: active ? 0 : 1 }),
-    });
-    const d = await opFetch(`/api/admin/watchlist`).then(r => r.json());
-    setWatchlist(d.data || []);
-    setWatchSaving(false);
+    try {
+      await opJson(`/api/admin/watchlist/${ticker}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ active: active ? 0 : 1 }),
+      });
+      const d = await opJson<{ data: WatchItem[] }>(`/api/admin/watchlist`);
+      setWatchlist(d.data || []);
+    } catch (e) { handleOpFailure(e, `Toggle ${ticker}`); }
+    finally { setWatchSaving(false); }
   };
 
   const handleAddTicker = async () => {
     if (!newTicker.trim()) return;
     setWatchSaving(true);
-    await opFetch(`/api/admin/watchlist`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ticker: newTicker.trim().toUpperCase(), sector: newSector }),
-    });
-    const d = await opFetch(`/api/admin/watchlist`).then(r => r.json());
-    setWatchlist(d.data || []);
-    setNewTicker(""); setNewSector("");
-    setWatchSaving(false);
+    try {
+      await opJson(`/api/admin/watchlist`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticker: newTicker.trim().toUpperCase(), sector: newSector }),
+      });
+      const d = await opJson<{ data: WatchItem[] }>(`/api/admin/watchlist`);
+      setWatchlist(d.data || []);
+      setNewTicker(""); setNewSector("");   // cleared only on a real success
+    } catch (e) { handleOpFailure(e, `Add ${newTicker.trim().toUpperCase()}`); }
+    finally { setWatchSaving(false); }
   };
 
   const handleReloadConfig = async () => {
-    const r = await opFetch(`/api/admin/reload-config`, { method: "POST" }).then(r => r.json());
-    setReloadMsg(`✅ Reloaded — ${r.watchlist} saham, ${r.foreign?.length || 0} foreign, ${r.bigMoney?.length || 0} bigMoney`);
+    try {
+      const r = await opJson<any>(`/api/admin/reload-config`, { method: "POST" });
+      setReloadMsg(`✅ Reloaded — ${r.watchlist} saham, ${r.foreign?.length || 0} foreign, ${r.bigMoney?.length || 0} bigMoney`);
+    } catch (e) {
+      const err = e instanceof OpError ? e : null;
+      setReloadMsg(`❌ Reload failed - ${err?.message || "unknown error"}`);
+      if (err?.kind === "auth") setOp({ authenticated: false });
+    }
     setTimeout(() => setReloadMsg(""), 5000);
   };
 
@@ -246,6 +292,13 @@ export default function AdminDataHub() {
           <h1 style={{ fontSize: 26, fontWeight: 900, fontFamily: "'Space Grotesk', sans-serif", marginBottom: 6 }}>
             ⚙️ Admin Panel
           </h1>
+          {dataError && (
+            <div role="alert" style={{ marginBottom: 10, padding: "8px 12px", borderRadius: 8, fontSize: 12,
+              background: "rgba(248,81,73,0.12)", color: "var(--accent-red, #f85149)",
+              border: "1px solid rgba(248,81,73,0.35)" }}>
+              ⚠️ {dataError}
+            </div>
+          )}
           <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8 }}>
             <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: 20, fontWeight: 700,
               background: "rgba(63,185,80,0.15)", color: "var(--accent-green, #3fb950)" }}>

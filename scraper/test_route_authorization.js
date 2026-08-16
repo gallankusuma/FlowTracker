@@ -43,9 +43,9 @@ const PUBLIC_MUTATIONS = {
   'POST /api/operator/login':
     'This is how an operator session is OBTAINED, so requiring one would be ' +
     'circular. It verifies ADMIN_API_KEY in constant time, returns 401 on ' +
-    'mismatch and 503 when the key is unconfigured, and both outcomes are ' +
-    'audited. Not rate-limited yet — that is P0-01 remediation item 4, outside ' +
-    'the FT-P0-01A slice, and is recorded rather than assumed handled.',
+    'mismatch, 503 when the key is unconfigured and 429 once a client exceeds ' +
+    'the failure bound, and every outcome is audited. Brute-force protection is ' +
+    'part of this slice, not deferred: the slice introduced the endpoint.',
 
   'POST /api/operator/logout':
     'Destroys only the session named by the caller own httpOnly cookie, so it ' +
@@ -156,6 +156,42 @@ test('requireAdminKey is defined before any route uses it', () => {
   const firstUse = routes.filter(r => r.guard === 'requireAdminKey')
     .reduce((m, r) => Math.min(m, r.line), Infinity);
   assert.ok(def + 1 < firstUse, 'requireAdminKey must be defined before its first use');
+});
+
+test('requireOperator is defined before any route uses it', () => {
+  // Correction 5. The ratchet previously proved this only for requireAdminKey,
+  // so `requireOperator` could have been referenced-but-undefined and the suite
+  // would still have been green — which is exactly what happened once during
+  // this task: seven routes referenced an identifier the module never declared,
+  // and `node --check` cannot see an unresolved name.
+  const def = lines.findIndex(l => /const requireOperator\s*=/.test(l));
+  assert.ok(def >= 0, 'requireOperator is not defined in server.js');
+  const firstUse = routes.filter(r => r.guard === 'requireOperator')
+    .reduce((m, r) => Math.min(m, r.line), Infinity);
+  assert.ok(firstUse !== Infinity, 'no route uses requireOperator — the slice is not wired');
+  assert.ok(def + 1 < firstUse, 'requireOperator must be defined before its first use');
+});
+
+test('requireOperator DELEGATES to the tested boundary, not to a local lookalike', () => {
+  // A middleware named requireOperator that quietly waved everything through
+  // would satisfy every other check in this file. So the ratchet insists it
+  // resolves to modules/operator_session, which is the thing under test in
+  // test_operator_session.js.
+  const i = lines.findIndex(l => /const requireOperator\s*=/.test(l));
+  const decl = lines.slice(i, i + 4).join('\n');
+  assert.ok(/operatorSession\.requireOperator\s*\(/.test(decl),
+    'requireOperator must delegate to modules/operator_session.requireOperator');
+  assert.ok(/require\(['"]\.\/modules\/operator_session['"]\)/.test(src),
+    'server.js must import modules/operator_session');
+});
+
+test('the operator boundary itself refuses, and its refusals are the tested ones', () => {
+  const mod = fs.readFileSync(path.join(__dirname, 'modules', 'operator_session.js'), 'utf8');
+  assert.ok(/timingSafeEqual/.test(mod), 'credential comparison must be constant time');
+  assert.ok(/status:\s*401/.test(mod), 'must refuse unauthenticated callers with 401');
+  assert.ok(/status:\s*403/.test(mod), 'must refuse missing/mismatched CSRF with 403');
+  assert.ok(/status:\s*503/.test(mod), 'must refuse when ADMIN_API_KEY is unconfigured');
+  assert.ok(/audit pool unavailable/.test(mod), 'mutations must fail closed without audit');
 });
 
 test('the guard actually rejects, rather than merely existing', () => {

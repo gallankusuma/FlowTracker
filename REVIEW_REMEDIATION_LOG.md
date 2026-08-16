@@ -156,6 +156,19 @@ and break the cron and CLI callers. The CSRF token is compared against the
 **session**, not against the cookie: the usual double-submit mistake passes for
 anyone able to write both.
 
+**Dispatch 2026-08-16-02 returned this PARTIAL with seven corrections. All seven
+are done, each with a test that fails without the fix:**
+
+| # | Correction | Where |
+|---|------------|-------|
+| 1 | Brute-force bound on `/api/operator/login` — 5 failures per client, 15-minute window and lockout, `429` with `attemptsRemaining` | `operator_session.js` `loginState` |
+| 2 | Actor identity bound server-side; a caller can no longer name itself. The audit records a key **fingerprint**, never the key | `serverActorIdentity()` |
+| 3 | `Secure` set from the real socket, not from a spoofable `X-Forwarded-Proto`; `X-Forwarded-For` honoured only behind a trusted proxy | `requestIsSecure`/`clientIp` |
+| 4 | Test runner actually awaits, plus coverage for a missing pool and for unfinalized audit rows | `test_operator_session.js` |
+| 5 | Ratchet now proves `requireOperator` is defined before use **and delegates to the tested module** — a local lookalike that waved everything through would have satisfied every other check | `test_route_authorization.js` |
+| 6 | UI stopped treating refusals as data. `opJson()` throws a typed `OpError`; 401/403/503 no longer arrive as `d.data \|\| []`, which rendered "no brokers configured" — a claim about the data — when the truth was "you are signed out". Pending edits survive a rejected write | `lib/operatorSession.ts`, `app/admin/page.tsx` |
+| 7 | Browser transport resolved and the click-path actually driven — see below | this entry |
+
 **Evidence, live against `76.13.22.155:3100` after deploy.**
 
 Unauthorized — all eight routes in the slice:
@@ -197,9 +210,15 @@ in UI copy on `app/awo-dashboard/page.tsx`, which is the legacy
 touched, but it is exactly the pattern this task replaces and is the obvious next
 migration.
 
-Suites: `test_operator_session.js` 23/23, `test_route_authorization.js` 7/7, full
-unit suite **482 passing, 0 failing** across 22 files. Frontend production build
-compiled successfully, 30/30 static pages.
+Suites: `test_operator_session.js` **39/39**, `test_route_authorization.js`
+**10/10**. Frontend production build compiled successfully, 30/30 static pages.
+
+The `23/23` figure previously printed here was not evidence. Codex found the
+runner was `try { fn() }` with no `await`, so every async test resolved after the
+`catch` had already gone by; a deliberately broken probe (`assert.strictEqual(1,
+2)`) still reported PASS. The runner now awaits each case, and carries a
+self-check that registers a rejecting test and asserts the runner sees it —
+so the suite proves it can fail before it claims anything passed.
 
 **Scope kept narrow.** No route on the pending list was touched.
 `/api/admin/reload-config` was included because `handleSaveBrokers()` calls it
@@ -207,14 +226,93 @@ immediately after a bulk save, so leaving it on the key guard would have
 half-broken the very flow being migrated; it was already guarded, so the pending
 count is unaffected — it moved from key to session, it was not opened.
 
-**Not verified, and stated rather than implied:** the browser UI flow end to end.
-`npm run dev` returns HTTP 500 from `app/globals.css:1322` (P1-02), so the page
-could not be exercised in a live browser. The production build passes and every
-server-side behaviour above is verified by request, but the click-path is
-unproven. Related: with no `CORS_ALLOWED_ORIGINS` set, the API still answers
-`Access-Control-Allow-Origin: *`, and browsers refuse to send cookies to a
-wildcard origin — so the browser session needs either the same-origin routing
-FT-P0-02 is heading for, or that variable set. Machine callers are unaffected.
+**Browser click-path — now actually driven, 2026-08-16.**
+
+The previous entry said the click-path was unproven and offered a compiled build
+in its place. Codex correctly refused that, so it was driven for real.
+
+*Rig.* Production build served on `localhost:3210`; a throwaway instance of the
+API on an isolated port, reached through an SSH tunnel so the page and the API
+are **same-site**. That detail is not incidental — see the finding below. The
+throwaway instance ran with its own one-shot key and with the daily cron and the
+600-ticker Yahoo warm-up patched out, because a temporary process must not
+schedule work. The live process on 3100 was never restarted, and the temporary
+copy was deleted afterwards. The production `ADMIN_API_KEY` was never used.
+
+*Observed, in order, in the browser:*
+
+```
+/admin unauthenticated      -> operator sign-in gate renders; the panel does not
+sign in, wrong key          -> "invalid operator key"; panel still withheld
+sign in, correct key        -> panel renders, header reads operator:optest-c7
+Watchlist tab               -> 122 active / 122 total, read via the session
+click "Nonaktifkan" BBTN    -> 121 active / 122; row flips to NONAKTIF
+click "Aktifkan" BBTN       -> 122 active / 122  (state restored)
+click "sign out"            -> gate returns
+```
+
+*Network, same run* — every mutation preflighted, then carried the cookie:
+
+```
+GET  /api/operator/whoami        401     POST /api/operator/login    401  (wrong key)
+POST /api/operator/login         200     GET  /api/operator/whoami   200
+GET  /api/admin/broker-config    200     GET  /api/admin/watchlist   200
+OPTIONS /api/admin/watchlist/BBTN 204 -> PUT /api/admin/watchlist/BBTN 200   (x2)
+```
+
+*Storage, read from the page while signed in* — this is the acceptance criterion
+that is easiest to pass by accident and hardest to notice failing:
+
+```
+localStorage                     (empty)
+sessionStorage                   (empty)
+document.cookie                  ft_csrf=... only
+ft_op readable by JS             false      <- httpOnly holds
+operator key anywhere in storage/URL   false
+```
+
+*Logout is a real revocation, not a UI state change.* After signing out, a direct
+`fetch` from the page returned **401** for both the read and `whoami`, and a
+mutation **replayed with the still-valid-looking CSRF token** was refused
+`401 no valid operator session`. A logout that only hides the panel is the
+fail-open version of this feature, so it was tested as a server question.
+
+*The audit trail recorded the whole path, denials included:*
+
+```
+anonymous          none     GET /api/admin/watchlist      DENIED  401
+anonymous          login    POST /api/operator/login      DENIED  401
+operator:optest-c7 login    POST /api/operator/login      ALLOWED 200
+operator:optest-c7 session  PUT /api/admin/watchlist/BBTN ALLOWED 200   (x2, target BBTN)
+operator           logout   POST /api/operator/logout     ALLOWED 200
+anonymous          none     PUT /api/admin/watchlist/BBTN DENIED  401
+```
+
+**A finding that changes the choice the review offered.** The dispatch allowed
+"explicit CORS allowlist **or** same-origin route". Only the second works. The
+session cookie is `SameSite=Strict`, so no CORS grant can make a browser send it
+cross-site — CORS governs whether a response may be *read*, never whether a
+cookie is *sent*. A CORS allowlist is therefore sufficient only when the frontend
+is already same-site with the API, which is the case this rig had to construct.
+The allowlist half was verified anyway and behaves correctly: an allowlisted
+origin is echoed back with `Access-Control-Allow-Credentials: true`, and a
+non-allowlisted origin receives **no** `Access-Control-Allow-Origin` header at
+all. No code change was needed — `cors` already reflects when given an array.
+
+This makes **FT-P0-02 a prerequisite for the browser half of every future slice**,
+not an independent item: today `API_BASE` resolves to `/scraper-api`, and no nginx
+site on the box proxies that path, so the production page has no working route to
+the API at all. Machine callers on `x-admin-key` are unaffected throughout.
+
+**Deploy status: NOT deployed, deliberately.** `predeploy_check.sh` ends in
+`SOMETHING FAILED — do not deploy`. The failure is `verify_strategy_book.js`
+(*"every per-date target book, open and close matches"*, *"overall hash matches"* —
+15 passed, 2 failed) and it is **pre-existing**: the VPS files were restored to
+their as-found hashes and the fixture still fails identically, so it is not caused
+by this slice. Every other suite in the gate reports 0 failures. The gate was
+honoured — the running process on 3100 was left untouched and the corrected files
+were rolled back off the box, so disk and memory still agree. This work deploys
+when the golden fixture is resolved (open finding, 2026-08-11).
 
 ---
 
