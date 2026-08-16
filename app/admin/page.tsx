@@ -3,6 +3,7 @@ import Navbar from "@/components/Navbar";
 import SectorsApiPanel from "@/components/SectorsApiPanel";
 import TampermonkeyPanel from "@/components/TampermonkeyPanel";
 import { API_BASE } from "@/lib/apiConfig";
+import { opFetch, whoami, login, logout, type OperatorState } from "@/lib/operatorSession";
 import { useState, useEffect, useRef } from "react";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -49,11 +50,45 @@ export default function AdminDataHub() {
   const [watchSaving, setWatchSaving]   = useState(false);
   const [reloadMsg, setReloadMsg]       = useState("");
 
+  // ── Operator session (FT-P0-01A) ────────────────────────────────────────────
+  const [op, setOp]           = useState<OperatorState | null>(null);  // null = still checking
+  const [opKey, setOpKey]     = useState("");
+  const [opError, setOpError] = useState("");
+  const [opBusy, setOpBusy]   = useState(false);
+
+  const loadOperatorData = () => {
+    opFetch(`/api/admin/broker-config`).then(r => r.json()).then(d => setBrokerCfg(d.data || [])).catch(() => {});
+    opFetch(`/api/admin/watchlist`).then(r => r.json()).then(d => setWatchlist(d.data || [])).catch(() => {});
+  };
+
   useEffect(() => {
+    // /api/health is public and stays a plain fetch.
     fetch(`${API_BASE}/api/health`).then(r => r.json()).then(d => setHealth(d)).catch(() => setHealth({ status: "offline" }));
-    fetch(`${API_BASE}/api/admin/broker-config`).then(r => r.json()).then(d => setBrokerCfg(d.data || [])).catch(() => {});
-    fetch(`${API_BASE}/api/admin/watchlist`).then(r => r.json()).then(d => setWatchlist(d.data || [])).catch(() => {});
+    // Protected data is requested only AFTER a session is confirmed. Firing it
+    // unconditionally would spray 401s and write a denial into the audit trail on
+    // every page load, burying the denials that actually matter.
+    whoami().then(state => {
+      setOp(state);
+      if (state.authenticated) loadOperatorData();
+    });
   }, []);
+
+  const handleOperatorLogin = async () => {
+    setOpBusy(true); setOpError("");
+    const r = await login(opKey);
+    if (!r.ok) { setOpError(r.error || "login failed"); setOpBusy(false); return; }
+    setOpKey("");                       // never keep the key around after the exchange
+    const state = await whoami();
+    setOp(state);
+    if (state.authenticated) loadOperatorData();
+    setOpBusy(false);
+  };
+
+  const handleOperatorLogout = async () => {
+    await logout();
+    setOp({ authenticated: false });
+    setBrokerCfg([]); setWatchlist([]);
+  };
 
   // ── Broker Config helpers ───────────────────────────────────────────────────
   const getBrokerCat = (code: string) => brokerDirty[code] || (brokerCfg.find(b => b.code === code)?.category || "RITEL");
@@ -67,16 +102,16 @@ export default function AdminDataHub() {
     if (!updates.length) return;
     setBrokerSaving(true);
     try {
-      await fetch(`${API_BASE}/api/admin/broker-config/bulk`, {
+      await opFetch(`/api/admin/broker-config/bulk`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ updates }),
       });
       // Refresh and reload config
-      const d = await fetch(`${API_BASE}/api/admin/broker-config`).then(r => r.json());
+      const d = await opFetch(`/api/admin/broker-config`).then(r => r.json());
       setBrokerCfg(d.data || []);
       setBrokerDirty({});
-      await fetch(`${API_BASE}/api/admin/reload-config`, { method: "POST" });
+      await opFetch(`/api/admin/reload-config`, { method: "POST" });
       setReloadMsg("✅ Broker config saved & server reloaded!");
       setTimeout(() => setReloadMsg(""), 3000);
     } catch (e) { setReloadMsg("❌ Save failed"); }
@@ -93,12 +128,12 @@ export default function AdminDataHub() {
   // ── Watchlist helpers ───────────────────────────────────────────────────────
   const handleToggleWatch = async (ticker: string, active: number) => {
     setWatchSaving(true);
-    await fetch(`${API_BASE}/api/admin/watchlist/${ticker}`, {
+    await opFetch(`/api/admin/watchlist/${ticker}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ active: active ? 0 : 1 }),
     });
-    const d = await fetch(`${API_BASE}/api/admin/watchlist`).then(r => r.json());
+    const d = await opFetch(`/api/admin/watchlist`).then(r => r.json());
     setWatchlist(d.data || []);
     setWatchSaving(false);
   };
@@ -106,19 +141,19 @@ export default function AdminDataHub() {
   const handleAddTicker = async () => {
     if (!newTicker.trim()) return;
     setWatchSaving(true);
-    await fetch(`${API_BASE}/api/admin/watchlist`, {
+    await opFetch(`/api/admin/watchlist`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ticker: newTicker.trim().toUpperCase(), sector: newSector }),
     });
-    const d = await fetch(`${API_BASE}/api/admin/watchlist`).then(r => r.json());
+    const d = await opFetch(`/api/admin/watchlist`).then(r => r.json());
     setWatchlist(d.data || []);
     setNewTicker(""); setNewSector("");
     setWatchSaving(false);
   };
 
   const handleReloadConfig = async () => {
-    const r = await fetch(`${API_BASE}/api/admin/reload-config`, { method: "POST" }).then(r => r.json());
+    const r = await opFetch(`/api/admin/reload-config`, { method: "POST" }).then(r => r.json());
     setReloadMsg(`✅ Reloaded — ${r.watchlist} saham, ${r.foreign?.length || 0} foreign, ${r.bigMoney?.length || 0} bigMoney`);
     setTimeout(() => setReloadMsg(""), 5000);
   };
@@ -147,6 +182,61 @@ export default function AdminDataHub() {
 
   const dirtyCount = Object.keys(brokerDirty).length;
 
+  // ── Operator gate ───────────────────────────────────────────────────────────
+  // Rendered INSTEAD of the panel, not alongside it. The server refuses either
+  // way — this exists so an unauthenticated operator sees why the panel is empty
+  // rather than a working-looking screen with no data in it, which is the
+  // fail-closed UI rule the review asked for elsewhere.
+  if (op === null || !op.authenticated) {
+    return (
+      <>
+        <Navbar />
+        <main style={{ maxWidth: 460, margin: "0 auto", padding: "64px 16px" }}>
+          <h1 style={{ fontSize: 22, fontWeight: 900, fontFamily: "'Space Grotesk', sans-serif", marginBottom: 8 }}>
+            🔐 Operator sign-in
+          </h1>
+          {op === null ? (
+            <div style={{ fontSize: 13, opacity: 0.7 }}>Checking session…</div>
+          ) : (
+            <>
+              <p style={{ fontSize: 13, opacity: 0.75, marginBottom: 18, lineHeight: 1.6 }}>
+                The Admin panel changes broker classification and the tracked watchlist,
+                so it needs an operator session. Your key is exchanged for a session
+                cookie and is never stored in this browser.
+              </p>
+              <input
+                type="password"
+                value={opKey}
+                onChange={e => setOpKey(e.target.value)}
+                onKeyDown={e => { if (e.key === "Enter" && opKey && !opBusy) handleOperatorLogin(); }}
+                placeholder="Operator key"
+                autoComplete="off"
+                style={{ width: "100%", padding: "10px 12px", borderRadius: 8, fontSize: 14,
+                  border: "1px solid var(--border, #30363d)", background: "var(--bg-elevated, #161b22)",
+                  color: "inherit", marginBottom: 10 }}
+              />
+              <button
+                onClick={handleOperatorLogin}
+                disabled={!opKey || opBusy}
+                style={{ width: "100%", padding: "10px 12px", borderRadius: 8, fontWeight: 700,
+                  fontSize: 14, cursor: opKey && !opBusy ? "pointer" : "not-allowed",
+                  background: "var(--accent-blue, #2f81f7)", color: "#fff", border: "none",
+                  opacity: opKey && !opBusy ? 1 : 0.5 }}
+              >
+                {opBusy ? "Signing in…" : "Sign in"}
+              </button>
+              {opError && (
+                <div style={{ marginTop: 12, fontSize: 12, color: "var(--accent-red, #f85149)" }}>
+                  {opError}
+                </div>
+              )}
+            </>
+          )}
+        </main>
+      </>
+    );
+  }
+
   return (
     <>
       <Navbar />
@@ -156,6 +246,18 @@ export default function AdminDataHub() {
           <h1 style={{ fontSize: 26, fontWeight: 900, fontFamily: "'Space Grotesk', sans-serif", marginBottom: 6 }}>
             ⚙️ Admin Panel
           </h1>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8 }}>
+            <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: 20, fontWeight: 700,
+              background: "rgba(63,185,80,0.15)", color: "var(--accent-green, #3fb950)" }}>
+              operator: {op.actor}
+            </span>
+            <button onClick={handleOperatorLogout}
+              style={{ fontSize: 11, padding: "3px 10px", borderRadius: 20, fontWeight: 700,
+                cursor: "pointer", background: "transparent", color: "inherit",
+                border: "1px solid var(--border, #30363d)" }}>
+              sign out
+            </button>
+          </div>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
             <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: 20, fontWeight: 700,
               background: health?.status === "ok" ? "rgba(63,185,80,0.15)" : "rgba(248,81,73,0.15)",

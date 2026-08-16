@@ -75,6 +75,15 @@ function requireAdminKey(req, res, next) {
 }
 
 
+// ── Operator session (FT-P0-01A) ─────────────────────────────────────────────
+// `pool` is assigned later inside setupDB(), so the middleware is resolved
+// lazily rather than captured at module load. Binding it eagerly would freeze an
+// undefined pool into the authorization path and silently disable auditing —
+// the audit would then "succeed" by doing nothing, which is the failure mode
+// this whole slice exists to prevent.
+const operatorSession = require('./modules/operator_session');
+const requireOperator = (req, res, next) => operatorSession.requireOperator(pool)(req, res, next);
+
 // Top IDX stocks to auto-pull daily
 const { IDX_TICKERS: TOP_STOCKS } = require('./modules/tickers');
 // The cross-section F5 is measured against. Frozen and versioned SEPARATELY from
@@ -273,10 +282,23 @@ const corsAllowedOrigins = (process.env.CORS_ALLOWED_ORIGINS || '').split(',').m
 if (corsAllowedOrigins.length === 0) {
   console.warn('⚠️  CORS_ALLOWED_ORIGINS not set — allowing all origins (*). Set it in .env to restrict.');
 }
+// `credentials` and `x-csrf-token` added for the operator session (FT-P0-01A).
+//
+// NOTE the interaction, because it is load-bearing and easy to misread as a bug:
+// with no allowlist this still sends `Access-Control-Allow-Origin: *`, and
+// browsers REFUSE to send cookies to a wildcard origin. That is the correct
+// outcome — reflecting arbitrary origins back with credentials enabled would let
+// any site on the internet make authenticated requests as the operator.
+//
+// So the browser session works when the frontend is same-origin with this API
+// (the destination FT-P0-02 is heading for) or when CORS_ALLOWED_ORIGINS names
+// the real frontend origin. Machine callers using `x-admin-key` are unaffected
+// either way, since headers are not credentials in the CORS sense.
 app.use(cors({
   origin: corsAllowedOrigins.length > 0 ? corsAllowedOrigins : '*',
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-key', 'x-csrf-token'],
+  credentials: true,
 }));
 // Body limit reduced from 50mb (external review, 2026-07-31) — no endpoint
 // in this file legitimately needs anywhere close to that; the largest real
@@ -3657,7 +3679,17 @@ async function loadWatchlist(force = false) {
 // ─── Start ────────────────────────────────────────────────────────────────────
 async function main() {
   await setupDB();
-  
+
+  // Audit storage must exist before the operator boundary admits anything —
+  // mutations fail closed when the record cannot be written, so a missing table
+  // would refuse every Admin write rather than silently skip the trail.
+  try {
+    await operatorSession.ensureAuditTable(pool);
+    console.log('   🔐 operator audit table ready (ft_operator_audit)');
+  } catch (e) {
+    console.error('   ⚠️  operator audit table unavailable:', e.message);
+  }
+
   // ─── FIBONACCI — Auto Fib Retracement from OHLC ─────────────────────────────
 // GET /api/fibonacci?ticker=BBCA&lookback=60
 app.get('/api/fibonacci', async (req, res) => {
@@ -4120,8 +4152,67 @@ app.get('/api/stockbit-status', async (req, res) => {
   }
 });
 
+// ── Operator session endpoints (FT-P0-01A) ───────────────────────────────────
+//
+// The key is presented ONCE, in a request body, and is exchanged for an
+// httpOnly session cookie. It is never stored in localStorage, never placed in a
+// NEXT_PUBLIC_* variable, and never travels in a URL where it would land in
+// access logs and browser history.
+//
+// This endpoint is deliberately NOT behind requireOperator — it is how a session
+// is obtained in the first place.
+app.post('/api/operator/login', async (req, res) => {
+  const key = (req.body && req.body.key) || '';
+  const ip = (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').toString().split(',')[0].trim();
+
+  if (!process.env.ADMIN_API_KEY) {
+    return res.status(503).json({ error: 'ADMIN_API_KEY not configured on server' });
+  }
+  if (!operatorSession.safeEqual(key, process.env.ADMIN_API_KEY)) {
+    // Failed logins are the ones worth having a record of.
+    operatorSession.recordAudit(pool, {
+      actor: 'anonymous', via: 'login', method: 'POST', route: '/api/operator/login',
+      target: null, outcome: 'DENIED', statusCode: 401, ip,
+    }).catch(() => {});
+    return res.status(401).json({ error: 'invalid operator key' });
+  }
+
+  const s = operatorSession.createSession({ actor: 'operator', ip });
+  operatorSession.recordAudit(pool, {
+    actor: s.actor, via: 'login', method: 'POST', route: '/api/operator/login',
+    target: null, outcome: 'ALLOWED', statusCode: 200, ip,
+  }).catch(() => {});
+  res.setHeader('Set-Cookie', operatorSession.cookieHeaders(s, req));
+  // The CSRF token is returned in the body as well so a client can hold it in
+  // memory instead of re-reading the cookie. The SESSION id is not returned —
+  // it exists only in the httpOnly cookie.
+  res.json({ ok: true, actor: s.actor, csrfToken: s.csrf, expiresAt: s.expiresAt });
+});
+
+app.post('/api/operator/logout', (req, res) => {
+  const sid = operatorSession.parseCookies(req)[operatorSession.COOKIE_SESSION];
+  const existed = sid ? operatorSession.destroySession(sid) : false;
+  operatorSession.recordAudit(pool, {
+    actor: existed ? 'operator' : 'anonymous', via: 'logout', method: 'POST',
+    route: '/api/operator/logout', target: null,
+    outcome: 'ALLOWED', statusCode: 200,
+    ip: (req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '').toString().split(',')[0].trim(),
+  }).catch(() => {});
+  res.setHeader('Set-Cookie', operatorSession.clearCookieHeaders());
+  res.json({ ok: true, revoked: existed });
+});
+
+// Lets the Admin UI decide whether to show a login form without probing a
+// protected route and logging a spurious denial.
+app.get('/api/operator/whoami', (req, res) => {
+  const sid = operatorSession.parseCookies(req)[operatorSession.COOKIE_SESSION];
+  const s = operatorSession.getSession(sid);
+  if (!s) return res.status(401).json({ authenticated: false });
+  res.json({ authenticated: true, actor: s.actor, expiresAt: s.expiresAt, csrfToken: s.csrf });
+});
+
 // ── Admin: GET /api/admin/broker-config ──────────────────────────────────────
-app.get('/api/admin/broker-config', requireAdminKey, async (req, res) => {
+app.get('/api/admin/broker-config', requireOperator, async (req, res) => {
   try {
     const [rows] = await pool.query(
       'SELECT code, name, category, active, notes, updated_at FROM ft_broker_config ORDER BY category, code'
@@ -4131,7 +4222,7 @@ app.get('/api/admin/broker-config', requireAdminKey, async (req, res) => {
 });
 
 // ── Admin: PUT /api/admin/broker-config/:code ────────────────────────────────
-app.put('/api/admin/broker-config/:code', async (req, res) => {
+app.put('/api/admin/broker-config/:code', requireOperator, async (req, res) => {
   const { code } = req.params;
   const { category, name, active, notes } = req.body;
   try {
@@ -4145,7 +4236,7 @@ app.put('/api/admin/broker-config/:code', async (req, res) => {
 });
 
 // ── Admin: POST /api/admin/broker-config/bulk ────────────────────────────────
-app.post('/api/admin/broker-config/bulk', requireAdminKey, async (req, res) => {
+app.post('/api/admin/broker-config/bulk', requireOperator, async (req, res) => {
   const { updates } = req.body; // [{ code, category }]
   if (!Array.isArray(updates)) return res.status(400).json({ error: 'updates must be array' });
   try {
@@ -4161,7 +4252,7 @@ app.post('/api/admin/broker-config/bulk', requireAdminKey, async (req, res) => {
 });
 
 // ── Admin: GET /api/admin/watchlist ──────────────────────────────────────────
-app.get('/api/admin/watchlist', requireAdminKey, async (req, res) => {
+app.get('/api/admin/watchlist', requireOperator, async (req, res) => {
   try {
     const [rows] = await pool.query(
       'SELECT ticker, active, display_order, sector, added_at FROM ft_watchlist ORDER BY display_order ASC, ticker ASC'
@@ -4171,7 +4262,7 @@ app.get('/api/admin/watchlist', requireAdminKey, async (req, res) => {
 });
 
 // ── Admin: POST /api/admin/watchlist ─────────────────────────────────────────
-app.post('/api/admin/watchlist', requireAdminKey, async (req, res) => {
+app.post('/api/admin/watchlist', requireOperator, async (req, res) => {
   const { ticker, sector, display_order } = req.body;
   if (!ticker) return res.status(400).json({ error: 'ticker required' });
   try {
@@ -4193,7 +4284,7 @@ app.post('/api/admin/watchlist', requireAdminKey, async (req, res) => {
 });
 
 // ── Admin: PUT /api/admin/watchlist/:ticker ───────────────────────────────────
-app.put('/api/admin/watchlist/:ticker', async (req, res) => {
+app.put('/api/admin/watchlist/:ticker', requireOperator, async (req, res) => {
   const { ticker } = req.params;
   const { active, display_order, sector } = req.body;
   try {
@@ -4207,7 +4298,7 @@ app.put('/api/admin/watchlist/:ticker', async (req, res) => {
 });
 
 // ── Admin: DELETE /api/admin/watchlist/:ticker ────────────────────────────────
-app.delete('/api/admin/watchlist/:ticker', async (req, res) => {
+app.delete('/api/admin/watchlist/:ticker', requireOperator, async (req, res) => {
   const { ticker } = req.params;
   try {
     await pool.query('UPDATE ft_watchlist SET active=0 WHERE ticker=?', [ticker.toUpperCase()]);
@@ -4217,7 +4308,11 @@ app.delete('/api/admin/watchlist/:ticker', async (req, res) => {
 });
 
 // ── Admin: POST /api/admin/reload-config ─────────────────────────────────────
-app.post('/api/admin/reload-config', requireAdminKey, async (req, res) => {
+// Part of the Admin broker-config flow: handleSaveBrokers() calls this straight
+// after a bulk save, so leaving it on the key guard would half-break the very
+// flow FT-P0-01A migrates. Still guarded either way — this moves it from the
+// key to the operator session, it does not open anything.
+app.post('/api/admin/reload-config', requireOperator, async (req, res) => {
   try {
     _brokerCatCache = null;
     _watchlistCache = null;

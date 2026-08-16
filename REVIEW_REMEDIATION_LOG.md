@@ -124,6 +124,98 @@ That list carries 18 routes; the pending set here carries 19. The extra is
 key at runtime and is called from `components/SectorsApiPanel.tsx:18`. It belongs
 in the count.
 
+### FT-P0-01A — operator boundary, Admin slice — **AWAITING_REVIEW**
+
+Route-count delta: **guarded 18 → 21, pending 19 → 16, intentionally public 1 → 3.**
+
+Codex's 16:38 checkpoint raised two corrections. Both were real defects in the
+first draft and both are fixed with tests that fail without the fix:
+
+- **Audit was fire-and-forget and stamped every admitted request `200 ALLOWED`
+  before the handler ran.** It now writes an `ATTEMPTED` row first and stamps the
+  REAL `res.statusCode` on `finish`, so a handler that 500s is recorded `FAILED`.
+  Fail-closed is defined rather than assumed: **mutations refuse with 503 when
+  the attempt cannot be recorded** (a state change that cannot be attributed must
+  not happen), **reads are best-effort but logged loudly** (a GET leaves nothing
+  to attribute, and refusing it protects nobody), and **denials are never
+  upgraded** (a 401 must not become a 503, or the audit path becomes a probe).
+- **`decodeURIComponent` threw on malformed percent-encoding.** The Cookie header
+  is attacker-controlled, so that was a crash reachable anonymously on the
+  authorization boundary. Undecodable values are now kept raw and simply fail to
+  match. My original test used `%20` — valid encoding — so it proved tolerance of
+  malformed *structure* while leaving malformed *encoding* untested; the new test
+  uses `%ZZ`, a lone `%`, and a truncated UTF-8 sequence.
+
+**Design.** No session facility existed to reuse (deps are cors, dotenv, express,
+mysql2, puppeteer), so `modules/operator_session.js` is ~200 lines with no new
+dependency. Two admission paths, deliberately different: a **browser** path on an
+httpOnly `ft_op` cookie, which is ambient and therefore requires CSRF on every
+mutation; and a **machine** path on `x-admin-key`, which is not ambient — no
+browser attaches it cross-site — so demanding CSRF there would protect nothing
+and break the cron and CLI callers. The CSRF token is compared against the
+**session**, not against the cookie: the usual double-submit mistake passes for
+anyone able to write both.
+
+**Evidence, live against `76.13.22.155:3100` after deploy.**
+
+Unauthorized — all eight routes in the slice:
+
+```
+GET    /api/admin/broker-config      -> 401      POST   /api/admin/watchlist          -> 401
+PUT    /api/admin/broker-config/AK   -> 401      PUT    /api/admin/watchlist/BBCA     -> 401
+POST   /api/admin/broker-config/bulk -> 401      DELETE /api/admin/watchlist/BBCA     -> 401
+GET    /api/admin/watchlist          -> 401      POST   /api/admin/reload-config      -> 401
+```
+
+Login, session, CSRF:
+
+```
+login, wrong key                            -> 401
+login, correct key                          -> 200   ft_op HttpOnly=yes, ft_csrf HttpOnly=no
+session GET  /api/admin/watchlist           -> 200   (reads need no CSRF token)
+session PUT  /api/admin/watchlist/BBCA      -> 403   no CSRF token
+session PUT  /api/admin/watchlist/BBCA      -> 403   wrong CSRF token
+session PUT  /api/admin/watchlist/BBCA      -> 200   correct CSRF token
+machine GET  /api/admin/broker-config       -> 200   x-admin-key, no CSRF needed
+```
+
+Audit trail, read back from `ft_operator_audit` — actor, route, action, target,
+timestamp and outcome, with the real status:
+
+```
+anonymous          none       PUT    /api/admin/watchlist/BBCA   BBCA  DENIED   401
+anonymous          login      POST   /api/operator/login         -     DENIED   401
+operator           login      POST   /api/operator/login         -     ALLOWED  200
+operator           session    PUT    /api/admin/watchlist/BBCA   BBCA  ALLOWED  200
+machine:admin-key  admin-key  GET    /api/admin/broker-config    -     ALLOWED  200
+```
+
+Secret hygiene: the production `ADMIN_API_KEY` **value** was grepped for across
+`.next/static` and is **absent**. The literal string `ADMIN_API_KEY` does appear —
+in UI copy on `app/awo-dashboard/page.tsx`, which is the legacy
+`lib/adminKey.ts` localStorage path. That page is outside this slice and was not
+touched, but it is exactly the pattern this task replaces and is the obvious next
+migration.
+
+Suites: `test_operator_session.js` 23/23, `test_route_authorization.js` 7/7, full
+unit suite **482 passing, 0 failing** across 22 files. Frontend production build
+compiled successfully, 30/30 static pages.
+
+**Scope kept narrow.** No route on the pending list was touched.
+`/api/admin/reload-config` was included because `handleSaveBrokers()` calls it
+immediately after a bulk save, so leaving it on the key guard would have
+half-broken the very flow being migrated; it was already guarded, so the pending
+count is unaffected — it moved from key to session, it was not opened.
+
+**Not verified, and stated rather than implied:** the browser UI flow end to end.
+`npm run dev` returns HTTP 500 from `app/globals.css:1322` (P1-02), so the page
+could not be exercised in a live browser. The production build passes and every
+server-side behaviour above is verified by request, but the click-path is
+unproven. Related: with no `CORS_ALLOWED_ORIGINS` set, the API still answers
+`Access-Control-Allow-Origin: *`, and browsers refuse to send cookies to a
+wildcard origin — so the browser session needs either the same-origin routing
+FT-P0-02 is heading for, or that variable set. Machine callers are unaffected.
+
 ---
 
 ## Candlestick architecture decision — ACKNOWLEDGED

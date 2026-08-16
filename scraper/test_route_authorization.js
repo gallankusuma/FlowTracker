@@ -39,6 +39,19 @@ const PUBLIC_MUTATIONS = {
     'Retired stub. Returns HTTP 410 and performs no work; a 401 would hide the ' +
     'explanation a stale caller needs. Accepted by the reviewer 2026-08-16 as ' +
     'outside the auth defect count.',
+
+  'POST /api/operator/login':
+    'This is how an operator session is OBTAINED, so requiring one would be ' +
+    'circular. It verifies ADMIN_API_KEY in constant time, returns 401 on ' +
+    'mismatch and 503 when the key is unconfigured, and both outcomes are ' +
+    'audited. Not rate-limited yet — that is P0-01 remediation item 4, outside ' +
+    'the FT-P0-01A slice, and is recorded rather than assumed handled.',
+
+  'POST /api/operator/logout':
+    'Destroys only the session named by the caller own httpOnly cookie, so it ' +
+    'grants nothing and reveals nothing. Logout must work even from a stale or ' +
+    'already-invalid session, which is exactly when a user needs it; forcing it ' +
+    'to authenticate first would leave dead sessions unrevocable.',
 };
 
 /**
@@ -46,9 +59,6 @@ const PUBLIC_MUTATIONS = {
  * THIS LIST MUST ONLY GET SHORTER. Do not add to it — guard the route instead.
  */
 const PENDING_UNGUARDED = new Set([
-  'PUT /api/admin/broker-config/:code',
-  'PUT /api/admin/watchlist/:ticker',
-  'DELETE /api/admin/watchlist/:ticker',
   'POST /api/broker-summary/upload',
   'POST /api/broker-summary/upload-csv',
   'POST /api/stockbit-import',
@@ -87,11 +97,12 @@ function test(name, fn) {
 }
 
 const routes = mutationRoutes();
-const guarded = routes.filter(r => r.guard === 'requireAdminKey');
-const open = routes.filter(r => r.guard !== 'requireAdminKey');
+const GUARDS = new Set(['requireAdminKey', 'requireOperator']);
+const guarded = routes.filter(r => GUARDS.has(r.guard));
+const open = routes.filter(r => !GUARDS.has(r.guard));
 
 console.log(`\nroute authorization policy — ${routes.length} mutation routes found`);
-console.log(`  guarded by requireAdminKey : ${guarded.length}`);
+console.log(`  guarded (key or session)   : ${guarded.length}`);
 console.log(`  intentionally public       : ${open.filter(r => PUBLIC_MUTATIONS[r.key]).length}`);
 console.log(`  pending (P0-01)            : ${open.filter(r => PENDING_UNGUARDED.has(r.key)).length}`);
 
@@ -111,7 +122,7 @@ test('the pending list only shrinks — nothing on it may already be guarded', (
   // ratchet silently loosens and the count stops meaning anything.
   const stale = [...PENDING_UNGUARDED].filter(k => {
     const r = routes.find(x => x.key === k);
-    return r && r.guard === 'requireAdminKey';
+    return r && GUARDS.has(r.guard);
   });
   assert.deepStrictEqual(stale, [],
     'These are now guarded and must be deleted from PENDING_UNGUARDED: ' + stale.join(', '));
@@ -135,7 +146,7 @@ test('the two Sectors.app routes remain guarded', () => {
   for (const k of ['POST /api/sectors/pull', 'POST /api/sectors/pull-broker']) {
     const r = routes.find(x => x.key === k);
     assert.ok(r, `route disappeared: ${k}`);
-    assert.strictEqual(r.guard, 'requireAdminKey', `${k} lost its guard (regression)`);
+    assert.ok(GUARDS.has(r.guard), `${k} lost its guard (regression)`);
   }
 });
 
