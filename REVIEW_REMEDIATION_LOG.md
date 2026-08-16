@@ -89,6 +89,67 @@ served to the public. Which of those four pages are operator-only has to be
 settled before the remaining routes can be closed correctly — otherwise the fix
 moves a shared secret into public JavaScript rather than protecting anything.
 
+### Update 2026-08-16 — authorization ratchet added
+
+The review's remaining acceptance criteria included *"automated authorization
+tests that enumerate every Express route"* and *"CI fails when a new mutation
+route is registered without an auth policy"*. Both are now satisfied by
+`scraper/test_route_authorization.js`, wired into `test:unit`.
+
+It is a **ratchet**, not a flat assertion, because 19 routes genuinely cannot be
+closed today and a permanently-red test is one nobody reads. Every mutation route
+must fall into exactly one of three declared buckets:
+
+```
+38 mutation routes
+  guarded by requireAdminKey : 18
+  intentionally public       :  1   (POST /api/ft-pull, with the reason recorded)
+  pending (P0-01)            : 19   (enumerated by name; the list may only SHRINK)
+```
+
+Anything outside all three fails the suite immediately. **Verified by injection**
+rather than assumed: adding `DELETE /api/__injected_probe/:id` to server.js made
+the test fail naming that exact route, and reverting restored green.
+
+The test also guards against regression on what is already closed — both
+Sectors.app routes must keep `requireAdminKey` — and checks that
+`requireAdminKey` itself still returns 401/403, compares in constant time, and
+refuses with 503 when `ADMIN_API_KEY` is unset rather than falling open.
+
+Suite 459 passing, 0 failing.
+
+**One discrepancy with the review's Evidence list, in the stricter direction.**
+That list carries 18 routes; the pending set here carries 19. The extra is
+`POST /api/sectors/configure` (`server.js:2268`), which sets the Sectors.app API
+key at runtime and is called from `components/SectorsApiPanel.tsx:18`. It belongs
+in the count.
+
+---
+
+## Candlestick architecture decision — ACKNOWLEDGED
+
+The 2026-08-16 decision (**RETAIN AS SHADOW CONTEXT; NO-GO AS A STANDALONE SIGNAL
+SYSTEM**) is accepted as written. Recorded here so the constraints are not
+rediscovered later:
+
+- no standalone candlestick BUY/SELL, no hard veto, no F15, no change to the AWO
+  composite, no sizing/stop/target effect
+- **no expansion to a 101-pattern production taxonomy** — this closes the open
+  question of translating the remaining definitions
+- no selecting only the best discovery patterns after seeing results
+- runtime mode stays `CANDLE_MODE=SHADOW`, all candle output non-actionable
+
+Worth noting for whoever builds the Candle Context Engine: the required output
+contract is almost exactly what the research modules already emit — `resolved`,
+`unresolvedReason`, `geometryReliable`, `ticksInRange`, `bodyRatio`,
+`upperWickRatio`, `lowerWickRatio`, `closeLocation`, `rangeVsAtr`, gap versus
+prior close, strictly-prior trend/location context, and taxonomy version/hash.
+Shadow wiring is therefore an integration task, not a rebuild.
+
+Per the review's own priority ruling, this work stays **behind** P0-01, P0-02,
+P0-03, the hardcoded API origins, and restoring development/integration testing.
+No production wiring has been started.
+
 ---
 
 ## Not yet started
