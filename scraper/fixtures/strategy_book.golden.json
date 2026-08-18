@@ -1075,8 +1075,8 @@
   {
    "date": "2026-07-22",
    "exposure": 0,
-   "eligible": 75,
-   "vetoed": 15,
+   "eligible": 66,
+   "vetoed": 13,
    "book": [],
    "opened": [],
    "closed": []
@@ -1084,8 +1084,8 @@
   {
    "date": "2026-08-05",
    "exposure": 0,
-   "eligible": 88,
-   "vetoed": 17,
+   "eligible": 76,
+   "vetoed": 15,
    "book": [],
    "opened": [],
    "closed": []
@@ -1156,6 +1156,6 @@
  "finalEquity": 1.396172,
  "maxDrawdown": 0.163719,
  "cagr": 0.158422,
- "hash": "eee5cebcd5cfa9f3c3c6a3333b5f96a5",
+ "hash": "9b41c9d4c5b2512992c607777e0ede14",
  "windowEnd": "2026-08-13"
 }
