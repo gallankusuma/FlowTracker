@@ -588,3 +588,80 @@ the box. `.deployed-commit` stamped `c9ddf97`.
 **Not claimed:** that the two `--update-golden` re-baselines earlier today are
 accepted. The reviewer blocked them for regenerating from mutable database state,
 and that objection is unaffected by this run.
+
+---
+
+## Golden fixture — identified input — **AWAITING_REVIEW**
+
+Against the standing objection: *"Never green the gate by accepting current
+mutable database state... generate from an immutable/versioned input snapshot
+with reviewed economic deltas."*
+
+**The objection was right and the diagnosis was precise.** The fixture pinned an
+OUTPUT computed from an input nobody recorded, so a change in the database was
+indistinguishable from a change in the code — the hash moved and the diff blamed
+whichever line had been touched last. That is how two re-baselines landed in a
+single day, each explaining an output that had moved for reasons outside the file
+being edited.
+
+**What was built.** Storing the input itself is impractical (1.15M price rows).
+Storing its *identity* is not, and "identified" is the word the objection uses.
+`verify_strategy_book.js` now digests the exact three result sets `load()` reads —
+`idx_ihsg_history`, `idx_stock_prices WHERE close_price > 0`, `idx_concentration` —
+with a per-table breakdown, and the fixture carries it:
+
+```
+input digest e8933bb2ce97f61c
+  idx_ihsg_history      2,422   2016-08-01 .. 2026-08-14   8adbe4d9dbd31d76
+  idx_stock_prices  1,145,730   2016-08-01 .. 2026-08-14   f15984dbbbb5bdae
+  idx_concentration   100,457   2024-01-02 .. 2026-08-14   7444d08670f5a236
+```
+
+An input change is now reported **as** an input change, before any output is
+compared:
+
+```
+FAIL  the INPUT changed since this fixture was taken
+        fixture input cafebabecafebabe   now d44db1c538bb936e
+        ~ idx_stock_prices: 1145430 -> 1146330 rows (+900), 2016-08-01..2026-08-18
+        A fixture is a claim about OUTPUT GIVEN INPUT. Regenerating it now
+        would record a different claim, not repair this one.
+```
+
+**Proven by injection, not asserted.** A false identity written into the fixture
+produced exactly the above, naming the table and the delta; restoring the fixture
+returned the check to PASS.
+
+**Bounded by `windowEnd`, and the bound is what makes it usable.** The first
+version hashed whole tables, so the session that arrived today moved the digest —
+the fixture would have failed every morning for a reason unrelated to the code.
+That is the same mistake `windowEnd` already exists to prevent, and this file's
+own comment warns that a daily-red check is one people regenerate without
+reading. Caught before commit. Bounded, the digest moves only when data INSIDE
+the window changes — a backfill, a recalculation, a repaired hole — which is
+precisely the event that must not pass unnoticed. Demonstrated: bounding drops
+2,423 -> 2,422 ihsg rows, 1,146,330 -> 1,145,730 prices, 101,031 -> 100,457
+concentration, all of it today's session.
+
+**Determinism:** identical digest across consecutive runs (`e8933bb2ce97f61c`).
+
+**This re-baseline moves no economic number.** trades 256, finalEquity 1.396172,
+maxDrawdown 0.163719, output hash `9b41c9d4c5b2512992c607777e0ede14` — all
+unchanged from the committed fixture. It records which input the already-passing
+fixture corresponds to, which is the opposite of greening a gate by accepting
+whatever the database happened to hold. 18 passed, 0 failed.
+
+**Gate, run alone after the change:** `predeploy_check.sh` exit 0,
+`ALL SUITES PASSED`, 4 of 4 steps, and inside it the fixture step now reports
+
+```
+input digest e8933bb2ce97f61c  ihsg_history=2422  stock_prices=1145730  concentration=100457
+PASS  the input is the one this fixture was taken from (e8933bb2ce97f61c)
+```
+
+so the gate's own log carries the identity of the data it passed against.
+`.deployed-commit` stamped `3ebf3af`.
+
+**What this does NOT do, stated plainly:** it does not make the check runnable
+without a database, and it does not retroactively validate the two earlier
+re-baselines. It makes the next one impossible to perform silently.
