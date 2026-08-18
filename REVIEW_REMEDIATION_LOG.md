@@ -439,3 +439,127 @@ altering them to make a check pass is the one thing a seal must never permit.
 Still open from the same review, and not claimed here: no candidate/control
 shadow lifecycle exists yet, and it cannot accumulate anything while the regime
 filter holds exposure at 0. `FT-P0-02` remains the only `READY` task.
+
+---
+
+## FT-P0-02 — frontend/backend API contract — **AWAITING_REVIEW**
+
+Claimed `IN_PROGRESS` per the team protocol before any code was written.
+
+### The corrected premise held, and the gap was the local half
+
+Production was already right: nginx on `:3200` serves the app and proxies
+`location /scraper-api/` to `127.0.0.1:3100`, so frontend and API share an
+origin — the only arrangement a `SameSite=Strict` session cookie can travel
+over. No second production proxy was built; `next.config.ts` returns no rewrite
+under `NODE_ENV=production` unless `SCRAPER_UPSTREAM` is set deliberately.
+
+What did not exist was the **local** equivalent. Nothing served `/scraper-api`
+under `next dev`, so browser-side calls 404'd against the app itself.
+`next.config.ts` now rewrites `/scraper-api/:path*` to `SCRAPER_UPSTREAM`,
+defaulting to `127.0.0.1:3100` outside production. Documented in
+`API_ROUTING.md`, including the trap that **`next start` bakes rewrites at BUILD
+time**, so setting the variable only at runtime does nothing.
+
+### P1-02 fixed as a prerequisite
+
+`next dev` returned HTTP 500 for every page, so "works in local development"
+could not be shown at all. The cause was not what the error line said:
+`app/globals.css` is 245 lines with its imports at the top, but `@import
+"tailwindcss"` expands INLINE and pushed the font import below ~1300 generated
+rules, where `@import` is illegal. Font import now precedes tailwind.
+`next build` had tolerated it — the broken path was the one no CI ran.
+
+### A live regression this work uncovered, and it was mine
+
+The deployed `app/admin/page.tsx` was dated **29 May** and `lib/operatorSession.ts`
+was **absent from the box entirely**. FT-P0-01A guarded the server routes and the
+frontend half was never deployed with them. In production the Admin page was
+calling `/api/admin/*` with a plain `fetch` and no session, receiving 401 on
+every call, and swallowing it with `.catch(() => {})` — rendering empty broker and
+watchlist tables with no indication why. A fail-open UI over a fail-closed API,
+which is the exact defect this task exists to remove. Exactly 2 of 41 tracked
+frontend files had drifted; both are now deployed and the frontend rebuilt.
+
+### Commands and evidence
+
+Proxy contract, run against a stub upstream behind a real dev server
+(`npm run test:routing`, kept out of `test:unit` because it spawns a server):
+
+```
+14 passed, 0 failed
+  method / path rewrite / query / body survive
+  Cookie and X-CSRF-Token reach upstream
+  Set-Cookie returns with HttpOnly and SameSite=Strict intact
+  401 and 503 propagate — not coerced to 200; error body survives
+  no ADMIN_API_KEY or Authorization is ever injected
+```
+
+Local **production build** (`SCRAPER_UPSTREAM=http://127.0.0.1:3100 npm run build`
+then `npx next start -p 3210`), driven in a browser over the same-origin path:
+
+```
+/admin unauthenticated        operator sign-in gate; panel withheld
+wrong key                     "invalid operator key"
+correct key                   panel renders, operator:optest-p002
+read  GET /admin/watchlist    200, 122 rows
+MUTATION, cookie but NO CSRF  403 {"error":"missing CSRF token"}
+MUTATION, WRONG CSRF token    403
+toggle BBTN (UI)              121 aktif / 122
+toggle back (UI)              122 aktif / 122   — reversible, state restored
+logout                        gate returns
+post-logout GET watchlist     401
+post-logout GET whoami        401
+post-logout replayed mutation 401 {"error":"no valid operator session"}
+```
+
+Storage and URL hygiene, read from the page while signed in:
+
+```
+localStorage (empty)   sessionStorage (empty)
+document.cookie        ft_csrf only        ft_op readable by JS: false
+operator key anywhere client-side: false   URL: http://localhost:3210/admin
+```
+
+Upstream cut **mid-session** (tunnel killed while the page was open):
+
+```
+proxy /scraper-api/api/health   500   — not 200, not an empty body
+badge                           ● API OFFLINE
+watchlist                       122 aktif / 122 total, all rows still shown
+reload action                   ❌ Reload failed - HTTP 500
+```
+
+Failure stated, previous data preserved, nothing zeroed or emptied.
+
+Production routing through `/scraper-api` on `:3200`:
+
+```
+/api/health 200   /api/operator/whoami 401   /api/admin/watchlist 401
+/api/admin/broker-config 401
+login, wrong key -> {"error":"invalid operator key","attemptsRemaining":4}
+Set-Cookie: ft_op=;   Path=/; SameSite=Strict; Max-Age=0; HttpOnly
+Set-Cookie: ft_csrf=; Path=/; SameSite=Strict; Max-Age=0
+```
+
+Cookie attributes survive nginx unchanged.
+
+### Two defects fixed that the evidence run exposed
+
+- **The health badge reported cached success.** Fetched once on mount and never
+  re-checked, it read `API ONLINE` after the upstream had gone. Now polled every
+  30s with `cache: "no-store"`, `r.ok` checked before parsing, interval cleared
+  on unmount, and four states so that "not checked yet" and "stale" are not
+  disguised as "online".
+- **`TampermonkeyPanel` was nearly "fixed" into breakage.** Its absolute origin
+  lives inside a userscript that runs on rti.co.id and stockbit.com, where a
+  relative `/scraper-api` would resolve against THOSE origins. `test_api_origins.js`
+  now separates legitimate absolute origins from real debt, and asserts each
+  legitimate entry is either the apiConfig authority or a genuine userscript.
+
+### Ratchet
+
+`scraper/test_api_origins.js` enumerates the four pages that still bypass the
+same-site contract (`daily-picks`, `journey`, `screener`, `stockbit-connector`).
+The list may only shrink; a new hardcoded origin fails the suite. They are
+outside this slice and none can carry an operator session.

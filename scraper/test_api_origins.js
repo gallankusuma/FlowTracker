@@ -20,7 +20,32 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 
-const ROOT = path.join(__dirname, '..');
+/**
+ * Where the frontend tree lives, which is NOT the same relative to this file in
+ * every deployment. In the repository the scraper is a subdirectory, so `..` is
+ * the frontend root. On the production box they are SIBLINGS
+ * (/var/www/flowtracker-scraper and /var/www/flowtracker), so `..` is /var/www
+ * and every lookup misses. Assuming one layout made this pass locally and fail
+ * on the box — the opposite of what a gate is for.
+ *
+ * Resolved by looking for the thing we actually need rather than by guessing a
+ * shape: the directory that contains lib/apiConfig.ts.
+ */
+function findFrontendRoot() {
+  const candidates = [
+    process.env.FRONTEND_ROOT,
+    path.join(__dirname, '..'),                        // repo layout
+    path.join(__dirname, '..', 'flowtracker'),         // sibling layout (VPS)
+  ].filter(Boolean);
+  for (const c of candidates) {
+    if (fs.existsSync(path.join(c, 'lib', 'apiConfig.ts'))) return c;
+  }
+  console.error('Could not locate the frontend tree. Tried:');
+  for (const c of candidates) console.error('  ' + c);
+  console.error('Set FRONTEND_ROOT to the directory containing lib/apiConfig.ts.');
+  process.exit(1);
+}
+const ROOT = findFrontendRoot();
 
 /**
  * Absolute origins that are CORRECT, not debt. Kept separate from the deviations
@@ -50,6 +75,19 @@ const KNOWN_DEVIATIONS = {
 };
 
 const SEARCH_DIRS = ['app', 'lib', 'components'];
+
+/**
+ * Next route handlers (app/.../route.ts) execute on the SERVER, not in a browser.
+ * A loopback origin there is the same correct thing apiConfig does for SSR: it
+ * never reaches a client, and no cookie policy applies to it. Flagging them would
+ * push someone to "fix" a server call into a relative path that resolves against
+ * whatever host happens to be serving.
+ *
+ * They are still checked, but against the rule that actually applies to them: a
+ * server handler may call loopback, never a public address.
+ */
+const isServerRoute = rel => /^app\/.*\/route\.tsx?$/.test(rel);
+const LOOPBACK_ONLY = /https?:\/\/(?:localhost|127\.0\.0\.1)(?::\d+)?/;
 const ABSOLUTE_ORIGIN = /https?:\/\/(?:\d{1,3}(?:\.\d{1,3}){3}|localhost|127\.0\.0\.1)(?::\d+)?/;
 
 function walk(dir, out = []) {
@@ -88,7 +126,7 @@ console.log(`  files with an absolute API origin: ${offenders.length}`);
 
 test('no NEW file hardcodes an absolute API origin', () => {
   const undeclared = offenders
-    .filter(o => !(o.rel in KNOWN_DEVIATIONS) && !(o.rel in LEGITIMATE_ABSOLUTE))
+    .filter(o => !(o.rel in KNOWN_DEVIATIONS) && !(o.rel in LEGITIMATE_ABSOLUTE) && !isServerRoute(o.rel))
     .map(o => `${o.rel}:${o.hits[0].n}  ${o.hits[0].line.slice(0, 80)}`);
   assert.deepStrictEqual(undeclared, [],
     'These call the API by host and port, so the SameSite=Strict session cookie\n' +
@@ -134,6 +172,19 @@ test('the operator client goes through API_BASE, never an absolute origin', () =
   assert.ok(/from ['"]@\/lib\/apiConfig['"]/.test(src), 'operatorSession must import API_BASE');
   assert.ok(!ABSOLUTE_ORIGIN.test(src.replace(/^\s*\*.*$/gm, '')),
     'operatorSession.ts hardcodes an origin — the session cookie would not be sent');
+});
+
+test('server route handlers call loopback only, never a public address', () => {
+  const bad = [];
+  for (const o of offenders.filter(x => isServerRoute(x.rel))) {
+    for (const h of o.hits) {
+      const m = h.line.match(ABSOLUTE_ORIGIN);
+      if (m && !LOOPBACK_ONLY.test(m[0])) bad.push(o.rel + ":" + h.n + "  " + m[0]);
+    }
+  }
+  assert.deepStrictEqual(bad, [],
+    'A server handler reaching a PUBLIC address leaves the box and comes back: slower, ' +
+    'broken when the address changes, and needlessly on the network. ' + bad.join(', '));
 });
 
 console.log(`\n${pass} passed, ${fail} failed`);
