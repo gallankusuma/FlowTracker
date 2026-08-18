@@ -1336,3 +1336,44 @@ D10 has both the **highest** excess breakout rate of any decile (+5.12pp vs univ
 Leans toward **quality is mostly fine, extension is what stands out** — but not cleanly, because two of the seven quality factors are entangled with extension by construction. The broker-flow-only view (the part of "quality" that's genuinely independent of price level) is intact in D10 except for the separately-known F6 inversion; every timing/extension measure except volatility is at its sample extreme in D10. This gives real, if qualified, empirical grounding for `MARKET STATE → SETUP QUALITY → TIMING/EXTENSION → RISK → EXECUTION` — with the caveat that a future implementation cannot treat F4/F5 as clean "quality" inputs independent of the "extension" gate; they measure overlapping things and will need to be split or residualized, not just passed through both stages.
 
 **Status**: MEASURED, purely observational as instructed — no F1-F14 weight change, no new composite score. Cross-checked against EXP-026 R2 (exact match, all 4 horizons) and hand-verified against raw SQL. Next step is for the review to decide, not implied here.
+
+---
+
+## EXP-029 (2026-08-18) — Re-tuning HI52W against the v3 concentration model: vetoFrac 0.40, sealed not promoted
+
+- **Scripts**: `retune_v3.js` (walk-forward), `retune_edge.js` (grid extension + flat-fold diagnosis), `regime_probe.js`, `reentry_probe.js` — session scratchpad; each duplicates `load()`/`replay()` from `verify_strategy_book.js` because that file is an IIFE with no module guard
+- **Engine**: `modules/strategy_book.js` + `modules/execution.js`, the production pair
+- **Model version**: concentration `FT_TOP3BUY_TOP3SELL_V1` / `v3` (see the same-day concentration parity work)
+- **Universe / period**: 650 tickers, 2024-04-03 .. 2026-08-13, 56 rebalance decisions at a 10-bar cadence
+- **Costs**: 0.20% buy / 0.30% sell, unchanged
+- **Harness validity**: reproduced the golden fixture hash `9b41c9d4c5b2512992c607777e0ede14` exactly before any tuning was run. A harness that cannot rederive the fixture is not the production engine and its numbers would mean nothing.
+
+**Why the v3 CAGR drop was misread at first.** Switching concentration to the reference-site definition dropped backtest CAGR 20.10% → 15.84%, which looked like "correctness cost performance". It is not that. `posfrac()` — the measure the veto ranks on — reads **only the sign of `dn0`**:
+
+```
+for j in window: if (dn0[j] > 0) pos++; cnt++
+return cnt >= posfracMinReal ? pos/cnt : null
+```
+
+so the magnitude half of v2→v3 (the halving) was irrelevant, and `dnBound: 100` clipping is irrelevant too since clipping preserves sign. What moved the strategy was the **13.4% of `dn0` values that changed sign**.
+
+**Result — the optimum is interior, on two independent axes:**
+
+| vetoFrac | 0.2 | 0.3 | **0.4** | 0.5 | 0.6 | 0.7 | 0.8 |
+|---|---|---|---|---|---|---|---|
+| CAGR pos=6 | 25.69% | 35.39% | **48.86%** | 43.28% | 28.41% | −4.42% | −5.22% |
+| CAGR pos=8 | 15.84% | 28.16% | **36.45%** | 31.59% | 14.68% | 1.62% | 4.33% |
+
+Peaks at 0.40 for both position sizes and falls away either side, so it is not a boundary artefact of a too-narrow grid. Max drawdown is also **lowest** near the optimum (11.92% at 0.4/pos6 against 17.16% at 0.2/pos6) — better on return and on risk, not a trade between them. Direction agrees with EXP-016: persistent top-3-broker buying predicts underperformance, so vetoing more of it should help.
+
+**Walk-forward** (train 24 decisions, step 8, four folds): every fold independently chose `veto=0.40 pos=6`. Chained out-of-sample equity **2.0451 against the incumbent's 1.3341**, winning 3 of 4 folds.
+
+**Caveats, and they are heavy:**
+
+1. 56 decisions total, of which **26 hold no book at all** (regime flat) — effective sample about 30.
+2. **Fold 4 is 0.00% for both arms.** All 8 of its decisions have `exposure 0`. One fold (2025-08 → 2025-11, +58.47% vs +33.96%) carries most of the out-of-sample gap.
+3. **The holdout is burned.** The full-sample grid was printed and read, so per `PROMOTION_CONTRACT.md` S3 this window can never again be clean evidence for this parameter search. Only forward data is admissible from here.
+
+**Separate finding — why the strategy is idle.** `exposure = belowSma ? 0 : 1`, and IHSG has closed below its 200-session SMA since **2026-03-02** (106 sessions, third-longest spell in ten years) after falling 30% from the December 2025 peak. Data checked and clean: zero non-positive closes, no recent gaps, IHSG and price tables agree at 2026-08-14. Across 38 such spells the median is 3 sessions, so this is the tail, not the norm; 47.1% of the strategy window sits below the SMA. On a **flat** price the SMA rolls down through the price in ~117 sessions (~Jan/Feb 2027) because the window still carries the 8,227–9,033 prints from Oct 2025 – Jan 2026; a 6.5% rally crosses inside three months.
+
+**Status**: SEALED, NOT PROMOTED. Recorded as `CANDIDATE_SEAL_2026-08-18_vetofrac040.md`, strategy hash `3f98982baa68b452` (incumbent `0bd4f452f2ab01b3`), with the `forward_gate.js` GATE and the S4 control-track requirement pre-registered before any forward data exists. It cannot start yet: a standing-aside strategy produces **zero fills** against a gate that needs 50, so the shadow opens on the first rebalance decision with IHSG above its 200-session SMA. No production parameter was changed.
