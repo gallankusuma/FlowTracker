@@ -9,20 +9,20 @@
     "AMRT",
     "BBTN",
     "BNGA",
-    "CPIN",
     "DSNG",
-    "MAPI",
+    "MEDC",
     "NISP",
+    "SILO",
     "TPIA"
    ],
    "opened": [
     "AMRT",
     "BBTN",
     "BNGA",
-    "CPIN",
     "DSNG",
-    "MAPI",
+    "MEDC",
     "NISP",
+    "SILO",
     "TPIA"
    ],
    "closed": []
@@ -33,29 +33,29 @@
    "eligible": 93,
    "vetoed": 18,
    "book": [
-    "AKRA",
     "AMRT",
     "BBCA",
+    "BMRI",
     "CMNT",
-    "CMRY",
     "DSNG",
     "ELSA",
-    "EXCL"
+    "ISAT",
+    "MIKA"
    ],
    "opened": [
-    "AKRA",
     "BBCA",
+    "BMRI",
     "CMNT",
-    "CMRY",
     "ELSA",
-    "EXCL"
+    "ISAT",
+    "MIKA"
    ],
    "closed": [
     "BBTN",
     "BNGA",
-    "CPIN",
-    "MAPI",
+    "MEDC",
     "NISP",
+    "SILO",
     "TPIA"
    ]
   },
@@ -68,21 +68,23 @@
     "AMMN",
     "AMRT",
     "BBCA",
-    "CMRY",
     "DOID",
-    "DSNG",
-    "EXCL",
-    "MIKA"
+    "ELSA",
+    "JPFA",
+    "MIKA",
+    "TAPG"
    ],
    "opened": [
     "AMMN",
     "DOID",
-    "MIKA"
+    "JPFA",
+    "TAPG"
    ],
    "closed": [
-    "AKRA",
+    "BMRI",
     "CMNT",
-    "ELSA"
+    "DSNG",
+    "ISAT"
    ]
   },
   {
@@ -96,11 +98,11 @@
     "AMMN",
     "AMRT",
     "BBCA",
-    "CMRY",
     "DOID",
-    "DSNG",
-    "EXCL",
-    "MIKA"
+    "ELSA",
+    "JPFA",
+    "MIKA",
+    "TAPG"
    ]
   },
   {
@@ -120,8 +122,8 @@
    "book": [
     "ADRO",
     "BBCA",
+    "CMNT",
     "CMRY",
-    "DSNG",
     "DSSA",
     "MIKA",
     "SILO",
@@ -130,8 +132,8 @@
    "opened": [
     "ADRO",
     "BBCA",
+    "CMNT",
     "CMRY",
-    "DSNG",
     "DSSA",
     "MIKA",
     "SILO",
@@ -149,20 +151,18 @@
     "AMRT",
     "BBCA",
     "CMNT",
-    "CTRA",
+    "CPIN",
     "DSSA",
-    "JSMR",
+    "ELSA",
     "SILO"
    ],
    "opened": [
     "AMRT",
-    "CMNT",
-    "CTRA",
-    "JSMR"
+    "CPIN",
+    "ELSA"
    ],
    "closed": [
     "CMRY",
-    "DSNG",
     "MIKA",
     "UNIQ"
    ]
@@ -175,19 +175,23 @@
    "book": [
     "ADRO",
     "AMRT",
-    "BBCA",
     "CMNT",
     "CMRY",
     "CTRA",
-    "DSNG",
-    "DSSA"
+    "DSSA",
+    "JSMR",
+    "MIKA"
    ],
    "opened": [
     "CMRY",
-    "DSNG"
+    "CTRA",
+    "JSMR",
+    "MIKA"
    ],
    "closed": [
-    "JSMR",
+    "BBCA",
+    "CPIN",
+    "ELSA",
     "SILO"
    ]
   },
@@ -200,23 +204,19 @@
     "ADRO",
     "BBCA",
     "CMRY",
+    "CTRA",
     "DSSA",
     "JSMR",
-    "TAPG",
-    "TSPC",
-    "WIFI"
+    "MIKA",
+    "TAPG"
    ],
    "opened": [
-    "JSMR",
-    "TAPG",
-    "TSPC",
-    "WIFI"
+    "BBCA",
+    "TAPG"
    ],
    "closed": [
     "AMRT",
-    "CMNT",
-    "CTRA",
-    "DSNG"
+    "CMNT"
    ]
   },
   {
@@ -229,22 +229,18 @@
     "CMRY",
     "CTRA",
     "DSSA",
-    "ICBP",
+    "JSMR",
     "SILO",
-    "TAPG",
-    "TINS"
+    "SRTG",
+    "TAPG"
    ],
    "opened": [
-    "CTRA",
-    "ICBP",
     "SILO",
-    "TINS"
+    "SRTG"
    ],
    "closed": [
     "BBCA",
-    "JSMR",
-    "TSPC",
-    "WIFI"
+    "MIKA"
    ]
   },
   {
@@ -254,27 +250,27 @@
    "vetoed": 19,
    "book": [
     "ADRO",
-    "BMRI",
     "CTRA",
-    "ICBP",
+    "KLBF",
     "LSIP",
     "MIKA",
     "NISP",
-    "SRTG"
+    "SRTG",
+    "TOBA"
    ],
    "opened": [
-    "BMRI",
+    "KLBF",
     "LSIP",
     "MIKA",
     "NISP",
-    "SRTG"
+    "TOBA"
    ],
    "closed": [
     "CMRY",
     "DSSA",
+    "JSMR",
     "SILO",
-    "TAPG",
-    "TINS"
+    "TAPG"
    ]
   },
   {
@@ -283,28 +279,26 @@
    "eligible": 101,
    "vetoed": 20,
    "book": [
+    "CTRA",
     "LSIP",
     "MIKA",
-    "MYOR",
     "NISP",
+    "PNBN",
     "PTBA",
     "SMRA",
-    "TAPG",
-    "TINS"
+    "TAPG"
    ],
    "opened": [
-    "MYOR",
+    "PNBN",
     "PTBA",
     "SMRA",
-    "TAPG",
-    "TINS"
+    "TAPG"
    ],
    "closed": [
     "ADRO",
-    "BMRI",
-    "CTRA",
-    "ICBP",
-    "SRTG"
+    "KLBF",
+    "SRTG",
+    "TOBA"
    ]
   },
   {
@@ -317,19 +311,21 @@
     "HRTA",
     "LSIP",
     "MIKA",
+    "PNBN",
     "PTBA",
-    "SMRA",
     "TINS",
     "UNIQ"
    ],
    "opened": [
     "BRMS",
     "HRTA",
+    "TINS",
     "UNIQ"
    ],
    "closed": [
-    "MYOR",
+    "CTRA",
     "NISP",
+    "SMRA",
     "TAPG"
    ]
   },
@@ -339,30 +335,26 @@
    "eligible": 100,
    "vetoed": 20,
    "book": [
-    "BBCA",
     "BRMS",
-    "CMRY",
-    "CTRA",
-    "NISP",
+    "DEWA",
+    "DSNG",
+    "ESSA",
     "PNBN",
     "PTBA",
-    "UNTR"
+    "TAPG",
+    "UNIQ"
    ],
    "opened": [
-    "BBCA",
-    "CMRY",
-    "CTRA",
-    "NISP",
-    "PNBN",
-    "UNTR"
+    "DEWA",
+    "DSNG",
+    "ESSA",
+    "TAPG"
    ],
    "closed": [
     "HRTA",
     "LSIP",
     "MIKA",
-    "SMRA",
-    "TINS",
-    "UNIQ"
+    "TINS"
    ]
   },
   {
@@ -373,24 +365,26 @@
    "book": [
     "ADRO",
     "BBCA",
-    "CMRY",
     "DSNG",
-    "DSSA",
+    "ERAA",
     "JPFA",
     "NISP",
-    "PNBN"
+    "PNBN",
+    "TAPG"
    ],
    "opened": [
     "ADRO",
-    "DSNG",
-    "DSSA",
-    "JPFA"
+    "BBCA",
+    "ERAA",
+    "JPFA",
+    "NISP"
    ],
    "closed": [
     "BRMS",
-    "CTRA",
+    "DEWA",
+    "ESSA",
     "PTBA",
-    "UNTR"
+    "UNIQ"
    ]
   },
   {
@@ -403,12 +397,12 @@
    "closed": [
     "ADRO",
     "BBCA",
-    "CMRY",
     "DSNG",
-    "DSSA",
+    "ERAA",
     "JPFA",
     "NISP",
-    "PNBN"
+    "PNBN",
+    "TAPG"
    ]
   },
   {
@@ -418,23 +412,23 @@
    "vetoed": 18,
    "book": [
     "BBCA",
+    "ICBP",
     "ITMG",
     "JPFA",
     "NISP",
     "PGAS",
     "SRTG",
-    "UNTR",
-    "WIFI"
+    "UNIQ"
    ],
    "opened": [
     "BBCA",
+    "ICBP",
     "ITMG",
     "JPFA",
     "NISP",
     "PGAS",
     "SRTG",
-    "UNTR",
-    "WIFI"
+    "UNIQ"
    ],
    "closed": []
   },
@@ -447,13 +441,13 @@
    "opened": [],
    "closed": [
     "BBCA",
+    "ICBP",
     "ITMG",
     "JPFA",
     "NISP",
     "PGAS",
     "SRTG",
-    "UNTR",
-    "WIFI"
+    "UNIQ"
    ]
   },
   {
@@ -573,9 +567,9 @@
     "BRMS",
     "BRPT",
     "DEWA",
-    "ELSA",
-    "EMTK",
     "HEAL",
+    "LSIP",
+    "PYFA",
     "TAPG",
     "WIFI"
    ],
@@ -583,9 +577,9 @@
     "BRMS",
     "BRPT",
     "DEWA",
-    "ELSA",
-    "EMTK",
     "HEAL",
+    "LSIP",
+    "PYFA",
     "TAPG",
     "WIFI"
    ],
@@ -597,8 +591,8 @@
    "eligible": 85,
    "vetoed": 17,
    "book": [
-    "AALI",
     "BRPT",
+    "CASA",
     "DEWA",
     "EMTK",
     "HEAL",
@@ -607,13 +601,13 @@
     "TAPG"
    ],
    "opened": [
-    "AALI",
-    "LSIP",
+    "CASA",
+    "EMTK",
     "NCKL"
    ],
    "closed": [
     "BRMS",
-    "ELSA",
+    "PYFA",
     "WIFI"
    ]
   },
@@ -623,22 +617,20 @@
    "eligible": 89,
    "vetoed": 17,
    "book": [
-    "AALI",
     "CASA",
     "DEWA",
     "EMTK",
     "HEAL",
+    "LSIP",
     "NCKL",
     "PYFA",
     "TAPG"
    ],
    "opened": [
-    "CASA",
     "PYFA"
    ],
    "closed": [
-    "BRPT",
-    "LSIP"
+    "BRPT"
    ]
   },
   {
@@ -647,20 +639,20 @@
    "eligible": 92,
    "vetoed": 18,
    "book": [
-    "AALI",
-    "ANTM",
     "BRMS",
-    "BUKA",
+    "ELSA",
     "EMTK",
     "HRTA",
+    "LSIP",
+    "MDKA",
     "NCKL",
     "TKIM"
    ],
    "opened": [
-    "ANTM",
     "BRMS",
-    "BUKA",
+    "ELSA",
     "HRTA",
+    "MDKA",
     "TKIM"
    ],
    "closed": [
@@ -687,16 +679,14 @@
     "TKIM"
    ],
    "opened": [
-    "ELSA",
     "HEAL",
     "MIDI",
     "PGAS"
    ],
    "closed": [
-    "AALI",
-    "ANTM",
-    "BUKA",
-    "EMTK"
+    "EMTK",
+    "LSIP",
+    "MDKA"
    ]
   },
   {
@@ -709,21 +699,19 @@
     "BRPT",
     "DEWA",
     "EMTK",
+    "HEAL",
     "HRTA",
     "NCKL",
-    "PYFA",
     "TINS"
    ],
    "opened": [
     "BRPT",
     "DEWA",
     "EMTK",
-    "PYFA",
     "TINS"
    ],
    "closed": [
     "ELSA",
-    "HEAL",
     "MIDI",
     "PGAS",
     "TKIM"
@@ -747,14 +735,13 @@
    "opened": [
     "CSRA",
     "ELSA",
-    "GPSO",
     "JPFA"
    ],
    "closed": [
     "BRPT",
     "DEWA",
     "EMTK",
-    "PYFA"
+    "HEAL"
    ]
   },
   {
@@ -763,26 +750,25 @@
    "eligible": 91,
    "vetoed": 18,
    "book": [
-    "AUTO",
     "CMRY",
     "CPIN",
     "ELSA",
     "JPFA",
     "LSIP",
+    "MBMA",
     "NCKL",
-    "TLKM"
+    "PGAS"
    ],
    "opened": [
-    "AUTO",
     "CMRY",
     "CPIN",
     "LSIP",
-    "TLKM"
+    "MBMA",
+    "PGAS"
    ],
    "closed": [
     "BRMS",
     "CSRA",
-    "GPSO",
     "HRTA",
     "TINS"
    ]
@@ -793,23 +779,25 @@
    "eligible": 92,
    "vetoed": 18,
    "book": [
-    "AUTO",
+    "BREN",
     "BUMI",
     "CMRY",
     "ELSA",
+    "INKP",
     "LSIP",
     "PGAS",
-    "SGRO",
-    "TLKM"
+    "SGRO"
    ],
    "opened": [
+    "BREN",
     "BUMI",
-    "PGAS",
+    "INKP",
     "SGRO"
    ],
    "closed": [
     "CPIN",
     "JPFA",
+    "MBMA",
     "NCKL"
    ]
   },
@@ -819,7 +807,7 @@
    "eligible": 87,
    "vetoed": 17,
    "book": [
-    "AUTO",
+    "BNGA",
     "BUMI",
     "CMRY",
     "INKP",
@@ -829,12 +817,12 @@
     "WIIM"
    ],
    "opened": [
-    "INKP",
+    "BNGA",
     "WIIM"
    ],
    "closed": [
-    "ELSA",
-    "TLKM"
+    "BREN",
+    "ELSA"
    ]
   },
   {
@@ -848,7 +836,7 @@
     "DEWA",
     "EXCL",
     "ISAT",
-    "MTEL",
+    "JPFA",
     "PGAS",
     "SGRO"
    ],
@@ -856,10 +844,10 @@
     "DEWA",
     "EXCL",
     "ISAT",
-    "MTEL"
+    "JPFA"
    ],
    "closed": [
-    "AUTO",
+    "BNGA",
     "INKP",
     "LSIP",
     "WIIM"
@@ -875,8 +863,8 @@
     "EXCL",
     "HRTA",
     "INCO",
-    "INKP",
     "MTEL",
+    "PGAS",
     "SGRO",
     "TKIM"
    ],
@@ -884,7 +872,7 @@
     "ALII",
     "HRTA",
     "INCO",
-    "INKP",
+    "MTEL",
     "TKIM"
    ],
    "closed": [
@@ -892,7 +880,7 @@
     "CMRY",
     "DEWA",
     "ISAT",
-    "PGAS"
+    "JPFA"
    ]
   },
   {
@@ -901,24 +889,26 @@
    "eligible": 92,
    "vetoed": 18,
    "book": [
+    "ANTM",
     "HRTA",
     "INCO",
     "INKP",
     "MBMA",
-    "MDKA",
     "SGRO",
     "TINS",
     "TKIM"
    ],
    "opened": [
+    "ANTM",
+    "INKP",
     "MBMA",
-    "MDKA",
     "TINS"
    ],
    "closed": [
     "ALII",
     "EXCL",
-    "MTEL"
+    "MTEL",
+    "PGAS"
    ]
   },
   {
@@ -933,11 +923,10 @@
     "BNGA",
     "INCO",
     "JPFA",
-    "MDKA",
+    "SGRO",
     "TKIM"
    ],
    "opened": [
-    "ANTM",
     "BBNI",
     "BJTM",
     "BNGA",
@@ -947,7 +936,6 @@
     "HRTA",
     "INKP",
     "MBMA",
-    "SGRO",
     "TINS"
    ]
   },
@@ -961,21 +949,21 @@
     "BBTN",
     "BJTM",
     "BNGA",
+    "ELSA",
     "INCO",
     "TINS",
-    "ULTJ",
-    "WIIM"
+    "ULTJ"
    ],
    "opened": [
     "BBTN",
+    "ELSA",
     "TINS",
-    "ULTJ",
-    "WIIM"
+    "ULTJ"
    ],
    "closed": [
     "ANTM",
     "JPFA",
-    "MDKA",
+    "SGRO",
     "TKIM"
    ]
   },
@@ -986,25 +974,21 @@
    "vetoed": 17,
    "book": [
     "AUTO",
-    "BBTN",
-    "BDMN",
+    "BJTM",
     "BNGA",
     "ELSA",
+    "INCO",
     "TINS",
     "TKIM",
     "ULTJ"
    ],
    "opened": [
     "AUTO",
-    "BDMN",
-    "ELSA",
     "TKIM"
    ],
    "closed": [
     "BBNI",
-    "BJTM",
-    "INCO",
-    "WIIM"
+    "BBTN"
    ]
   },
   {
@@ -1016,10 +1000,10 @@
    "opened": [],
    "closed": [
     "AUTO",
-    "BBTN",
-    "BDMN",
+    "BJTM",
     "BNGA",
     "ELSA",
+    "INCO",
     "TINS",
     "TKIM",
     "ULTJ"
@@ -1100,8 +1084,8 @@
   {
    "date": "2026-08-05",
    "exposure": 0,
-   "eligible": 83,
-   "vetoed": 16,
+   "eligible": 88,
+   "vetoed": 17,
    "book": [],
    "opened": [],
    "closed": []
@@ -1109,69 +1093,69 @@
  ],
  "equity": [
   0.998,
-  0.953223,
-  0.961856,
-  0.971864,
-  0.971864,
-  0.96992,
-  0.971531,
-  0.988577,
-  1.042495,
-  1.102027,
-  1.108177,
-  1.154188,
-  1.177114,
-  1.280177,
-  1.266139,
-  1.207905,
-  1.20549,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.141631,
-  1.139348,
-  1.177412,
-  1.25655,
-  1.307478,
-  1.260042,
-  1.343487,
-  1.4591,
-  1.38711,
-  1.376044,
-  1.454691,
-  1.511274,
-  1.570806,
-  1.743069,
-  1.643688,
-  1.665905,
-  1.709778,
-  1.508661,
-  1.508661,
-  1.508661,
-  1.508661,
-  1.508661,
-  1.508661,
-  1.508661,
-  1.508661,
-  1.508661,
-  1.508661
+  0.962296,
+  0.951376,
+  0.967448,
+  0.967448,
+  0.965513,
+  0.976922,
+  0.987782,
+  1.036533,
+  1.056611,
+  1.083707,
+  1.126101,
+  1.127767,
+  1.242728,
+  1.198983,
+  1.14827,
+  1.145974,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.046534,
+  1.044441,
+  1.058213,
+  1.114018,
+  1.154832,
+  1.132529,
+  1.219965,
+  1.404903,
+  1.344138,
+  1.33526,
+  1.401928,
+  1.448596,
+  1.500271,
+  1.617659,
+  1.545314,
+  1.562787,
+  1.669501,
+  1.396172,
+  1.396172,
+  1.396172,
+  1.396172,
+  1.396172,
+  1.396172,
+  1.396172,
+  1.396172,
+  1.396172,
+  1.396172
  ],
- "trades": 272,
+ "trades": 256,
  "noFill": 0,
  "sellNoFill": 0,
- "costPaid": 0.10409,
- "finalEquity": 1.508661,
- "maxDrawdown": 0.13448,
- "cagr": 0.201032,
- "hash": "8bb4972cd5b41c93df92445ca37f93d3",
- "windowEnd": "2026-08-05"
+ "costPaid": 0.092379,
+ "finalEquity": 1.396172,
+ "maxDrawdown": 0.163719,
+ "cagr": 0.158422,
+ "hash": "eee5cebcd5cfa9f3c3c6a3333b5f96a5",
+ "windowEnd": "2026-08-13"
 }
