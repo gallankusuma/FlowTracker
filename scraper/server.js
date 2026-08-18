@@ -2699,11 +2699,22 @@ async function autoCalculateConcentration(targetDate, force = false) {
     const model = MODEL_FT;
 
     // dnValues[0] = latestDate (dn0), [1] = day before (dn1), etc.
-    const dn0 = dnValues[0] ?? 0;
-    const dn1 = dnValues[1] ?? 0;
-    const dn2 = dnValues[2] ?? 0;
-    const dn3 = dnValues[3] ?? 0;
-    const dn4 = dnValues[4] ?? 0;
+    // NULL, NOT ZERO, for a session we have no broker book for. `?? 0` published
+    // "0.00%" -- a real reading of a perfectly balanced market -- for tickers that
+    // simply had no data that day, and the Flow Analyzer rendered it as exactly
+    // that. The 600-ticker expansion made this visible rather than new: names added
+    // then show 0.00% across DAY-4..DAY-2 only because their broker history starts
+    // later. Storing NULL lets the null-preservation added in R2-A do its job and
+    // the column render an em dash instead of a number nobody measured.
+    //
+    // The scorer is untouched: both readers already coerce with `c.dn0 ?? 0`, so
+    // F1/F7 see exactly what they saw before. This changes what the stored number
+    // CLAIMS, not what the engine does with it.
+    const dn0 = dnValues[0] ?? null;
+    const dn1 = dnValues[1] ?? null;
+    const dn2 = dnValues[2] ?? null;
+    const dn3 = dnValues[3] ?? null;
+    const dn4 = dnValues[4] ?? null;
 
     // Get price info from idx_stock_prices or Yahoo cache
     const [priceRow] = await pool.query(
