@@ -44,6 +44,34 @@ test('the old halving is gone — the value is not ~24.3 or ~12.7', () => {
   assert.ok(Math.abs(v - 12.70) > 1, `the 0.6 NG blend is back: ${v}`);
 });
 
+// idx_broker_summary, stock_code='TLKM', date='2026-08-14'. The session that
+// settled "top 3 per side" against "top 6 by magnitude": the reference site
+// published -9.33, per-side gives -9.32, and by-magnitude gives +6.50 -- not
+// merely a different number but the opposite direction.
+const TLKM_2026_08_14 = [
+  -47884419000, 38433777000, -11820153000, 9635803000, 9241124000, 8209963000,
+  6341115000, 5976828000, -5942193000, -5558368000, -4640765000, -4202168000,
+  3970120000, 3791906000, -2027480000, -1435619000, 1126942000, -1110015000,
+  -1037560000, -1012913000, -987787000, -594645000, 518351000, -500264000,
+  465014000, 324766000, 290178000, 276335000, -256042000, 239456000,
+  -169441000, 150451000, -138535000, 131262000, 100860000, 75456000,
+  -73750000, 51123000, -31702000, 29252000, 26000000, 20960000,
+  18662000, -15097000, -13736000, 13100000, 12803000, -12596000,
+  -6575000, -4741000, 3393000, 2610000, -2610000, 259000,
+];
+
+test('TLKM 2026-08-14 matches the reference where the rival reading flips the sign', () => {
+  assert.strictEqual(signedTop3ConcentrationRounded(TLKM_2026_08_14), -9.32);
+
+  // The rival reading, computed rather than asserted so the divergence is
+  // visible: the top 6 by |net| here is 4 buyers / 2 sellers, not 3/3.
+  const top6 = [...TLKM_2026_08_14].sort((a, b) => Math.abs(b) - Math.abs(a)).slice(0, 6);
+  const posTotal = TLKM_2026_08_14.filter(n => n > 0).reduce((a, b) => a + b, 0);
+  const byMagnitude = 100 * top6.reduce((a, b) => a + b, 0) / posTotal;
+  assert.ok(byMagnitude > 0, 'the rival reading is positive on this session');
+  assert.ok(Math.abs(byMagnitude + 9.33) > 15, 'the readings must be far apart here');
+});
+
 console.log('\nthe definition, stated as tests');
 
 test('top 3 PER SIDE, not top 6 by magnitude — the sample could not tell these apart', () => {

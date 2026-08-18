@@ -24,15 +24,16 @@
  * SUM|net| therefore halves every value — that is precisely the shape of the old
  * divergence, and it is why the metric must name which side it normalises by.
  *
- * A KNOWN AMBIGUITY, RECORDED RATHER THAN HIDDEN. On all five reference sessions
- * the top 6 brokers by |net| happened to split exactly 3 buyers / 3 sellers, so
- * that sample cannot distinguish "top 3 per side" from "top 6 by magnitude".
- * Across the universe the two disagree on 52% of ticker-sessions (max gap 60
- * points), so the choice matters. This implements TOP 3 PER SIDE, which is what
- * the reference site's own column label ("TOP 3 BROKER CONCENTRATION") says and
- * what the buyer/seller framing implies. Confirming it needs reference values
- * for a session where the top 6 by |net| are NOT 3/3 — see
- * test_concentration_formula.js, which pins the distinction with a fixture.
+ * WHICH READING, SETTLED EMPIRICALLY. "Top 3" admits two readings: top 3 per
+ * side (6 brokers), or top 6 by magnitude. On the first five reference sessions
+ * the top 6 happened to split exactly 3/3, so they were indistinguishable there
+ * and the choice was made on the label alone. Two more reference tickers then
+ * supplied three sessions whose top 6 is NOT 3/3, and all three decide the same
+ * way -- BBCA 2026-08-11 (ref -28.59: per-side -28.65, by-magnitude -49.58),
+ * TLKM 2026-08-11 (ref -36.36: -36.49 vs -18.34) and TLKM 2026-08-14 (ref
+ * -9.33: -9.32 vs +6.50, where by-magnitude gets the SIGN wrong). Across all 15
+ * reference points per-side is off by a mean 0.089 points, by-magnitude by
+ * 3.732. TOP 3 PER SIDE it is.
  *
  * NG (negotiated market) DELIBERATELY PLAYS NO PART. The previous model blended
  * an NG concentration at 0.6 weight. In NG a crossing puts the same broker on
