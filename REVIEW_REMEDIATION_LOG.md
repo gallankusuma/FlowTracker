@@ -299,10 +299,36 @@ origin is echoed back with `Access-Control-Allow-Credentials: true`, and a
 non-allowlisted origin receives **no** `Access-Control-Allow-Origin` header at
 all. No code change was needed — `cors` already reflects when given an array.
 
-This makes **FT-P0-02 a prerequisite for the browser half of every future slice**,
-not an independent item: today `API_BASE` resolves to `/scraper-api`, and no nginx
-site on the box proxies that path, so the production page has no working route to
-the API at all. Machine callers on `x-admin-key` are unaffected throughout.
+**CORRECTION 2026-08-18 — the second half of that finding was wrong.** I wrote
+that no nginx site proxies `/scraper-api`, so the production page had no route to
+the API. That was an artefact of my own command: I searched with `grep -r`, and
+every entry in `sites-enabled` is a symlink, which `-r` does not follow. `grep -R`
+finds it immediately. The proxy exists and always did:
+
+```
+/etc/nginx/sites-available/flowtracker-direct   (listen 3200)
+  location /scraper-api/ -> proxy_pass http://127.0.0.1:3100
+  location /             -> proxy_pass http://127.0.0.1:3201   (Next.js)
+```
+
+Frontend and API are therefore served from **one origin**, which is exactly the
+condition `SameSite=Strict` needs. Verified against the live box through the
+public port, not inferred:
+
+```
+GET  :3200/scraper-api/api/operator/whoami  -> 401
+GET  :3200/scraper-api/api/admin/watchlist  -> 401
+POST :3200/scraper-api/api/operator/login   -> {"error":"invalid operator key","attemptsRemaining":4}
+GET  :3200/scraper-api/api/health           -> 200
+```
+
+So the mechanism above still holds — only a same-site route can carry the
+session, and CORS could never have substituted for one — but the conclusion drawn
+from it does not. **FT-P0-01A is not blocked on transport; the transport is
+already there.** FT-P0-02 remains worth doing on its own merits, and the reviewer
+promoted it partly on my incorrect claim, so that promotion deserves re-reading
+rather than being treated as settled. Machine callers on `x-admin-key` are
+unaffected throughout.
 
 **Deploy status: NOT deployed, deliberately.** `predeploy_check.sh` ends in
 `SOMETHING FAILED — do not deploy`. The failure is `verify_strategy_book.js`
