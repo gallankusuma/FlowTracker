@@ -298,7 +298,7 @@ Do not:
 
 ### FT-P0-02 — Repair the frontend/backend API contract
 
-Status: `IN_PROGRESS — claimed 2026-08-18, scope: audit/codify the existing production route`
+Status: `AWAITING_REVIEW — 2026-08-18, contract codified, local path added, gate green`
 
 Dispatch: `2026-08-16-03 — EXECUTE NOW (dependency unblocker)`
 

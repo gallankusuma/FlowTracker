@@ -563,3 +563,28 @@ Cookie attributes survive nginx unchanged.
 same-site contract (`daily-picks`, `journey`, `screener`, `stockbit-connector`).
 The list may only shrink; a new hardcoded origin fails the suite. They are
 outside this slice and none can carry an operator session.
+
+### The gate, and what its previous greens did not cover
+
+`predeploy_check.sh` — **`ALL SUITES PASSED`, exit 0, 4 of 4 steps** (credential
+preflight, unit, golden fixture, integration), run alone with nothing else
+touching the database.
+
+It took two attempts, and the first failure is worth more than the pass.
+Syncing `scraper/package.json` from the repository turned the gate red with
+`Cannot find module .../test_candle_geometry.js`. The file had never been
+deployed, **and the box's own `package.json` did not reference it** — the two
+were consistent in the same omission, so nothing ever complained.
+
+So every earlier "ALL SUITES PASSED" on that box, including the ones cited in
+this log today, meant *"every suite this machine happens to list passed"*, not
+*"every suite in the repository passed"*. The same shape as the defects this
+slice removes: a check that looks total while its scope has quietly shrunk.
+
+Fixed, and verified by enumeration rather than by trusting the fix: all 24 files
+referenced by `test:unit`, `test:verify` and `test:integration` are now present on
+the box. `.deployed-commit` stamped `c9ddf97`.
+
+**Not claimed:** that the two `--update-golden` re-baselines earlier today are
+accepted. The reviewer blocked them for regenerating from mutable database state,
+and that objection is unaffected by this run.
