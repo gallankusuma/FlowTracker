@@ -1155,7 +1155,33 @@
  "costPaid": 0.092379,
  "finalEquity": 1.396172,
  "maxDrawdown": 0.163719,
- "cagr": 0.158422,
+ "cagr": 0.158117,
  "hash": "9b41c9d4c5b2512992c607777e0ede14",
- "windowEnd": "2026-08-13"
+ "windowEnd": "2026-08-14",
+ "input": {
+  "all": "e8933bb2ce97f61c",
+  "parts": [
+   {
+    "name": "idx_ihsg_history",
+    "rows": 2422,
+    "from": "2016-08-01",
+    "to": "2026-08-14",
+    "hash": "8adbe4d9dbd31d76"
+   },
+   {
+    "name": "idx_stock_prices",
+    "rows": 1145730,
+    "from": "2016-08-01",
+    "to": "2026-08-14",
+    "hash": "f15984dbbbb5bdae"
+   },
+   {
+    "name": "idx_concentration",
+    "rows": 100457,
+    "from": "2024-01-02",
+    "to": "2026-08-14",
+    "hash": "7444d08670f5a236"
+   }
+  ]
+ }
 }

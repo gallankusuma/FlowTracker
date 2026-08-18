@@ -65,6 +65,70 @@ function check(name, cond, detail) {
   else { fail++; console.log(`  FAIL  ${name}${detail ? '\n          ' + detail : ''}`); }
 }
 
+/**
+ * Identity of the INPUT the backtest reads.
+ *
+ * The golden fixture pins an output. Without recording what produced it, a
+ * change in the database is indistinguishable from a change in the code: the
+ * hash moves and the diff blames whatever line was touched last. That is how
+ * two re-baselines landed in one day, each explaining an output that had moved
+ * for reasons outside the file being edited.
+ *
+ * BOUNDED BY THE PINNED WINDOW END, and that bound is the whole reason this is
+ * usable. An unbounded digest covers rows the backtest never reads, so every
+ * nightly session would move it and the fixture would fail each morning for a
+ * reason that has nothing to do with the code. This file already learned that
+ * lesson once with windowEnd. A check that goes red daily is one people
+ * regenerate without reading, which is worse than not having it.
+ *
+ * Bounded, it moves only when data INSIDE the window changes -- a backfill, a
+ * recalculation, a repaired hole -- which is exactly the event that must never
+ * pass unnoticed.
+ *
+ * These are the three queries load() runs, hashed row by row in the same order
+ * the loader sees them, so the digest is a function of the data and nothing
+ * else. Per-table breakdown is kept because "the input changed" is not useful
+ * on its own -- the reviewer needs to see WHICH table and by how much.
+ */
+async function inputDigest(pool, windowEnd) {
+  const part = async (name, sql, cols) => {
+    const [rows] = await pool.query(sql, [windowEnd]);
+    const h = crypto.createHash("sha256");
+    let from = null, to = null;
+    for (const r of rows) {
+      // Hash the values, not the row object: key order and driver types must
+      // not leak into an identity that is supposed to describe the data.
+      h.update(cols.map(c => {
+        const v = r[c];
+        return v === null || v === undefined ? "" :
+          (v instanceof Date ? toDateStr(v) : String(v));
+      }).join("\u0001"));
+      h.update("\u0002");
+      const d = r.date ?? r.data_date;
+      if (d !== undefined) {
+        const s = toDateStr(d);
+        if (from === null || s < from) from = s;
+        if (to === null || s > to) to = s;
+      }
+    }
+    return { name, rows: rows.length, from, to, hash: h.digest("hex").slice(0, 16) };
+  };
+
+  const parts = [
+    await part("idx_ihsg_history", "SELECT date, close_price FROM idx_ihsg_history WHERE date <= ? ORDER BY date ASC", ["date", "close_price"]),
+    await part("idx_stock_prices",
+      "SELECT stock_code, date, open_price, high_price, close_price, volume, value FROM idx_stock_prices WHERE close_price > 0 AND date <= ? ORDER BY stock_code, date ASC",
+      ["stock_code", "date", "open_price", "high_price", "close_price", "volume", "value"]),
+    await part("idx_concentration",
+      "SELECT stock_code, data_date, dn0 FROM idx_concentration WHERE data_date <= ? ORDER BY stock_code, data_date ASC",
+      ["stock_code", "data_date", "dn0"]),
+  ];
+  const all = crypto.createHash("sha256")
+    .update(parts.map(p => p.name + ":" + p.rows + ":" + p.hash).join("|"))
+    .digest("hex").slice(0, 16);
+  return { all, parts };
+}
+
 async function load(pool) {
   const [ihsgRows] = await pool.query('SELECT date, close_price FROM idx_ihsg_history ORDER BY date ASC');
   const tradingDates = ihsgRows.map(r => toDateStr(r.date));
@@ -224,6 +288,9 @@ function replay(ctx, firstI, lastI, params) {
   console.log(`Window ${ctx.tradingDates[firstI]} .. ${ctx.tradingDates[lastI]}   universe ${ctx.series.size}\n`);
 
   const run = replay(ctx, firstI, lastI, PARAMS);
+  const input = await inputDigest(pool, ctx.tradingDates[lastI]);
+  console.log(`  input digest ${input.all}  ` +
+    input.parts.map(p => `${p.name.replace("idx_", "")}=${p.rows}`).join("  "));
   console.log(`  decisions ${run.decisions.length}  trades ${run.trades}  buy NO_FILL ${run.noFill}  sell NO_FILL ${run.sellNoFill}`);
   console.log(`  finalEquity ${run.finalEquity}  maxDD ${(run.maxDrawdown * 100).toFixed(2)}%  cagr ${(run.cagr * 100).toFixed(2)}%`);
   console.log(`  hash ${run.hash}\n`);
@@ -232,7 +299,7 @@ function replay(ctx, firstI, lastI, params) {
     fs.mkdirSync(path.dirname(GOLDEN), { recursive: true });
     // The window end travels WITH the fixture, so the next run compares the same
     // span rather than whatever the data happens to reach that day.
-    fs.writeFileSync(GOLDEN, JSON.stringify({ ...run, windowEnd: ctx.tradingDates[lastI] }, null, 1));
+    fs.writeFileSync(GOLDEN, JSON.stringify({ ...run, windowEnd: ctx.tradingDates[lastI], input }, null, 1));
     console.log(`  GOLDEN FIXTURE WRITTEN -> ${GOLDEN}`);
     console.log('  Commit it. From now on any change to these numbers fails the test.');
     await pool.end();
@@ -245,6 +312,31 @@ function replay(ctx, firstI, lastI, params) {
     fail++;
   } else {
     const g = JSON.parse(fs.readFileSync(GOLDEN, 'utf8'));
+    // INPUT FIRST. If the data moved, say so before comparing outputs -- an
+    // output diff explained by an input change is not a code regression, and
+    // reporting it as one sends the reader to the wrong file.
+    if (!g.input) {
+      console.log('  NOTE  fixture predates input-digest recording; regenerate to pin its input');
+    } else if (g.input.all !== input.all) {
+      fail++;
+      console.log(`  FAIL  the INPUT changed since this fixture was taken`);
+      console.log(`          fixture input ${g.input.all}   now ${input.all}`);
+      for (const now of input.parts) {
+        const was = (g.input.parts || []).find(p => p.name === now.name);
+        if (!was) { console.log(`          + ${now.name}: new to the digest`); continue; }
+        if (was.hash === now.hash) continue;
+        const d = now.rows - was.rows;
+        console.log(`          ~ ${now.name}: ${was.rows} -> ${now.rows} rows` +
+          `${d ? ` (${d > 0 ? "+" : ""}${d})` : " (same count, different values)"}` +
+          `, ${was.from}..${was.to} -> ${now.from}..${now.to}`);
+      }
+      console.log('          A fixture is a claim about OUTPUT GIVEN INPUT. Regenerating it now');
+      console.log('          would record a different claim, not repair this one. Establish why the');
+      console.log('          data moved, then --update-golden deliberately with that delta stated.');
+    } else {
+      pass++;
+      console.log(`  PASS  the input is the one this fixture was taken from (${input.all})`);
+    }
     check('decision count matches', g.decisions.length === run.decisions.length,
       `${g.decisions.length} vs ${run.decisions.length}`);
     check('trade count matches', g.trades === run.trades, `${g.trades} vs ${run.trades}`);
