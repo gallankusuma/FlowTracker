@@ -144,8 +144,15 @@ export default function FlowAnalyzer() {
     const mnV = parseFloat(filterMinVal), mxV = parseFloat(filterMaxVal);
     const mn0 = parseFloat(filterMinDay0), mx0 = parseFloat(filterMaxDay0);
     const mnC = parseFloat(filterMinChg),  mxC = parseFloat(filterMaxChg);
-    if (!isNaN(mnV)) rows = rows.filter(r => parseLastVal(r.turnover) >= mnV);
-    if (!isNaN(mxV)) rows = rows.filter(r => parseLastVal(r.turnover) <= mxV);
+    // buyValue, not turnover. `turnover` is SUM(buy_val + sell_val), which counts
+    // every trade twice: one side's buy is the other side's sell, so it is exactly
+    // 2x the value that actually changed hands. The one-sided figure is both the
+    // conventional IDX "nilai transaksi" and what the reference site publishes as
+    // LAST VAL. Display, filter and sort all read the same field on purpose --
+    // filtering on a scale the column does not show is how "min 10B" silently
+    // meant 5B.
+    if (!isNaN(mnV)) rows = rows.filter(r => parseLastVal(r.buyValue) >= mnV);
+    if (!isNaN(mxV)) rows = rows.filter(r => parseLastVal(r.buyValue) <= mxV);
     // An UNOBSERVED value cannot satisfy a numeric range. `?? 0` would have made
     // every unknown day count as exactly 0.00% and quietly pass filters like
     // "day0 <= 5", which is the missing-becomes-zero bug wearing a filter.
@@ -158,7 +165,7 @@ export default function FlowAnalyzer() {
     rows.sort((a, b) => {
       let va: number | string = 0, vb: number | string = 0;
       if (sortKey === "ticker")      { va = a.ticker;      vb = b.ticker; }
-      else if (sortKey === "turnover"){ va = parseLastVal(a.turnover); vb = parseLastVal(b.turnover); }
+      else if (sortKey === "turnover"){ va = parseLastVal(a.buyValue); vb = parseLastVal(b.buyValue); }
       else if (sortKey in dayIdx)    { va = a.days[dayIdx[sortKey]] ?? 0; vb = b.days[dayIdx[sortKey]] ?? 0; }
       else if (sortKey === "dailyChange") { va = a.dailyChangeAtSnapshot ?? 0; vb = b.dailyChangeAtSnapshot ?? 0; }
       else if (sortKey === "price")  { va = a.priceAtSnapshot ?? 0; vb = b.priceAtSnapshot ?? 0; }
@@ -392,7 +399,7 @@ export default function FlowAnalyzer() {
                             {row.ticker}
                           </span>
                         </td>
-                        <td style={{ color: "var(--text-secondary)", fontSize: 12 }}>{row.turnover}</td>
+                        <td style={{ color: "var(--text-secondary)", fontSize: 12 }}>{row.buyValue}</td>
                         {days5.map((d, di) => (
                           <td key={di} title={d === null ? "No observation for this session" : undefined}
                             style={{ textAlign: "center", fontWeight: 700, fontSize: 13,
