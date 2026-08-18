@@ -14,7 +14,11 @@
  * Projection only. No new information about the future is being claimed — this
  * is arithmetic on prints that already exist.
  */
-require('dotenv').config();
+// Loaded from the scraper root, not the cwd. Without the explicit path
+// dotenv finds nothing here and db_config falls back to its defaults --
+// which connects as the OLD shared erp_user with no password and fails
+// with a confusing 'Access denied' instead of saying the .env was missed.
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const { createPool } = require('../modules/db_config');
 const sb = require('../modules/strategy_book');
 

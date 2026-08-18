@@ -13,7 +13,11 @@
  * If it cannot reproduce a hash we already know, its output for the candidate
  * is not evidence of anything.
  */
-require('dotenv').config();
+// Loaded from the scraper root, not the cwd. Without the explicit path
+// dotenv finds nothing here and db_config falls back to its defaults --
+// which connects as the OLD shared erp_user with no password and fails
+// with a confusing 'Access denied' instead of saying the .env was missed.
+require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
