@@ -1,5 +1,14 @@
-@import "tailwindcss";
+/* Font import FIRST, before tailwind.
+ *
+ * `@import "tailwindcss"` is expanded INLINE by the bundler, so anything after it
+ * lands below ~1300 lines of generated rules. CSS requires @import to precede all
+ * rules, so the font import ended up illegal at (expanded) line 1322 and `next dev`
+ * returned HTTP 500 for every page -- while `next build` tolerated it, which is why
+ * this survived: the broken path was the one nobody's CI ran.
+ *
+ * Order matters here and is not cosmetic. Do not move the tailwind import above it. */
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Space+Grotesk:wght@600;700;800&display=swap');
+@import "tailwindcss";
 
 /* ── Dark Mode (default) ──────────────────────────────────────────────────── */
 :root, [data-theme="dark"] {
