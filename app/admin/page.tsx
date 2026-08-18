@@ -82,9 +82,25 @@ export default function AdminDataHub() {
     } catch (e) { handleOpFailure(e, "Watchlist"); }
   };
 
+  // API health, RE-CHECKED. It was fetched once on mount and never again, so the
+  // badge kept reporting "API ONLINE" long after the upstream had gone -- a cached
+  // success with no stale label, which is the exact shape FT-P0-02 exists to remove.
+  // It also called .json() without looking at r.ok, so a JSON-shaped error body
+  // read as health.
+  const checkHealth = async () => {
+    try {
+      const r = await fetch(`${API_BASE}/api/health`, { cache: "no-store" });
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      setHealth({ ...(await r.json()), checkedAt: Date.now() });
+    } catch {
+      // Unreachable is a state of its own; it must not inherit the last good one.
+      setHealth({ status: "offline", checkedAt: Date.now() });
+    }
+  };
+
   useEffect(() => {
-    // /api/health is public and stays a plain fetch.
-    fetch(`${API_BASE}/api/health`).then(r => r.json()).then(d => setHealth(d)).catch(() => setHealth({ status: "offline" }));
+    checkHealth();
+    const healthTimer = setInterval(checkHealth, 30_000);
     // Protected data is requested only AFTER a session is confirmed. Firing it
     // unconditionally would spray 401s and write a denial into the audit trail on
     // every page load, burying the denials that actually matter.
@@ -92,6 +108,9 @@ export default function AdminDataHub() {
       setOp(state);
       if (state.authenticated) loadOperatorData();
     });
+    // Without this the interval outlives the component and keeps polling a page
+    // nobody is looking at.
+    return () => clearInterval(healthTimer);
   }, []);
 
   const handleOperatorLogin = async () => {
@@ -312,11 +331,25 @@ export default function AdminDataHub() {
             </button>
           </div>
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "center" }}>
-            <span style={{ fontSize: 11, padding: "3px 10px", borderRadius: 20, fontWeight: 700,
-              background: health?.status === "ok" ? "rgba(63,185,80,0.15)" : "rgba(248,81,73,0.15)",
-              color: health?.status === "ok" ? "var(--accent-green)" : "var(--accent-red)" }}>
-              {health?.status === "ok" ? "● API ONLINE" : "● API OFFLINE"}
-            </span>
+            {(() => {
+              // Three states, not two. "Not checked yet" is not "online", and a
+              // reading that has gone stale says so rather than standing in for a
+              // fresh one.
+              const stale = health?.status === "ok" && health?.checkedAt && Date.now() - health.checkedAt > 90_000;
+              const good = health?.status === "ok" && !stale;
+              const unknown = !health || stale;
+              const label = !health ? "● API CHECKING…"
+                : health.status === "ok" ? (stale ? "● API LAST OK >90s AGO" : "● API ONLINE")
+                : "● API OFFLINE";
+              return (
+                <span title={health?.checkedAt ? `last checked ${new Date(health.checkedAt).toLocaleTimeString()}` : undefined}
+                  style={{ fontSize: 11, padding: "3px 10px", borderRadius: 20, fontWeight: 700,
+                    background: good ? "rgba(63,185,80,0.15)" : unknown ? "rgba(210,153,34,0.15)" : "rgba(248,81,73,0.15)",
+                    color: good ? "var(--accent-green)" : unknown ? "#d29922" : "var(--accent-red)" }}>
+                  {label}
+                </span>
+              );
+            })()}
             {reloadMsg && (
               <span style={{ fontSize: 11, color: "var(--accent-green)", fontWeight: 700 }}>{reloadMsg}</span>
             )}
