@@ -262,8 +262,21 @@ function replay(ctx, firstI, lastI, params) {
       const a = g.decisions[k], b = run.decisions[k];
       if (JSON.stringify(a) !== JSON.stringify(b)) { firstDiff = { k, a, b }; break; }
     }
+    // The comparison is over the WHOLE decision object, so reporting only .book
+    // was actively misleading: a divergence in any other field printed as
+    // "golden [] / now []" -- two identical empty books -- which points the
+    // reader at the one thing that had not changed. Name the fields that differ.
+    const diffKeys = d => {
+      const keys = [...new Set([...Object.keys(d.a), ...Object.keys(d.b)])];
+      return keys.filter(k => JSON.stringify(d.a[k]) !== JSON.stringify(d.b[k]));
+    };
     check('every per-date target book, open and close matches', firstDiff === null,
-      firstDiff ? `first divergence on ${firstDiff.b.date}:\n          golden ${JSON.stringify(firstDiff.a.book)}\n          now    ${JSON.stringify(firstDiff.b.book)}` : '');
+      firstDiff ? `first divergence on ${firstDiff.b.date} (index ${firstDiff.k})` +
+        diffKeys(firstDiff).map(k =>
+          `
+          ${k}
+            golden ${JSON.stringify(firstDiff.a[k])}
+            now    ${JSON.stringify(firstDiff.b[k])}`).join('') : '');
     check('overall hash matches', g.hash === run.hash, `${g.hash} vs ${run.hash}`);
   }
 

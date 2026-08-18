@@ -2633,14 +2633,6 @@ async function autoCalculateConcentration(targetDate, force = false) {
     console.log(`  ⚠️  [CONC] ${date}: 5D window INCOMPLETE — missing ${windowMissing.join(', ')}`);
   }
 
-  // How much to favor negotiated/block-deal (NG) concentration over regular-market
-  // (RG) concentration when a stock had NG activity that day. NG trades are large,
-  // privately-negotiated blocks — a cleaner "smart money" signal than the noisier RG
-  // order book (retail + institutional mixed). This is a documented heuristic, not
-  // an empirically-optimized weight — easy to retune once we have enough outcome
-  // history to actually validate it. Falls back to pure RG (today's prior behavior,
-  // zero regression) whenever a stock has no NG data for that day, which covers
-  // every date the idx_broker_flow_detail backfill hasn't reached yet.
 
   // R2-B model identity. Bumped from the unversioned original because the
   // window definition changed: dn0..dn4 now span canonical exchange sessions,
