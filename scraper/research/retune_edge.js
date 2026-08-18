@@ -19,7 +19,8 @@
 // dotenv finds nothing here and db_config falls back to its defaults --
 // which connects as the OLD shared erp_user with no password and fails
 // with a confusing 'Access denied' instead of saying the .env was missed.
-require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+const env = require('./env');
+env.loadEnv();
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -163,4 +164,4 @@ function replay(ctx, firstI, lastI, params) {
       '  vetoed ' + String(d.vetoed).padStart(3) + '  book ' + d.bookSize);
   }
   await pool.end();
-})().catch(e => { console.error('ERR', e.message, e.stack); process.exit(1); });
+})().catch(env.fail);

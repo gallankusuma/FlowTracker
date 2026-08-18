@@ -378,3 +378,64 @@ findings above: `scraper npm run db:check` and `test:verify` failed because the
 reviewer's machine has no `.env`. The database is on the VPS and the repository
 deliberately carries no credentials. The real defect is that the documented local
 setup does not say so — a documentation fix, not a broken system.
+
+---
+
+## FT-DESIGN-01 / EXP-029 harness — env-path review corrections — **AWAITING_REVIEW**
+
+Against `RESEARCH HARNESS ENV-PATH REVIEW 2026-08-18 18:10 ICT`. The reviewer
+accepted `path.join(__dirname, '..', '.env')` as the correct resolution rule and
+then found the defect the path change had left standing.
+
+**The finding was right, and it is the one I should have caught.** `db41f20`
+fixed WHERE the file is looked for and never checked WHETHER it was found: the
+return of `dotenv.config()` was ignored. On a checkout without credentials the
+harness therefore still fell through to `db_config`'s defaults and connected as
+the old shared `erp_user` with no password — reported as *Access denied*, which
+names a credential nobody chose, for a question nobody asked. I replaced one
+silent fallback with a quieter one.
+
+| # | correction | where |
+|---|---|---|
+| 1 | required input is checked **before any pool is constructed**, naming the file and why it matters | `scraper/research/env.js` `loadEnv()` |
+| 2 | `AggregateError`/nested detail preserved — mysql2 connection failures carry an EMPTY `.message`, which printed as a bare `ERR` and looked handled | `env.js` `describeError()` walks `errors[]`, `cause`, then `code`, then the class name |
+| 3 | this log entry | here |
+| 4 | a reproducible invocation that does not need a database | `seal_candidate.js --offline` |
+
+**Evidence, run from two working directories on a box with NO `scraper/.env`
+(the reviewer's condition):**
+
+```
+node scraper/research/seal_candidate.js              -> exit 1, names the missing file
+node scraper/research/seal_candidate.js --offline    -> exit 0
+  execution policy hash : c1e3cc7a25dd6e3c
+  incumbent  hash       : 0bd4f452f2ab01b3
+  candidate  hash       : 3f98982baa68b452
+  MODE: --offline. The hashes above are derived from source only.
+```
+
+Identical from `scraper/research/` and from the repository root, so cwd
+independence holds.
+
+**And the authoritative check, on the box that has the database:**
+
+```
+hashes live in virtual_accounts: 0bd4f452f2ab01b3
+reproduces the live incumbent  : YES — the computation is the production one
+exit=0
+```
+
+**On the two modes, deliberately not blurred.** `--offline` proves the identity
+*arithmetic* and prints that it does not prove the incumbent hash is live. Only
+the database-backed run does that, and it is the one that gates the seal. The
+offline mode exists so a reviewer without credentials can reproduce the
+derivation instead of receiving a blank `ERR` — it is not a substitute and its
+own output says so.
+
+**The sealed candidate was not touched.** `3f98982baa68b452` and the recorded
+parameters are byte-identical to `CANDIDATE_SEAL_2026-08-18_vetofrac040.md`;
+altering them to make a check pass is the one thing a seal must never permit.
+
+Still open from the same review, and not claimed here: no candidate/control
+shadow lifecycle exists yet, and it cannot accumulate anything while the regime
+filter holds exposure at 0. `FT-P0-02` remains the only `READY` task.

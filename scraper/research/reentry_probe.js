@@ -18,7 +18,8 @@
 // dotenv finds nothing here and db_config falls back to its defaults --
 // which connects as the OLD shared erp_user with no password and fails
 // with a confusing 'Access denied' instead of saying the .env was missed.
-require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+const env = require('./env');
+env.loadEnv();
 const { createPool } = require('../modules/db_config');
 const sb = require('../modules/strategy_book');
 
@@ -102,4 +103,4 @@ const toDateStr = d => d instanceof Date
     spells.map(s => s.len).sort((a, b) => a - b)[spells.length >> 1] + ' sessions');
 
   await pool.end();
-})().catch(e => { console.error('ERR', e.message); process.exit(1); });
+})().catch(env.fail);

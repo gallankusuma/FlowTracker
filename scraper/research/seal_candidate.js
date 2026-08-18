@@ -13,11 +13,24 @@
  * If it cannot reproduce a hash we already know, its output for the candidate
  * is not evidence of anything.
  */
-// Loaded from the scraper root, not the cwd. Without the explicit path
-// dotenv finds nothing here and db_config falls back to its defaults --
-// which connects as the OLD shared erp_user with no password and fails
-// with a confusing 'Access denied' instead of saying the .env was missed.
-require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
+//
+// TWO MODES, and the difference matters:
+//
+//   node seal_candidate.js             the real check. Reads virtual_accounts and
+//                                      proves the incumbent hash is LIVE. Needs
+//                                      scraper/.env. Exit 0 only if it matched.
+//   node seal_candidate.js --offline   derives the hashes from source alone. Lets
+//                                      a reviewer without database access confirm
+//                                      the identity arithmetic. It proves the
+//                                      DERIVATION, not that the incumbent hash is
+//                                      live, and says so in its own output.
+//
+// The offline mode exists because the reviewer could not run the DB check and got
+// a bare "ERR" instead. It is not a substitute for the liveness proof and must
+// never be quoted as one.
+const env = require('./env');
+const OFFLINE = process.argv.includes('--offline');
+env.loadEnv({ optional: OFFLINE });
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -58,6 +71,17 @@ console.log('incumbent  hash       : ' + inc.hash);
 console.log('candidate  hash       : ' + cand.hash);
 console.log('distinct              : ' + (inc.hash !== cand.hash ? 'YES' : 'NO — the seal would be meaningless'));
 
+if (OFFLINE) {
+  console.log();
+  console.log('MODE: --offline. The hashes above are derived from source only.');
+  console.log('It is NOT proven here that ' + inc.hash + ' is the hash actually stored in');
+  console.log('virtual_accounts — run without --offline, with scraper/.env present, for that.');
+  console.log();
+  console.log('--- CANDIDATE CONFIG AS HASHED ---');
+  console.log(JSON.stringify(cand.cfg, Object.keys(cand.cfg).sort(), 2));
+  process.exit(0);
+}
+
 (async () => {
   const { createPool } = require('../modules/db_config');
   const pool = createPool();
@@ -74,4 +98,4 @@ console.log('distinct              : ' + (inc.hash !== cand.hash ? 'YES' : 'NO �
   }
   await pool.end();
   process.exit(ok ? 0 : 1);
-})().catch(e => { console.error('ERR', e.message); process.exit(1); });
+})().catch(env.fail);
