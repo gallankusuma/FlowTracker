@@ -18,6 +18,7 @@ puppeteerExtra.use(StealthPlugin());
 const puppeteer = puppeteerExtra; // alias for backward compat
 const path    = require('path');
 const { autoFibonacci } = require('./modules/fibonacci');
+const { signedTop3Concentration } = require('./modules/concentration_formula');
 const { getLunarEvents } = require('./modules/astro');
 const stats = require('./modules/statistics');
 const { analyzeFactorContributions, getFactorStats } = require('./awo_analyzer');
@@ -2640,12 +2641,14 @@ async function autoCalculateConcentration(targetDate, force = false) {
   // history to actually validate it. Falls back to pure RG (today's prior behavior,
   // zero regression) whenever a stock has no NG data for that day, which covers
   // every date the idx_broker_flow_detail backfill hasn't reached yet.
-  const NG_WEIGHT = 0.6;
 
   // R2-B model identity. Bumped from the unversioned original because the
   // window definition changed: dn0..dn4 now span canonical exchange sessions,
   // so values differ wherever a session was missing from the broker table.
-  const MODEL_VERSION = 'v2';
+  // v3: concentration is now the reference-site definition (top 3 net buyers
+  // plus top 3 net sellers over the positive side). Values move substantially
+  // versus v2 rows, so anything comparing across the boundary must read this.
+  const MODEL_VERSION = 'v3';
 
   // WAS THE NG FEED PULLED FOR THIS SESSION AT ALL?
   //
@@ -2665,79 +2668,43 @@ async function autoCalculateConcentration(targetDate, force = false) {
     ngFeedByDate[d] = fd.length > 0;
   }
   const ngFeedGaps = tradingDates.filter(d => !ngFeedByDate[d]);
-  const MODEL_RG   = 'SIGNED_TOP3_RG_V1';
-  const MODEL_RGNG = 'SIGNED_TOP3_RGNG_V1';
+  // Supersedes SIGNED_TOP3_RG_V1 / SIGNED_TOP3_RGNG_V1 (2026-08-18). Those
+  // normalised by SUM|net| and blended NG at 0.6, which together published
+  // roughly 0.4x the reference site's figure. Rows written before this date
+  // still carry the old model names, which is what model_version is for.
+  const MODEL_FT = 'FT_TOP3BUY_TOP3SELL_V1';
 
   let saved = 0;
   for (const stock of stockRows) {
     const ticker = stock.stock_code;
     const dnValues = [];
-    // Which model actually ran, and why NG did or did not contribute. Collected
-    // per session, then reduced to one verdict for the row.
-    let usedNG = false, sawNGActivity = false;
 
     // Calculate concentration for each of last 5 days
     for (const d of tradingDates) {
-      const [topBrokers] = await pool.query(`
-        SELECT (buy_val - sell_val) AS net
+      // Per BROKER, not per row: a broker that appears on several rows would
+      // otherwise occupy more than one of the top-3 slots and overstate the
+      // concentration it represents.
+      const [brokerNets] = await pool.query(`
+        SELECT broker_code, SUM(buy_val - sell_val) AS net
         FROM idx_broker_summary WHERE date = ? AND stock_code = ?
-        ORDER BY ABS(buy_val - sell_val) DESC LIMIT 3
+        GROUP BY broker_code
       `, [d, ticker]);
-      const [totRow] = await pool.query(`
-        SELECT SUM(ABS(buy_val - sell_val)) AS total_net
-        FROM idx_broker_summary WHERE date = ? AND stock_code = ?
-      `, [d, ticker]);
-      const topNet = topBrokers.reduce((a, b) => a + Number(b.net), 0);
-      // totalNet is a SUM(ABS(...)) so it's never negative — only 0 or null
-      // when there's no broker data for this stock/day. The old `|| 1`
-      // fallback divided topNet by 1 instead of the true (missing) total,
-      // which could blow concRG up to ±hundreds instead of the ±100 the
-      // formula is mathematically bounded to otherwise (topNet is a sum
-      // over a subset of the same signed values totalNet sums the absolute
-      // value of, so |topNet| <= totalNet whenever totalNet is real).
-      // Confirmed in production data: 84/25946 rows exceeded ±100, all
-      // traced to this fallback. No data that day = no concentration signal
-      // = neutral 0, not a division artifact.
-      const totalNet = Number(totRow[0]?.total_net) || 0;
-      const concRG = totalNet > 0 ? (topNet / totalNet) * 100 : 0;
 
-      // Blend in NG concentration when available — same top-3-broker-by-|net|
-      // methodology, aggregated across foreign+domestic, scoped to market_segment='NG'.
-      const [topNG] = await pool.query(`
-        SELECT broker_code, SUM(net_val) AS net
-        FROM idx_broker_flow_detail WHERE date = ? AND stock_code = ? AND market_segment = 'NG'
-        GROUP BY broker_code ORDER BY ABS(SUM(net_val)) DESC LIMIT 3
-      `, [d, ticker]);
-      const [totNGRow] = await pool.query(`
-        SELECT SUM(ABS(net_val)) AS total_net
-        FROM idx_broker_flow_detail WHERE date = ? AND stock_code = ? AND market_segment = 'NG'
-      `, [d, ticker]);
-      const totalNGNet = Number(totNGRow[0]?.total_net) || 0;
-
-      // NO NG TRADING vs NO NG DATA — the same pure-RG number, two different
-      // meanings, and the writer could not tell them apart. "This stock had no
-      // block trades today" is a measurement; "we never pulled the NG feed for
-      // this date" is a hole. The health layer classifies flow_detail as
-      // DEGRADED precisely because it can go stale on its own, so the two must
-      // be distinguishable after the fact.
-      let blended = concRG;
-      if (totalNGNet > 0) {
-        const topNGNet = topNG.reduce((a, b) => a + Number(b.net), 0);
-        const concNG = (topNGNet / totalNGNet) * 100;
-        blended = concRG * (1 - NG_WEIGHT) + concNG * NG_WEIGHT;
-        usedNG = true; sawNGActivity = true;
-      }
-
-      dnValues.push(Math.round(blended * 10) / 10); // 1 decimal %
+      // The reference-site definition, recovered from data and pinned by
+      // test_concentration_formula.js. Two things it deliberately no longer
+      // does: normalise by SUM|net| (which halved every value, because the
+      // positive and negative sides are equal and opposite in a matched
+      // market), and blend an NG concentration at 0.6 weight (which applied a
+      // majority weight to a structural zero on 31.8% of ticker-days, since a
+      // negotiated crossing puts the same broker on both legs).
+      const conc = signedTop3Concentration(brokerNets.map(r => Number(r.net)));
+      dnValues.push(conc === null ? null : Math.round(conc * 100) / 100);
     }
 
-    // Feed gap beats activity: if any session in the window was never pulled,
-    // this window's NG picture is incomplete regardless of what the pulled
-    // sessions showed.
-    const ngState = ngFeedGaps.length ? 'NG_DATA_MISSING'
-      : sawNGActivity ? 'NG_ACTIVE'
-      : 'NO_NG_ACTIVITY';
-    const model = usedNG ? MODEL_RGNG : MODEL_RG;
+    // The model no longer consumes NG, so this records FEED health only —
+    // it must not keep implying NG contributed to the number.
+    const ngState = ngFeedGaps.length ? 'NG_DATA_MISSING' : 'NG_NOT_USED';
+    const model = MODEL_FT;
 
     // dnValues[0] = latestDate (dn0), [1] = day before (dn1), etc.
     const dn0 = dnValues[0] ?? 0;
