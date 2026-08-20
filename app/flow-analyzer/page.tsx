@@ -2,12 +2,18 @@
 import Navbar from "@/components/Navbar";
 import TickerDetail from "@/TickerDetail_vps";
 import { API_BASE } from "@/lib/apiConfig";
+import { parseLastVal, withinLastVal } from "@/lib/lastVal";
 import { useState, useEffect, useRef, useMemo } from "react";
 
 type FlowRow = {
   ticker: string;
+  // The API still sends the TWO-SIDED figure (SUM(buy_val + sell_val)). It is
+  // deliberately not displayed, filtered or sorted on: it is exactly 2x the
+  // value that changed hands. Kept in the type because it is in the payload --
+  // deleting it here would misdescribe what arrives, not remove it.
   turnover: string;
   turnoverRaw: number;
+  // LAST VAL: the one-sided IDX transaction value. This is the column.
   buyValue: string;
   // null = NO OBSERVATION. Not 0, which means "observed, and balanced".
   // The API used to collapse both into 0 and the UI then padded short arrays
@@ -30,38 +36,8 @@ type FlowMeta = {
 
 type StaleInfo = { blocking: string[]; signalDate?: string; limitedBy?: string; message?: string };
 
-type SortKey = "ticker" | "turnover" | "day4" | "day3" | "day2" | "day1" | "day0" | "dailyChange" | "price";
+type SortKey = "ticker" | "lastVal" | "day4" | "day3" | "day2" | "day1" | "day0" | "dailyChange" | "price";
 type SortDir = "asc" | "desc";
-
-/**
- * Parse a formatted turnover string into billions of rupiah.
- *
- * The server's formatVal() emits T, B, M, K, or a bare number for anything
- * under a thousand. This handled T, B and M, so "929.2K" fell through to
- * `return n` and was read as 929.2 BILLION — a million times too large — which
- * put the smallest rows at the top of a descending sort. A bare number had the
- * same shape of bug, off by a factor of a billion.
- *
- * The multipliers are now keyed off the suffix explicitly, and a value with no
- * recognised suffix is treated as raw rupiah rather than silently inheriting
- * the units of whatever the last branch happened to return.
- */
-const VAL_UNITS: Record<string, number> = {
-  T: 1e3,     // trillions -> billions
-  B: 1,
-  M: 1e-3,
-  K: 1e-6,
-};
-
-function parseLastVal(s: string): number {
-  if (!s) return 0;
-  const n = parseFloat(s);
-  if (isNaN(n)) return 0;
-  const suffix = s.trim().slice(-1).toUpperCase();
-  const mult = VAL_UNITS[suffix];
-  // No suffix means formatVal printed the raw figure, which is in rupiah.
-  return mult === undefined ? n / 1e9 : n * mult;
-}
 
 function pctColor(val: number) {
   if (val > 5)  return "#3fb950";
@@ -144,15 +120,10 @@ export default function FlowAnalyzer() {
     const mnV = parseFloat(filterMinVal), mxV = parseFloat(filterMaxVal);
     const mn0 = parseFloat(filterMinDay0), mx0 = parseFloat(filterMaxDay0);
     const mnC = parseFloat(filterMinChg),  mxC = parseFloat(filterMaxChg);
-    // buyValue, not turnover. `turnover` is SUM(buy_val + sell_val), which counts
-    // every trade twice: one side's buy is the other side's sell, so it is exactly
-    // 2x the value that actually changed hands. The one-sided figure is both the
-    // conventional IDX "nilai transaksi" and what the reference site publishes as
-    // LAST VAL. Display, filter and sort all read the same field on purpose --
-    // filtering on a scale the column does not show is how "min 10B" silently
-    // meant 5B.
-    if (!isNaN(mnV)) rows = rows.filter(r => parseLastVal(r.buyValue) >= mnV);
-    if (!isNaN(mxV)) rows = rows.filter(r => parseLastVal(r.buyValue) <= mxV);
+    // The column, the filter and the sort all read buyValue -- LAST VAL, the
+    // one-sided transaction value. See lib/lastVal.js for why, and
+    // scraper/test_last_val.js for the 10B boundary this must not drift from.
+    rows = rows.filter(r => withinLastVal(r.buyValue, mnV, mxV));
     // An UNOBSERVED value cannot satisfy a numeric range. `?? 0` would have made
     // every unknown day count as exactly 0.00% and quietly pass filters like
     // "day0 <= 5", which is the missing-becomes-zero bug wearing a filter.
@@ -165,7 +136,7 @@ export default function FlowAnalyzer() {
     rows.sort((a, b) => {
       let va: number | string = 0, vb: number | string = 0;
       if (sortKey === "ticker")      { va = a.ticker;      vb = b.ticker; }
-      else if (sortKey === "turnover"){ va = parseLastVal(a.buyValue); vb = parseLastVal(b.buyValue); }
+      else if (sortKey === "lastVal") { va = parseLastVal(a.buyValue); vb = parseLastVal(b.buyValue); }
       else if (sortKey in dayIdx)    { va = a.days[dayIdx[sortKey]] ?? 0; vb = b.days[dayIdx[sortKey]] ?? 0; }
       else if (sortKey === "dailyChange") { va = a.dailyChangeAtSnapshot ?? 0; vb = b.dailyChangeAtSnapshot ?? 0; }
       else if (sortKey === "price")  { va = a.priceAtSnapshot ?? 0; vb = b.priceAtSnapshot ?? 0; }
@@ -269,8 +240,8 @@ export default function FlowAnalyzer() {
           }}>
             {[
               { label: "SEARCH TICKER",    val: filterTicker,   set: (v: string) => setFilterTicker(v.toUpperCase()),  ph: "BBCA",  w: 110, type: "text"   },
-              { label: "TURNOVER MIN (B)", val: filterMinVal,   set: setFilterMinVal,   ph: "e.g. 10",  w: 105, type: "number", hint: "1B=1" },
-              { label: "TURNOVER MAX (B)", val: filterMaxVal,   set: setFilterMaxVal,   ph: "e.g. 999", w: 105, type: "number" },
+              { label: "LAST VAL MIN (B)", val: filterMinVal,   set: setFilterMinVal,   ph: "e.g. 10",  w: 108, type: "number", hint: "1B=1" },
+              { label: "LAST VAL MAX (B)", val: filterMaxVal,   set: setFilterMaxVal,   ph: "e.g. 999", w: 108, type: "number" },
               { label: "DAY 0 MIN (%)",    val: filterMinDay0,  set: setFilterMinDay0,  ph: "-100", w: 90,  type: "number" },
               { label: "DAY 0 MAX (%)",    val: filterMaxDay0,  set: setFilterMaxDay0,  ph: "100",  w: 90,  type: "number" },
               { label: "DAILY CHG MIN (%)",val: filterMinChg,   set: setFilterMinChg,   ph: "-20",  w: 100, type: "number" },
@@ -343,7 +314,7 @@ export default function FlowAnalyzer() {
               <thead>
                 <tr>
                   <Th k="ticker">TICKER</Th>
-                  <Th k="turnover">TURNOVER</Th>
+                  <Th k="lastVal" style={{ whiteSpace: "nowrap" }}>LAST VAL</Th>
                   {/* Named for what the number is. "Concentration" hid the sign:
                       +100, -90, +80 nets to +90, so this is directional dominance
                       among the largest flows, not how concentrated they are. */}

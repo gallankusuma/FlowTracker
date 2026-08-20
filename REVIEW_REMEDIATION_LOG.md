@@ -766,3 +766,68 @@ re-run below.
 `?? 0` on the READ side of `f1`/`f7` is untouched — for those two a stored 0 and a
 null both map to a neutral 50, so it is currently harmless, but it is a coercion
 and it is written down here rather than quietly left.
+
+---
+
+## FT-FLOW-01 — the UI contract, the boundary, the build — **AWAITING_REVIEW**
+
+Against `FLOW ANALYZER VALUE REVIEW 2026-08-18 10:50 ICT`: *"Rename the visible
+labels to TRANSACTION VALUE / LAST VAL (and preferably the internal key/helper),
+add a focused filter/sort fixture at the 10B boundary, then run the frontend
+build before acceptance."*
+
+**The finding was right and it was the important half.** `88574a3` moved display,
+filter and sort onto one-sided `buyValue` and left every name saying TURNOVER —
+the two-sided figure, `SUM(buy_val + sell_val)`, exactly 2x the value that
+changed hands. Correct arithmetic under a label that contradicts it is not a fix:
+a user reading TURNOVER and typing "min 10" is asking for something the column
+does not contain, and nothing on screen says so.
+
+### Renamed, all the way through
+
+| | before | after |
+|---|---|---|
+| column header | `TURNOVER` | `LAST VAL` |
+| filter labels | `TURNOVER MIN/MAX (B)` | `LAST VAL MIN/MAX (B)` |
+| sort key | `"turnover"` | `"lastVal"` |
+| parser | local `parseLastVal`, comment about turnover | `lib/lastVal.js`, documented as one-sided |
+
+The `turnover`/`turnoverRaw` fields stay in the row type with a comment saying
+what they are and that nothing reads them. The API still sends them; deleting
+them from the type would misdescribe the payload rather than remove it.
+
+### The 10B boundary — and why the helper had to move first
+
+A boundary cannot be pinned by a component that only runs in a browser. The
+parser and the range predicate now live in `lib/lastVal.js`, plain CommonJS on
+purpose: the page imports it through webpack and `scraper/test_last_val.js`
+requires it directly, so **the code under test is the code that ships**. The
+suite asserts that too — if the page grows its own `parseLastVal` again, the test
+fails rather than quietly testing a copy.
+
+`node scraper/test_last_val.js` — **15 passed, 0 failed**:
+
+- exactly `10.0B` passes a min of 10 **and** a max of 10; the bound is inclusive,
+  because the row a number names must survive the filter that names it, and an
+  exclusive bound drops it invisibly
+- `9.99B` out, `10.01B` in
+- the defect itself, stated as a test: a 5B one-sided stock prints 10B of
+  turnover, and must **not** survive a 10B floor
+- an empty box matches everything — `NaN` means "not filtering", not "nothing
+  matches", and reversing that empties the table the moment a user clears a field
+- every suffix `formatVal` emits, including the `929.2K` and bare-number cases
+  that used to read a million and a billion times too large
+- filter and sort share a scale: no kept row may sort below a dropped one
+- no *rendered* label says TURNOVER (comments may still discuss it)
+
+The frontend tree is located rather than assumed — on the VPS it is a **sibling**
+of the scraper, not its parent, the same correction `test_api_origins.js` needed.
+
+### Build
+
+`npx tsc --noEmit` clean. `npm run build` **exit 0, compiled successfully**, with
+the single pre-existing Turbopack NFT warning about `next.config.ts` and no CSS
+warning (that one was the `@import` ordering fixed under P1-02).
+
+`npm run test:unit` — **25 suites, 0 failures**, with `test_last_val.js` wired
+into `test` and `test:unit`.
