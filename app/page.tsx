@@ -1,5 +1,6 @@
 "use client";
 import Navbar from "@/components/Navbar";
+import MacroPanel from "@/components/MacroPanel";
 import { API_BASE } from "@/lib/apiConfig";
 import { useState, useEffect } from "react";
 
@@ -144,6 +145,10 @@ export default function Dashboard() {
                 ))}
               </div>
             </div>
+
+            {/* Market context. Placed under the signals and above the FAQ
+                because it describes the weather, not the trade. */}
+            <MacroPanel />
 
             {/* FAQ */}
             <div className="card" style={{ padding: 20 }}>
