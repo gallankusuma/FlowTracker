@@ -1377,3 +1377,38 @@ Peaks at 0.40 for both position sizes and falls away either side, so it is not a
 **Separate finding — why the strategy is idle.** `exposure = belowSma ? 0 : 1`, and IHSG has closed below its 200-session SMA since **2026-03-02** (106 sessions, third-longest spell in ten years) after falling 30% from the December 2025 peak. Data checked and clean: zero non-positive closes, no recent gaps, IHSG and price tables agree at 2026-08-14. Across 38 such spells the median is 3 sessions, so this is the tail, not the norm; 47.1% of the strategy window sits below the SMA. On a **flat** price the SMA rolls down through the price in ~117 sessions (~Jan/Feb 2027) because the window still carries the 8,227–9,033 prints from Oct 2025 – Jan 2026; a 6.5% rally crosses inside three months.
 
 **Status**: SEALED, NOT PROMOTED. Recorded as `CANDIDATE_SEAL_2026-08-18_vetofrac040.md`, strategy hash `3f98982baa68b452` (incumbent `0bd4f452f2ab01b3`), with the `forward_gate.js` GATE and the S4 control-track requirement pre-registered before any forward data exists. It cannot start yet: a standing-aside strategy produces **zero fills** against a gate that needs 50, so the shadow opens on the first rebalance decision with IHSG above its 200-session SMA. No production parameter was changed.
+
+---
+
+## EXP-030 (2026-08-20) — Does any macro indicator predict IHSG? Nothing survives correction
+
+- **Script**: `scraper/research/macro/exp030_macro_ic.js`
+- **Data**: `ft_macro_data`, 20 Yahoo-sourced indicators backfilled to maximum available history (165,966 rows; ~2,528 sessions each inside the IHSG window), target `idx_ihsg_history` 2016-08-01 .. 2026-08-19
+- **Question**: not "add a 15th factor" — whether any macro series deserves a place in the **regime layer**, which is the one component with a demonstrated effect (it held exposure at 0 through a 30% fall) and which currently sees only IHSG against its own 200-day average.
+- **Design**: strictly-prior features; **non-overlapping anchors** spaced H exchange sessions apart (`multiple_testing.nonOverlappingAnchors`, the EXP-026 helper); Spearman rank IC with a Fisher-z p-value; Benjamini-Hochberg across the whole family; chronological holdout at 2025-02-01.
+- **Transforms, fixed before results**: `chg20` (20-session % change) and `z250` (z-score vs trailing 250). **Horizons**: 20 and 60 sessions. 20 x 2 x 2 = **80 hypotheses**.
+
+**Result: 0 of 80 survive FDR at alpha 0.05.** Smallest q-value 0.81.
+
+**The stronger evidence is not the p-values — it is what happened when the sample doubled.** The experiment was first run on 5 years (n=41 train at H=20, n=13 at H=60 — `INSUFFICIENT_DATA` by the project's own tier rule), then re-run on full history (n=101 and n=33). The top five reshuffled almost completely:
+
+| rank | 5-year run | full-history run |
+|---|---|---|
+| 1 | CHINA_FXI chg20 H20 (IC −0.392) | WTI chg20 H20 (IC +0.209) |
+| 2 | COAL_BTU chg20 H60 | EIDO z250 H60 |
+| 3 | YIELD_CURVE chg20 H60 | NATURAL_GAS z250 H20 |
+| 4 | PALM_PROXY z250 H60 | SILVER chg20 H60 |
+| 5 | EIDO z250 H20 | CHINA_FXI z250 H60 |
+
+The 5-year leader — IC −0.39, uncorrected p=0.011, and *the same sign out of sample* — vanished from the table entirely once more data arrived. A leaderboard that does not survive its own sample being doubled is noise, and that is a more useful demonstration than any single q-value.
+
+**Rows that at least keep their sign across train and holdout** (none significant; holdout n is only 17–18): NATURAL_GAS z250 H20 (+0.201 / +0.245), CHINA_FXI z250 H20 (−0.156 / −0.152), SPY chg20 H20 (−0.146 / −0.387), VIX chg20 H20 (+0.144 / +0.316), USDIDR chg20 H20 (−0.131 / −0.243). The last is economically the most sensible — a weakening rupiah preceding weaker IHSG — and is the only one worth a pre-registered test if this is revisited.
+
+**Caveats, and they are the point:**
+
+1. **Non-overlapping anchors are brutal on n.** Ten years of daily data yields ~100 independent 20-session observations and ~33 at 60. That is `EXPLORATORY` tier at best. This is *absence of evidence*, not evidence of absence.
+2. **The holdout is burned.** It was read in the 5-year run and again in the full-history run. This family of hypotheses can no longer be tested cleanly on this window; a genuine confirmation needs data that does not yet exist, or a different market.
+3. **The second run is exploratory by construction** — it followed a null result and changed the sample. Recorded as such rather than presented as a confirmation.
+4. FRED series (FED_RATE, CPI, MFG_EMPLOYMENT, UNEMPLOYMENT, GDP) were **excluded**: `FRED_API_KEY` has never been set, so they hold zero rows. Whether US rates and inflation predict IHSG is untested, not answered.
+
+**Status**: NULL RESULT, EXPLORATORY. **No macro indicator is admissible for the regime layer on this evidence.** No production change made; the macro feed remains a display layer, and the regime switch is unchanged.
