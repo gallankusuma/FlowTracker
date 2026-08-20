@@ -26,30 +26,71 @@ FRED_BASE    = 'https://api.stlouisfed.org/fred/series/observations'
 def get_db():
     return pymysql.connect(**DB_CFG)
 
-def fetch_fred(series_id: str) -> dict | None:
-    """Fetch latest value from FRED."""
-    if not FRED_API_KEY:
-        return None
+FRED_CSV = 'https://fred.stlouisfed.org/graph/fredgraph.csv'
+
+
+def fetch_fred_observations(series_id: str) -> list:
+    """
+    Every observation of a FRED series, as [{'d': date, 'v': float}].
+
+    TWO ROUTES, and the order matters. The documented API is preferred whenever
+    FRED_API_KEY is set, because it is the stable contract. When no key exists we
+    fall back to the PUBLIC fredgraph.csv download, which needs no credential.
+
+    That fallback is the whole reason these series exist at all: the five FRED
+    indicators had produced ZERO rows for months, silently, because a key was
+    never configured -- and signal_engine.py was scoring sectors from them.
+    Waiting on a credential was never necessary; the data was public the whole
+    time.
+
+    The CSV route is not the documented interface and could change shape without
+    notice, so it announces itself rather than pretending to be the API.
+    """
+    if FRED_API_KEY:
+        try:
+            r = requests.get(FRED_BASE, params={
+                'series_id': series_id,
+                'api_key':   FRED_API_KEY,
+                'file_type': 'json',
+                'sort_order': 'asc',
+            }, timeout=20)
+            obs = [o for o in r.json().get('observations', []) if o['value'] not in ('.', '')]
+            return [{'d': o['date'], 'v': float(o['value'])} for o in obs]
+        except Exception as e:
+            log.warning(f"FRED api {series_id}: {e} -- falling back to the public CSV")
+
     try:
-        r = requests.get(FRED_BASE, params={
-            'series_id':    series_id,
-            'api_key':      FRED_API_KEY,
-            'file_type':    'json',
-            'sort_order':   'desc',
-            'limit':        2,
-        }, timeout=10)
-        data = r.json()
-        obs  = [o for o in data.get('observations', []) if o['value'] != '.']
-        if len(obs) < 2:
-            return None
-        return {
-            'current':  float(obs[0]['value']),
-            'previous': float(obs[1]['value']),
-            'date':     obs[0]['date'],
-        }
+        r = requests.get(FRED_CSV, params={'id': series_id}, timeout=25)
+        r.raise_for_status()
+        out = []
+        for line in r.text.splitlines()[1:]:          # first line is the header
+            parts = line.split(',')
+            if len(parts) < 2:
+                continue
+            d, v = parts[0].strip(), parts[1].strip()
+            # Missing observations arrive as an EMPTY field, not the '.' the JSON
+            # API uses. Checked against DGS2, which has hundreds of them.
+            if not v:
+                continue
+            try:
+                out.append({'d': d, 'v': float(v)})
+            except ValueError:
+                continue
+        return out
     except Exception as e:
-        log.warning(f"FRED {series_id}: {e}")
-        return None
+        log.warning(f"FRED csv {series_id}: {e}")
+        return []
+
+
+def fred_rows(series_id: str, history: bool) -> list:
+    """save()-shaped rows: the whole series, or just the latest observation."""
+    obs = fetch_fred_observations(series_id)
+    if len(obs) < 2:
+        return []
+    pairs = [{'current': obs[i]['v'], 'previous': obs[i - 1]['v'], 'date': obs[i]['d']}
+             for i in range(1, len(obs))]
+    return pairs if history else pairs[-1:]
+
 
 def fetch_yahoo_price(symbol: str) -> dict | None:
     """Latest close and the one before it."""
@@ -176,15 +217,34 @@ YF_SYMBOLS = {
 # a sector whose indicators are all absent scores 0 — indistinguishable from a
 # sector whose macro is genuinely balanced.
 FRED_SERIES = {
-    'FED_RATE':          'FEDFUNDS',
+    # growth
+    'GDP_GROWTH':        'A191RL1Q225SBEA',   # real GDP, % change annualised
+    # inflation, realised and expected
     'CPI':               'CPIAUCSL',
-    # MANEMP is All Employees, Manufacturing. It is NOT the PMI. Real ISM PMI is
-    # licensed and not distributed by FRED, so this was never going to be the
-    # indicator its name promised. Kept under an honest name; PMI needs a paid
-    # source or a different provider.
-    'MFG_EMPLOYMENT':    'MANEMP',
+    'PCE_PRICE':         'PCEPI',
+    'INFL_EXP_5Y':       'T5YIE',             # 5-year breakeven
+    'INFL_EXP_10Y':      'T10YIE',            # 10-year breakeven
+    # labour
     'UNEMPLOYMENT':      'UNRATE',
-    'GDP':               'A191RL1Q225SBEA',
+    'PAYROLLS':          'PAYEMS',            # nonfarm payrolls, thousands
+    'JOBLESS_CLAIMS':    'ICSA',              # weekly initial claims
+    # policy and the curve
+    'FED_RATE':          'FEDFUNDS',
+    # A REAL two-year at last. Yahoo has no clean 2Y series, which is how ^IRX
+    # (the 13-week bill) came to be stored under the name YIELD_2Y. FRED has the
+    # actual constant-maturity 2-year, so the name is now used correctly.
+    'YIELD_2Y':          'DGS2',
+    'YIELD_CURVE_10Y2Y': 'T10Y2Y',            # FRED computes this one itself
+    # money and liquidity
+    'M2':                'M2SL',
+    'M2_REAL':           'M2REAL',
+    'FED_BALANCE_SHEET': 'WALCL',
+    'REVERSE_REPO':      'RRPONTSYD',
+    # sentiment
+    'CONSUMER_SENT':     'UMCSENT',           # U. Michigan
+    # Kept under an honest name: MANEMP is manufacturing EMPLOYMENT, not the PMI.
+    # Real ISM/S&P Global PMI is licensed and not available from any free source.
+    'MFG_EMPLOYMENT':    'MANEMP',
 }
 
 
@@ -256,12 +316,24 @@ def repair_legacy(conn):
     hold 13-week yields and always did — only the name was wrong.
     """
     c = conn.cursor()
-    c.execute("SELECT COUNT(*) n FROM ft_macro_data WHERE indicator='YIELD_2Y'")
+    # SCOPED TO source='YAHOO', and that scope is load-bearing.
+    #
+    # The mislabelled rows came from Yahoo's ^IRX. Since then YIELD_2Y has become
+    # a LEGITIMATE indicator sourced from FRED's DGS2 -- an actual constant-maturity
+    # two-year. An unscoped rename would have destroyed it, folding real 2-year
+    # yields into the 3-month series. The unique key caught it on the first run;
+    # it should not have needed to.
+    #
+    # A migration that outlives the condition it was written for is a hazard, not
+    # a fix. This one now names exactly the rows it was meant for.
+    c.execute("SELECT COUNT(*) n FROM ft_macro_data WHERE indicator='YIELD_2Y' AND source='YAHOO'")
     n = c.fetchone()['n']
     if n:
-        c.execute("UPDATE ft_macro_data SET indicator='YIELD_3M' WHERE indicator='YIELD_2Y'")
+        c.execute("""UPDATE IGNORE ft_macro_data SET indicator='YIELD_3M'
+                      WHERE indicator='YIELD_2Y' AND source='YAHOO'""")
+        c.execute("DELETE FROM ft_macro_data WHERE indicator='YIELD_2Y' AND source='YAHOO'")
         conn.commit()
-        log.info(f"  repaired {n} mislabelled YIELD_2Y rows -> YIELD_3M (^IRX is the 13-week bill)")
+        log.info(f"  repaired {n} mislabelled Yahoo YIELD_2Y rows -> YIELD_3M (^IRX is the 13-week bill)")
 
     # Strip the fabricated direction: previous_value exactly 0.01 below value is
     # the signature of `spread - 0.01`, and no real series lands on that.
@@ -302,18 +374,18 @@ def run(backfill: str | None = None):
     else:
         compute_yield_curve(conn)
 
-    if FRED_API_KEY:
-        for indicator, series in FRED_SERIES.items():
-            save(conn, indicator, fetch_fred(series), 'FRED')
-    else:
-        # Loud, and specific about the consequence. This ran for months as a
-        # single warning nobody read, while signal_engine.py scored sectors
-        # from indicators that had never existed.
-        log.error("FRED_API_KEY is not set. %d series were NOT fetched: %s",
-                  len(FRED_SERIES), ', '.join(FRED_SERIES))
-        log.error("  signal_engine.py SECTOR_MAP consumes FED_RATE, CPI and UNEMPLOYMENT from this set;")
-        log.error("  its loop skips absent indicators, so CONSUMER currently scores 0 from NO data.")
-        log.error("  Free key: https://fred.stlouisfed.org/docs/api/api_key.html then set FRED_API_KEY in .env")
+    # No key required. The five series that had produced zero rows for months
+    # are fetched here whether or not FRED_API_KEY exists.
+    log.info(f"FRED via {'the keyed API' if FRED_API_KEY else 'the public CSV endpoint (no key needed)'}")
+    for indicator, series in FRED_SERIES.items():
+        rows = fred_rows(series, history=bool(backfill))
+        for r in rows:
+            save(conn, indicator, r, 'FRED', quiet=bool(backfill))
+        if backfill:
+            conn.commit()
+            log.info(f"  {indicator}: {len(rows)} observations")
+        elif not rows:
+            log.warning(f"  {indicator} ({series}): no observations returned")
 
     conn.close()
     log.info("=== Macro Fetcher Done ===")

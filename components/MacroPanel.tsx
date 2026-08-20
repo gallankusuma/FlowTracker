@@ -57,13 +57,36 @@ const META: Record<string, { label: string; note?: string; proxy?: boolean; dp?:
   YIELD_10Y:    { label: "US 10Y yield", dp: 3 },
   YIELD_3M:     { label: "US 3M yield", dp: 3 },
   YIELD_CURVE:  { label: "10Y − 3M spread", dp: 3 },
+
+  // FRED. These arrive from the public fredgraph.csv endpoint, which needs no
+  // API key -- the reason the first five below had produced zero rows for months.
+  GDP_GROWTH:        { label: "US GDP growth", note: "% annualised, quarterly", dp: 1 },
+  CPI:               { label: "US CPI", note: "index level, monthly", dp: 1 },
+  PCE_PRICE:         { label: "US PCE price", note: "index level, monthly", dp: 1 },
+  INFL_EXP_5Y:       { label: "Infl. exp. 5Y", note: "breakeven", dp: 2 },
+  INFL_EXP_10Y:      { label: "Infl. exp. 10Y", note: "breakeven", dp: 2 },
+  UNEMPLOYMENT:      { label: "US unemployment", note: "%, monthly", dp: 1 },
+  PAYROLLS:          { label: "Nonfarm payrolls", note: "thousands of jobs", dp: 0 },
+  JOBLESS_CLAIMS:    { label: "Jobless claims", note: "weekly initial claims", dp: 0 },
+  FED_RATE:          { label: "Fed funds rate", note: "%, monthly", dp: 2 },
+  YIELD_2Y:          { label: "US 2Y yield", note: "constant maturity", dp: 3 },
+  YIELD_CURVE_10Y2Y: { label: "10Y − 2Y spread", note: "computed by FRED", dp: 2 },
+  M2:                { label: "M2 money stock", note: "USD billions", dp: 0 },
+  M2_REAL:           { label: "M2 real", note: "inflation-adjusted", dp: 0 },
+  FED_BALANCE_SHEET: { label: "Fed balance sheet", note: "USD millions", dp: 0 },
+  REVERSE_REPO:      { label: "Reverse repo", note: "USD billions, overnight", dp: 3 },
+  CONSUMER_SENT:     { label: "Consumer sentiment", note: "U. Michigan", dp: 1 },
+  MFG_EMPLOYMENT:    { label: "Mfg employment", note: "NOT the PMI — real ISM/PMI is licensed and unavailable", dp: 0 },
 };
 
 const GROUPS: { title: string; keys: string[] }[] = [
   { title: "INDONESIA", keys: ["USDIDR", "JKSE", "EIDO"] },
   { title: "COMMODITIES", keys: ["COAL_BTU", "PALM_PROXY", "NICKEL_PROXY", "WTI", "COPPER", "GOLD", "SILVER", "NATURAL_GAS"] },
   { title: "GLOBAL RISK", keys: ["VIX", "DXY", "SPY", "QQQ", "EM_EEM", "CHINA_FXI"] },
-  { title: "US RATES", keys: ["YIELD_10Y", "YIELD_3M", "YIELD_CURVE"] },
+  { title: "RATES & CURVE", keys: ["FED_RATE", "YIELD_2Y", "YIELD_10Y", "YIELD_3M", "YIELD_CURVE_10Y2Y", "YIELD_CURVE"] },
+  { title: "GROWTH & LABOUR", keys: ["GDP_GROWTH", "UNEMPLOYMENT", "PAYROLLS", "JOBLESS_CLAIMS", "MFG_EMPLOYMENT", "CONSUMER_SENT"] },
+  { title: "INFLATION", keys: ["CPI", "PCE_PRICE", "INFL_EXP_5Y", "INFL_EXP_10Y"] },
+  { title: "MONEY & LIQUIDITY", keys: ["M2", "M2_REAL", "FED_BALANCE_SHEET", "REVERSE_REPO"] },
 ];
 
 function pct(cur: number, prev: number | null): number | null {
@@ -100,6 +123,12 @@ function Tile({ row }: { row: Row }) {
         {change === null
           ? <span style={{ color: "var(--text-muted)" }}>no prior</span>
           : `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`}
+      </div>
+      {/* The observation date, because a monthly or quarterly series is NOT
+          stale just because it is not from today -- and the reader cannot tell
+          which without being told. */}
+      <div style={{ fontSize: 9, color: "var(--text-muted)", marginTop: 2 }}>
+        {row.date ? new Date(row.date).toLocaleDateString("id-ID", { day: "2-digit", month: "short", year: "2-digit" }) : ""}
       </div>
     </div>
   );
