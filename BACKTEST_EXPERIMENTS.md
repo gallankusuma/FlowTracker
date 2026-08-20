@@ -1442,3 +1442,44 @@ Three of nine negative, against 4.5 expected under the null. The combined Z is *
 **Conclusion**: H1 is falsified. Currency weakness is not a usable regime input on this evidence, and the EXP-030 hint that suggested it was noise. No production change; the macro feed remains a display layer and the regime switch is untouched.
 
 **Method note worth keeping.** The holdout problem was solved by moving *across markets* rather than forward in time. Waiting for fresh Indonesian data would have needed ~2.4 years to reach 30 non-overlapping anchors; nine untouched markets supplied 1,090 observations the same afternoon. Where a hypothesis is about a mechanism rather than about one instrument, other instruments are a legitimate — and immediate — out-of-sample set.
+
+---
+
+## EXP-032 (2026-08-20) — The 17 FRED series: nothing survives, and one coherent candidate
+
+- **Script**: `scraper/research/macro/exp032_fred_ic.js`
+- **Data**: 17 FRED series (52,845 rows) fetched via the keyless public CSV endpoint; target `idx_ihsg_history` 2016-08-01 .. 2026-08-20
+- **Holdout**: from 2025-02-01, **clean for these series** — EXP-030 burned its holdout on the 20 Yahoo indicators, which did not include any of these.
+- **Design**: as EXP-030 — step function of last-known values, non-overlapping anchors, Spearman rank IC, Benjamini-Hochberg over the whole family. 17 x 2 transforms x 2 horizons = **68 hypotheses**.
+
+### The trap that would have invalidated the whole thing
+
+**FRED dates an observation by the period it describes, not by its release.** July CPI carries the date `2026-07-01` and is published around 13 August. Aligning it to the session of 1 July hands the model six weeks of future knowledge, and the resulting "predictive power" is the release leaking backwards.
+
+That defect is invisible in the output — it produces strong, stable, plausible ICs, and would have been the most convincing wrong answer this project has produced. Every series therefore carries a **publication lag** and becomes visible only at the first session on or after `period_end + lag`. Verified rather than assumed:
+
+```
+CPI period 2026-06-01 -> period ends 06-30 -> usable from 2026-07-18
+CPI period 2026-07-01 -> period ends 07-31 -> usable from 2026-08-18
+```
+
+So a session in mid-July sees **May** CPI. Lags run 1 day (daily market series) to 32 days (PCE, M2), rounded up.
+
+**Result: 0 of 68 survive FDR at alpha 0.05.**
+
+### The one coherent candidate, and why it is not a finding
+
+| series | transform | H | n train | IC train | p | IC holdout | n hold |
+|---|---|---|---|---|---|---|---|
+| `INFL_EXP_5Y` | chg20 | 20 | 102 | −0.240 | 0.0149 | **−0.335** | 18 |
+| `INFL_EXP_10Y` | chg20 | 20 | 102 | −0.218 | 0.0277 | **−0.320** | 18 |
+
+Rising US breakeven inflation expectations preceding *lower* IHSG returns is economically coherent (higher expected inflation → tighter Fed → EM outflows), the sign holds out of sample, and the holdout IC is **stronger** than the training one — the opposite of the decay that killed EXP-011's HI52W.
+
+**But the two series are not independent evidence.** 5-year and 10-year breakevens are near-duplicates of the same underlying measure; their agreement is close to one observation, not two. Neither survives correction (q = 0.51, 0.63), and the holdout carries 18 points.
+
+`GDP_GROWTH z250 H=60` has the lowest raw p (0.0010, q=0.0687 — the closest anything has come) but n=31 with a 5-point holdout that **flips sign**. That is the small-n artefact this design exists to expose, not a near-miss.
+
+**Status**: NULL under correction. `INFL_EXP` is registered as a **candidate for a separate pre-registered test**, not a finding. The obvious form is the EXP-031 design — one hypothesis, one-sided, tested across EM markets whose data has never been read — since US inflation expectations should move all of them if the mechanism is real.
+
+**The holdout for these 17 series is now burned.**
