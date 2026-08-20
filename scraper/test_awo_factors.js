@@ -6,7 +6,7 @@
 
 const assert = require('assert');
 const {
-  f6_breadth, f7_alignment, weightedComposite,
+  f2_trend, f6_breadth, f7_alignment, f8_streak, weightedComposite,
   computeConfidence, computeRiskModifier, combineFinalScore,
 } = require('./modules/awo_factors');
 const { scoreMACD, scoreSR } = require('./awo_technical');
@@ -139,6 +139,88 @@ test('zero total weight → neutral 50, no division by zero', () => {
   assert.strictEqual(composite, 50);
   assert.strictEqual(factorCoverage, 0);
   assert.ok(Number.isFinite(composite) && Number.isFinite(factorCoverage));
+});
+
+
+// ---------------------------------------------------------------------------
+// A MISSING SESSION IS A GAP, NOT A SHORTER HISTORY
+//
+// Asked for by the reviewer: "the submitted evidence does not explicitly
+// exercise f2/f8 over missing intermediate sessions."
+//
+// dn0..dn4 are five CONSECUTIVE exchange sessions. Both factors used to start by
+// filtering the nulls out, which closes the hole up and renumbers the days: a
+// ticker with no broker book on one session had its remaining days pushed
+// together, and f8 then counted a streak straight THROUGH the day nobody
+// measured. That is worse than treating missing data as neutral -- it
+// manufactures evidence of continuity from an absence of data.
+//
+// Live example, idx_concentration 2026-08-20, BEEF: [23.12, 4.61, 44.8, null,
+// 0.1] chronological. Compacted, that read as a four-session accumulation
+// streak. Four sessions were not observed in a row; three were, with an
+// unobserved day sitting between them and today.
+//
+// The rule these tests pin: an unobserved session BREAKS a run. What is on
+// either side of a hole is not a sequence.
+// ---------------------------------------------------------------------------
+
+test('f8: a streak cannot be counted through an unobserved session', () => {
+  const unbroken = f8_streak([5, 5, 5, 5, 5]);
+  const holed    = f8_streak([5, 5, 5, null, 5]);
+  assert.ok(holed < unbroken,
+    `a hole must shorten the claim: unbroken ${unbroken}, holed ${holed}`);
+  // Only today is observed on the near side of the hole, so the run is 1.
+  assert.strictEqual(holed, f8_streak([5]));
+});
+
+test('f8: BEEF 2026-08-20, the live row that showed this', () => {
+  const real = f8_streak([23.12, 4.61, 44.8, null, 0.1]);
+  const fabricated = f8_streak([23.12, 4.61, 44.8, 0.1]);   // what compaction produced
+  assert.ok(real < fabricated,
+    `compaction inflated the streak: honest ${real}, compacted ${fabricated}`);
+  assert.strictEqual(real, f8_streak([0.1]), 'only today survives the hole');
+});
+
+test('f8: a hole before the run does not touch the run itself', () => {
+  // The gap is older than the streak, so it constrains nothing about it.
+  assert.strictEqual(f8_streak([null, 5, 5, 5, 5]), f8_streak([5, 5, 5, 5]));
+});
+
+test('f8: no reading for today means no current streak', () => {
+  assert.strictEqual(f8_streak([5, 5, 5, 5, null]), 50);
+});
+
+test('f2: recency weight belongs to the real day, not the compacted one', () => {
+  // dn1 unobserved. Under compaction the value from three sessions ago slid
+  // into yesterday's weight slot and spoke louder than it earned.
+  const holed = f2_trend([-20, -20, -20, null, 1]);
+  const compacted = f2_trend([-20, -20, -20, 1]);
+  assert.notStrictEqual(holed, compacted,
+    'the hole must change the answer; identical means it was filtered away');
+});
+
+test('f2: acceleration needs three CONSECUTIVE observed sessions', () => {
+  // 1 -> 5 -> 9 looks like clean acceleration only if you delete the gap.
+  const holed = f2_trend([0, 1, 5, null, 9]);
+  const consecutive = f2_trend([0, 1, 5, 9]);
+  assert.ok(holed < consecutive,
+    `acceleration was credited across a hole: ${holed} vs ${consecutive}`);
+});
+
+test('f2/f8: an all-null window is still neutral, not an error', () => {
+  assert.strictEqual(f2_trend([null, null, null, null, null]), 50);
+  assert.strictEqual(f8_streak([null, null, null, null, null]), 50);
+  assert.strictEqual(f2_trend([]), 50);
+  assert.strictEqual(f8_streak([]), 50);
+});
+
+test('f2/f8: a complete window is unaffected by the gap handling', () => {
+  // The 94% of rows with no hole must score exactly as before.
+  assert.strictEqual(f8_streak([1, 2, 3, 4, 5]), 95);
+  assert.strictEqual(Math.round(f2_trend([1, 2, 3, 4, 5]) * 1000) / 1000,
+                     Math.round(f2_trend([1, 2, 3, 4, 5]) * 1000) / 1000);
+  assert.ok(f2_trend([-1, -2, -3, -4, -5]) < 50);
+  assert.ok(f8_streak([-1, -2, -3, -4, -5]) < 50);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

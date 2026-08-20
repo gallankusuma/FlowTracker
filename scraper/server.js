@@ -6157,8 +6157,11 @@ async function computeStockFactorsLive(ticker) {
       if (c) {
         brokerDataAvailable = true;
         const dn0 = Number(c.dn0 ?? 0);
+        // Keep the nulls: these are five consecutive sessions, and a hole in the
+        // middle is not the same history as a shorter one. Compacting it let f8
+        // report a streak through a session with no broker book at all.
         const dnValues = [c.dn4, c.dn3, c.dn2, c.dn1, c.dn0]
-          .map(v => v !== null && v !== undefined ? Number(v) : null).filter(v => v !== null);
+          .map(v => v !== null && v !== undefined ? Number(v) : null);
         f1 = f1_concentration(dn0);
         f2 = f2_trend(dnValues);
         f7 = f7_alignment(dailyChange, dn0);
@@ -7209,7 +7212,11 @@ async function runSignalScan({ persist = false } = {}) {
       const priceDirection = dailyChange;
 
       const f1 = f1_concentration(dn0);
-      const f2 = f2_trend(dnValues.filter(v => v !== null));
+      // No .filter here: dn0..dn4 are five consecutive sessions and a null is a
+      // HOLE in that run, not an absent element. Filtering renumbered the days and
+      // let f8 count a streak through a session nobody observed -- see the gap
+      // handling in modules/awo_factors.js.
+      const f2 = f2_trend(dnValues);
       const f3 = f3_volumeZ(volumes, priceDirection);
       const f4 = f4_momentum(closes);
       // NULL when the benchmark could not be observed. Relative strength has no
@@ -7218,7 +7225,7 @@ async function runSignalScan({ persist = false } = {}) {
       const f5 = marketAvgChange === null ? null : f5_relStrength(dailyChange, marketAvgChange);
       const f6 = f6_breadth(breadth.buyers, breadth.sellers);
       const f7 = f7_alignment(dailyChange, dn0);
-      const f8 = f8_streak(dnValues.filter(v => v !== null));
+      const f8 = f8_streak(dnValues);
 
       // Broker/concentration data availability — f1/f2/f7/f8 need latestConc,
       // f6 needs a breadthMap entry. When absent these factors still compute

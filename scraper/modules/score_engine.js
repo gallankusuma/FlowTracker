@@ -163,13 +163,17 @@ function scoreAtTimestamp({
   const breadthDataAvailable = !!breadth;
 
   const f1 = f1_concentration(dn0);
-  const f2 = f2_trend(dnValues.filter(v => v !== null));
+  // No .filter here: dn0..dn4 are five consecutive sessions and a null is a
+  // HOLE in that run, not an absent element. Filtering renumbered the days and
+  // let f8 count a streak through a session nobody observed -- see the gap
+  // handling in modules/awo_factors.js.
+  const f2 = f2_trend(dnValues);
   const f3 = f3_volumeZ(volumes, priceDirection);
   const f4 = f4_momentum(closes);
   const f5 = f5_relStrength(dailyChangePct, marketAvgChangePct);
   const f6 = f6_breadth(breadth?.netBuyers || 0, breadth?.netSellers || 0);
   const f7 = f7_alignment(dailyChangePct, dn0);
-  const f8 = f8_streak(dnValues.filter(v => v !== null));
+  const f8 = f8_streak(dnValues);
 
   // Fixed 2026-07-31 (external review, round 2 P1, then round 3 findings
   // #2/#4): first fix used one shared `technicalAvailable = candles.length

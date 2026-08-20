@@ -124,5 +124,93 @@ test('junk values are ignored rather than poisoning the sum', () => {
   assert.strictEqual(signedTop3ConcentrationRounded(dirty), 57.35);
 });
 
+
+// ---------------------------------------------------------------------------
+// THE 15-POINT PARITY CLAIM, MADE EXECUTABLE
+//
+// The module comment asserted "across all 15 reference points per-side is off by
+// a mean 0.089, by-magnitude by 3.732". The reviewer's objection was exact: that
+// was DOCUMENTATION, not acceptance evidence -- one real fixture was in the suite
+// and the other fourteen existed only as a sentence. A number nobody can re-run
+// is a claim about a computation that happened once.
+//
+// fixtures/concentration_reference_15.json now carries the RAW per-broker nets
+// for all 15 ticker-sessions exactly as read from idx_broker_summary, together
+// with the value flowtracker.id published for each. It is frozen in the
+// repository rather than re-queried, so a later backfill cannot quietly move the
+// evidence the way one moved the strategy-book fixture.
+// ---------------------------------------------------------------------------
+
+const REFERENCE_15 = require('./fixtures/concentration_reference_15.json');
+
+/** The rival reading the empirical work rejected: top 6 by |net|, not 3 per side. */
+function byMagnitudeReading(nets) {
+  const posTotal = nets.filter(n => n > 0).reduce((a, b) => a + b, 0);
+  if (!(posTotal > 0)) return null;
+  const top6 = nets.slice().sort((a, b) => Math.abs(b) - Math.abs(a)).slice(0, 6);
+  return (top6.reduce((a, b) => a + b, 0) / posTotal) * 100;
+}
+
+console.log('');
+console.log('the 15 reference points, one test each');
+
+const errPerSide = [], errByMagnitude = [];
+
+for (const p of REFERENCE_15.points) {
+  test(`${p.ticker} ${p.date} (top6 ${p.top6Split}, ${p.brokers} brokers) matches ${p.reference}`, () => {
+    const mine = signedTop3ConcentrationRounded(p.nets);
+    assert.strictEqual(typeof mine, 'number', 'the session must produce a reading');
+    const err = Math.abs(mine - p.reference);
+    errPerSide.push(err);
+    errByMagnitude.push(Math.abs(byMagnitudeReading(p.nets) - p.reference));
+    // 0.35 is just above the worst observed (0.33 on ANTM 2026-08-10). The
+    // reference site publishes 2dp from its own broker snapshot, so exact
+    // equality is not the right assertion -- but neither is a loose one.
+    assert.ok(err <= 0.35, `off by ${err.toFixed(3)}: got ${mine}, reference ${p.reference}`);
+    assert.strictEqual(Math.sign(mine), Math.sign(p.reference), 'the sign must agree');
+  });
+}
+
+test('the aggregate the module comment claims: mean |err| <= 0.089', () => {
+  assert.strictEqual(errPerSide.length, 15, 'all 15 points must have been measured');
+  const mean = errPerSide.reduce((a, b) => a + b, 0) / errPerSide.length;
+  assert.ok(mean <= 0.09, `mean |err| regressed to ${mean.toFixed(4)}`);
+  assert.ok(Math.max(...errPerSide) <= 0.35, 'worst-case error regressed');
+});
+
+test('per-side beats by-magnitude across the whole set', () => {
+  const meanB = errPerSide.reduce((a, b) => a + b, 0) / 15;
+  const meanA = errByMagnitude.reduce((a, b) => a + b, 0) / 15;
+  assert.ok(meanA > 3, `the rival reading should be far worse, got ${meanA.toFixed(3)}`);
+  assert.ok(meanA / meanB > 20, 'the two readings must remain clearly separable');
+});
+
+test('the three decisive sessions are the ones where top6 is NOT 3/3', () => {
+  // This is the discriminator itself. If a data change made every session 3/3
+  // again the 15 points would still pass while proving nothing about WHICH
+  // reading is right, so the suite asserts the discriminating cases exist.
+  const decisive = REFERENCE_15.points.filter(p => p.top6Split !== '3/3');
+  assert.strictEqual(decisive.length, 3, 'the discriminating sessions must be present');
+  assert.deepStrictEqual(decisive.map(p => `${p.ticker} ${p.date}`).sort(),
+    ['BBCA 2026-08-11', 'TLKM 2026-08-11', 'TLKM 2026-08-14']);
+  for (const p of decisive) {
+    const mine = Math.abs(signedTop3ConcentrationRounded(p.nets) - p.reference);
+    const rival = Math.abs(byMagnitudeReading(p.nets) - p.reference);
+    assert.ok(rival - mine > 10,
+      `${p.ticker} ${p.date} no longer discriminates: ${mine.toFixed(2)} vs ${rival.toFixed(2)}`);
+  }
+});
+
+test('the fixture is the one these numbers were taken from', () => {
+  // Same idea as the strategy-book input digest: if the raw nets are edited, the
+  // parity claim above is about different data and must be re-derived rather
+  // than re-asserted.
+  const digest = require('crypto').createHash('sha256')
+    .update(JSON.stringify(REFERENCE_15.points.map(p => [p.ticker, p.date, p.nets])))
+    .digest('hex').slice(0, 16);
+  assert.strictEqual(digest, REFERENCE_15.digest,
+    'the raw broker nets changed; the reference comparison must be redone');
+});
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

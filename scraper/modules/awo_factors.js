@@ -54,6 +54,50 @@ function f1_concentration(dn0) {
   return stats.clamp(50 + dn0 * 0.5, 0, 50);
 }
 
+/**
+ * A session we did not observe is a HOLE, not a shorter history.
+ *
+ * dn0..dn4 are five CONSECUTIVE exchange sessions, and both broker-history
+ * factors used to open with `dnValues.filter(v => v !== null)`. That closes the
+ * hole up and RENUMBERS the days: the value from three sessions ago slides into
+ * yesterday's slot, and a run is counted straight through the day nobody
+ * measured. It is worse than treating missing data as neutral -- it manufactures
+ * evidence of continuity out of an absence of data.
+ *
+ * Live on 2026-08-20, BEEF read [23.12, 4.61, 44.8, null, 0.1]. Compacted, that
+ * was published as a four-session accumulation streak. Four sessions were not
+ * observed in a row.
+ *
+ * 6.1% of idx_concentration rows since 2026-01-01 carry an interior gap, so this
+ * is neither rare nor theoretical. The two helpers below are the rule: a null
+ * breaks a run, and recency weight belongs to the day that actually held it.
+ */
+
+/** Length of the run of same-signed values ending at the last session, stopping at a gap. */
+function runToGap(dnValues, positive) {
+  let count = 0;
+  for (let i = dnValues.length - 1; i >= 0; i--) {
+    const v = dnValues[i];
+    if (v === null || v === undefined) break;   // unobserved: nothing continued through it
+    if (positive ? v > 0 : v < 0) count++;
+    else break;
+  }
+  return count;
+}
+
+/** Recency-weighted mean where the weight is the value's REAL position, gaps skipped. */
+function positionalWeightedAvg(dnValues) {
+  let sumV = 0, sumW = 0;
+  for (let i = 0; i < dnValues.length; i++) {
+    const v = dnValues[i];
+    if (v === null || v === undefined) continue;
+    const w = i + 1;
+    sumV += v * w;
+    sumW += w;
+  }
+  return sumW > 0 ? sumV / sumW : 0;
+}
+
 /** Broker-dependent — needs 5-day concentration history (dn0..dn4). */
 function f2_trend(dnValues) {
   if (!dnValues || dnValues.length === 0) return 50;
@@ -63,8 +107,10 @@ function f2_trend(dnValues) {
   const positives = valid.filter(v => v > 0).length;
   const total = valid.length;
 
+  // How OFTEN it accumulated is order-free, so the observed days answer it.
   const directionScore = (positives / total) * 100;
-  const weighted = stats.weightedAvg(valid);
+  // How RECENTLY it did is not: weight by the real session index.
+  const weighted = positionalWeightedAvg(dnValues);
   const recentBias = weighted > 0 ? Math.min(weighted * 0.5, 15) : Math.max(weighted * 0.5, -15);
 
   // Acceleration bonus, now sign-aware: genuine same-direction acceleration
@@ -72,8 +118,9 @@ function f2_trend(dnValues) {
   // positive-yet-weakening) only gets partial credit — it's a real signal,
   // just a weaker one than an outright trend reversal.
   let accelBonus = 0;
-  if (valid.length >= 3) {
-    const last3 = valid.slice(-3);
+  const last3 = dnValues.slice(-3);
+  const last3Observed = last3.length === 3 && last3.every(v => v !== null && v !== undefined);
+  if (last3Observed) {
     const allIncreasing = last3.every((v, i) => i === 0 || v > last3[i - 1]);
     const allDecreasing = last3.every((v, i) => i === 0 || v < last3[i - 1]);
     const allPositive = last3.every(v => v > 0);
@@ -198,19 +245,22 @@ function f7_alignment(priceChangePct, dn0) {
 /** Broker-dependent — needs 5-day concentration history (dn0..dn4). */
 function f8_streak(dnValues) {
   if (!dnValues || dnValues.length === 0) return 50;
-  const valid = dnValues.filter(v => v !== null && v !== undefined);
-  if (valid.length === 0) return 50;
-  const posStreak = stats.streak(valid, true);
-  const negStreak = stats.streak(valid, false);
+  if (dnValues.every(v => v === null || v === undefined)) return 50;
+
+  // runToGap, not stats.streak over the compacted array: a run ends at the first
+  // session we did not observe. If the most recent session is itself unobserved
+  // there is no current streak to report at all.
+  const posStreak = runToGap(dnValues, true);
+  const negStreak = runToGap(dnValues, false);
 
   let accelBonus = 0;
   if (posStreak >= 2) {
-    const streakVals = valid.slice(-posStreak);
+    const streakVals = dnValues.slice(dnValues.length - posStreak);
     const increasing = streakVals.every((v, i) => i === 0 || v >= streakVals[i - 1] * 0.9);
     if (increasing) accelBonus = 5;
   }
   if (negStreak >= 2) {
-    const streakVals = valid.slice(-negStreak);
+    const streakVals = dnValues.slice(dnValues.length - negStreak);
     const deepening = streakVals.every((v, i) => i === 0 || v <= streakVals[i - 1] * 0.9);
     if (deepening) accelBonus = -5;
   }

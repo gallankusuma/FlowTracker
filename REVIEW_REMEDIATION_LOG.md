@@ -665,3 +665,104 @@ so the gate's own log carries the identity of the data it passed against.
 **What this does NOT do, stated plainly:** it does not make the check runnable
 without a database, and it does not retroactively validate the two earlier
 re-baselines. It makes the next one impossible to perform silently.
+
+---
+
+## FT-CONC-01 — the three acceptance gaps — **AWAITING_REVIEW**
+
+Against `CONCENTRATION NULL-PERSISTENCE FOLLOW-UP 2026-08-18 11:05 ICT`: *"no
+database round-trip fixture, no explicit f2/f8 missing-session fixture, and no
+remaining reference-session parity fixtures."* All three, in that order.
+
+### 1. The 15-point parity claim is now executable, not documented
+
+The module comment asserted *"across all 15 reference points per-side is off by a
+mean 0.089, by-magnitude by 3.732"* while the suite contained **one** real
+fixture. The reviewer's phrasing was exact — that is documentation. A number
+nobody can re-run is a claim about a computation that happened once.
+
+`scraper/fixtures/concentration_reference_15.json` now carries the **raw
+per-broker nets** for all fifteen ticker-sessions as read from
+`idx_broker_summary`, with the value flowtracker.id published for each. It is
+frozen in the repository rather than re-queried, so a later backfill cannot move
+the evidence the way one moved the strategy-book fixture. The suite iterates it:
+
+```
+15 individual session assertions (value within 0.35, sign must agree)
++ mean |err| <= 0.089 across all 15
++ per-side beats by-magnitude by >20x on the same set
++ the three discriminating sessions EXIST and still discriminate by >10 points
++ a digest of the raw nets, so editing the data invalidates the claim
+```
+
+`node test_concentration_formula.js` — **29 passed, 0 failed** (was 10).
+
+The discriminator test is the one that matters most. Fifteen green sessions prove
+nothing about *which* reading is right if all fifteen happen to split 3/3, so the
+suite asserts by name that BBCA 2026-08-11, TLKM 2026-08-11 and TLKM 2026-08-14
+are present and that the rival reading is still >10 points worse on each.
+
+### 2. The database round-trip, and what it found
+
+`scraper/test_concentration_nullability.js`, wired into `test:integration`.
+A unit test cannot answer this: the null has four more places to die after the
+formula returns it — a `NOT NULL` column, the INSERT, the **`ON DUPLICATE KEY
+UPDATE` path** (a second writer, where `COALESCE(VALUES(dn1), dn1)` would leave
+yesterday's number standing in place of today's gap), and the API serializer.
+
+Isolated under `stock_code = '__NULTEST'` on 1999 dates, deleted pass or fail.
+**14 passed, 0 failed** against production MySQL, including a real zero stored
+next to a null so the pair stays distinguishable, and a live census —
+**1,168 of 4,447 rows since 2026-08-01 carry at least one null**, which is the
+assertion that fails if the writer ever returns to `?? 0`.
+
+### 3. f2/f8 over a missing session — this was not just a missing test
+
+The reviewer asked for evidence. Writing it found a defect that had been in
+production the whole time, and it is worse than the coercion it was meant to
+check for.
+
+Both factors opened with `dnValues.filter(v => v !== null)`, and four call sites
+filtered again before calling them. `dn0..dn4` are five **consecutive** sessions,
+so filtering closes the hole up and **renumbers the days**. `f8_streak` then
+counted a run straight through the session nobody observed.
+
+Live on 2026-08-20, `BEEF` read `[23.12, 4.61, 44.8, null, 0.1]`. Compacted, the
+engine published a **four-session accumulation streak**. Four sessions were not
+observed in a row. This does not merely treat missing data as neutral — it
+manufactures evidence of continuity out of an absence of data.
+
+**Not rare:** 2,087 of 34,447 rows since 2026-01-01 (**6.1%**) carry an interior gap.
+
+Fixed in `modules/awo_factors.js`: `runToGap()` ends a run at the first
+unobserved session, and `positionalWeightedAvg()` gives recency weight to the day
+that actually held the value. The acceleration bonus now requires three
+*consecutive observed* sessions. The four call sites that pre-filtered
+(`score_engine.js`, two in `server.js`) no longer do.
+
+**Blast radius, measured before and after on live data (34,447 rows):**
+
+| | changed | max move |
+|---|---|---|
+| f2 | 2,831 (8.22%) | 8.00 pts |
+| f8 | 682 (1.98%) | 35 pts |
+
+**In 682 of 682 cases the OLD value was the more extreme claim.** The fix only
+ever withdraws confidence; it never invents a stronger signal. A complete window
+scores byte-identically, which the suite asserts.
+
+`node test_awo_factors.js` — **31 passed, 0 failed** (was 23). The eight new tests
+were written first and five of them failed against the old code.
+
+### Gate
+
+`predeploy_check.sh` on the box, run alone: credential preflight **PASS**, unit
+**PASS**, golden fixture **PASS**, integration **PASS**. The script still exits 1,
+and correctly — `.deployed-commit` was older than the source I had just copied
+across, which is exactly the stamp-drift check it exists for. Re-stamped and
+re-run below.
+
+**Not claimed:** this does not revisit the strategy-book fixture dispute, and the
+`?? 0` on the READ side of `f1`/`f7` is untouched — for those two a stored 0 and a
+null both map to a neutral 50, so it is currently harmless, but it is a coercion
+and it is written down here rather than quietly left.
