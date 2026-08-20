@@ -1412,3 +1412,33 @@ The 5-year leader — IC −0.39, uncorrected p=0.011, and *the same sign out of
 4. FRED series (FED_RATE, CPI, MFG_EMPLOYMENT, UNEMPLOYMENT, GDP) were **excluded**: `FRED_API_KEY` has never been set, so they hold zero rows. Whether US rates and inflation predict IHSG is untested, not answered.
 
 **Status**: NULL RESULT, EXPLORATORY. **No macro indicator is admissible for the regime layer on this evidence.** No production change made; the macro feed remains a display layer, and the regime switch is unchanged.
+
+---
+
+## EXP-031 (2026-08-20) — Pre-registered: currency weakness does NOT predict emerging-market equity returns
+
+- **Pre-registration**: `PREREGISTRATION_2026-08-20_fx_equity.md`, committed as `ea05c4c` **before the test was run**. Git history timestamps the specification earlier than the result it judges.
+- **Scripts**: `scraper/research/macro/exp031_fetch.py` (writes a fixed JSON sample) and `exp031_fx_equity.js` (reads that file and nothing else, so the same test is the same test on every run).
+- **Hypothesis**: a rise in USD/local over 20 sessions predicts a **lower** local equity return over the following 20. One-sided, direction fixed in advance.
+- **Out-of-sample set**: nine EM markets never previously queried by this project — India, Thailand, Philippines, Malaysia, Brazil, Mexico, Turkey, South Africa, Korea. Indonesia run separately and **excluded** from the statistic.
+- **Method**: strictly-prior `chg20`; non-overlapping anchors 20 sessions apart on each market's own calendar; Spearman rank IC; Stouffer combined Z. **m = 1**, so no multiplicity correction applies.
+
+**Result: NOT CONFIRMED.** Combined Z = **+0.303**, one-sided p = **0.619**.
+
+| market | n | IC | market | n | IC |
+|---|---|---|---|---|---|
+| India | 121 | +0.015 | Mexico | 124 | +0.036 |
+| Thailand | 118 | −0.030 | Turkey | 123 | +0.088 |
+| Philippines | 119 | −0.081 | South Africa | 123 | +0.053 |
+| Malaysia | 121 | +0.003 | Korea | 121 | −0.034 |
+| Brazil | 122 | +0.029 | | | |
+
+Three of nine negative, against 4.5 expected under the null. The combined Z is **positive** — not a near-miss in the predicted direction, but a drift the other way.
+
+**This is not an underpowered null, and that distinction is the whole value of the experiment.** Unlike EXP-030 (n=13–41 at some horizons), each market carries ~121 non-overlapping anchors, ~1,090 pooled. The design detects a uniform IC of **−0.0505** at p<0.05. Had every market shown the Indonesian effect (IC −0.136), the combined Z would have been **−4.45, p = 4.4e-6**; had only half of them shown it, **Z = −2.22, p = 0.013**. The test had ample power to find an Indonesia-sized effect and did not.
+
+**The in-sample comparison is the finding.** Indonesia's IC is **−0.136** — larger in absolute value than any of the nine out-of-sample markets, in either direction. An effect that exists only in the market it was discovered in, and vanishes in nine others, is the textbook shape of a result that was never there.
+
+**Conclusion**: H1 is falsified. Currency weakness is not a usable regime input on this evidence, and the EXP-030 hint that suggested it was noise. No production change; the macro feed remains a display layer and the regime switch is untouched.
+
+**Method note worth keeping.** The holdout problem was solved by moving *across markets* rather than forward in time. Waiting for fresh Indonesian data would have needed ~2.4 years to reach 30 non-overlapping anchors; nine untouched markets supplied 1,090 observations the same afternoon. Where a hypothesis is about a mechanism rather than about one instrument, other instruments are a legitimate — and immediate — out-of-sample set.
