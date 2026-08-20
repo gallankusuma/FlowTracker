@@ -27,14 +27,22 @@ type Row = {
   source: string;
 };
 
-/** Display name, and a note where the series is a stand-in for something else. */
-const META: Record<string, { label: string; note?: string; dp?: number }> = {
+/**
+ * Display name, an optional clarification, and `proxy` where the series is a
+ * STAND-IN for something we cannot get.
+ *
+ * The two are kept apart deliberately. An earlier version asterisked anything
+ * carrying a note, so USD/IDR and VIX wore the marker while the footnote read
+ * "proksi, bukan harga aslinya" -- claiming two real prices were substitutes.
+ * A clarification is not a caveat about provenance.
+ */
+const META: Record<string, { label: string; note?: string; proxy?: boolean; dp?: number }> = {
   USDIDR:       { label: "USD / IDR", note: "up = rupiah weaker", dp: 0 },
   JKSE:         { label: "IHSG", dp: 0 },
-  EIDO:         { label: "EIDO", note: "Indonesia ETF — foreign flow proxy" },
-  COAL_BTU:     { label: "Coal", note: "BTU proxy — Newcastle not available" },
-  PALM_PROXY:   { label: "Palm oil", note: "soybean-oil proxy — CPO trades on Bursa Malaysia" },
-  NICKEL_PROXY: { label: "Nickel", note: "VALE proxy — not the LME contract" },
+  EIDO:         { label: "EIDO", note: "Indonesia ETF — foreign flow proxy", proxy: true },
+  COAL_BTU:     { label: "Coal", note: "BTU proxy — Newcastle not available", proxy: true },
+  PALM_PROXY:   { label: "Palm oil", note: "soybean-oil proxy — CPO trades on Bursa Malaysia", proxy: true },
+  NICKEL_PROXY: { label: "Nickel", note: "VALE proxy — not the LME contract", proxy: true },
   WTI:          { label: "WTI crude" },
   GOLD:         { label: "Gold" },
   COPPER:       { label: "Copper" },
@@ -82,7 +90,7 @@ function Tile({ row }: { row: Row }) {
     <div className="card" style={{ padding: "10px 12px", background: "var(--bg-primary)" }} title={meta.note || undefined}>
       <div style={{ fontSize: 10, color: "var(--text-muted)", marginBottom: 3, whiteSpace: "nowrap",
         overflow: "hidden", textOverflow: "ellipsis" }}>
-        {meta.label}{meta.note ? " *" : ""}
+        {meta.label}{meta.proxy ? " *" : ""}
       </div>
       <div style={{ fontSize: 15, fontWeight: 800, color: "var(--text-primary)",
         fontFamily: "'Space Grotesk', sans-serif", lineHeight: 1.2 }}>
