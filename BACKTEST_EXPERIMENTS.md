@@ -1483,3 +1483,60 @@ Rising US breakeven inflation expectations preceding *lower* IHSG returns is eco
 **Status**: NULL under correction. `INFL_EXP` is registered as a **candidate for a separate pre-registered test**, not a finding. The obvious form is the EXP-031 design — one hypothesis, one-sided, tested across EM markets whose data has never been read — since US inflation expectations should move all of them if the mechanism is real.
 
 **The holdout for these 17 series is now burned.**
+
+---
+
+## EXP-033 (2026-08-20) — Pre-registered: US inflation expectations do NOT predict EM equities at a usable size
+
+- **Pre-registration**: `PREREGISTRATION_2026-08-20_inflexp_em.md`, committed in `765e523` **before** the test ran
+- **Scripts**: `scraper/research/macro/exp033_fetch.py` (sample) and `exp033_inflexp_em.js` (test), committed unchanged in the same commit
+- **H1**: a rise in US 5-year breakeven inflation over the prior 20 sessions predicts a **lower** forward 20-session return on emerging-market equities. One-sided, direction fixed in advance.
+- **Predictor**: `INFL_EXP_5Y` (FRED `T5YIE`) `chg20`, carrying EXP-032's 1-day publication lag
+- **Out-of-sample set**: six USD-denominated country ETFs never queried by this project — `VNM`, `GXG`, `EPU`, `KSA`, `ECH`, `EPOL`
+- **Decision rule, fixed in advance**: CONFIRMED only if one-sided p < 0.05 **and** IC negative
+
+### The design problem this one had and EXP-031 did not
+
+EXP-031 combined nine markets with Stouffer, and that was legitimate: each market had **its own currency**, so each was an independent test of a *local* mechanism.
+
+This predictor is **global**. One US series against many co-moving EM markets is **not** N independent tests — the markets move together and the predictor is identical across them. Combining per-market z-scores here would have inflated significance for exactly the reason overlapping windows do, and it would have inflated it in the direction of the answer being hoped for.
+
+So the unit of observation was fixed as the **anchor date**: the six markets are averaged into one equal-weighted basket and a **single** IC is computed. `n` is the count of non-overlapping anchors, never the market count times the date count. m = 1, so no multiplicity correction applies.
+
+**Result: NOT CONFIRMED.**
+
+| | |
+|---|---|
+| shared trading dates | 2,488 (2016-08-22 .. 2026-07-17) |
+| non-overlapping anchors (n) | **123** |
+| basket rank IC | **−0.0859** |
+| z | −0.943 |
+| one-sided p | **0.173** |
+
+Secondary and descriptive only, as pre-registered — these do not rescue the primary and are not the result:
+
+| market | IC | market | IC |
+|---|---|---|---|
+| VNM | +0.095 | KSA | +0.060 |
+| GXG | −0.099 | ECH | −0.079 |
+| EPU | −0.100 | EPOL | −0.132 |
+
+4 of 6 negative, against 3 expected under the null.
+
+### What the number does and does not say
+
+**It is not a sign flip.** Unlike EXP-031 — where the combined Z came out *positive*, drifting against the hypothesis — the basket IC here is negative, the predicted direction. That is the honest reading, and it is also the whole extent of the support.
+
+**But the magnitude is the point.** At n=123 the design detects **|IC| ≥ 0.149** at one-sided p<0.05. The Indonesian result that generated this candidate was −0.240 in training and −0.335 in the holdout; had either magnitude been present in the basket it would have landed at **z = −2.68** or **−3.82**. It landed at −0.94. The effect that made `INFL_EXP` interesting is not there at the size that made it interesting — the basket IC is roughly a third of it.
+
+**And an effect this small is not reachable.** Confirming a true IC of −0.086 at this threshold needs **~368 non-overlapping anchors — about 29 years** of 20-session windows. A relationship that requires three decades to distinguish from noise is not a regime input regardless of whether it is real.
+
+**Conclusion**: H1 is not confirmed. `INFL_EXP` is closed as a candidate. No production change: the macro layer remains a display and context surface, and the regime switch is untouched. EXP-032's Indonesian rows stay what they were — a coherent story that did not survive its own correction and now has not been reproduced anywhere else.
+
+### Two caveats recorded rather than buried
+
+**`GXG` stops on 2026-07-17.** The other five run to 2026-08-20. Under the pre-registered rule — dates where any ETF lacks a close are dropped, never carried forward — the shared calendar simply ends there, costing ~25 sessions at the recent end. This was discovered when the sample was fetched, i.e. after the design was committed and before any return was computed, so it changed nothing about the test.
+
+**Three markets sat out on purpose, and the reasons predate the result**: Argentina (`^MERV`, nominal peso returns under triple-digit inflation measure currency collapse, not equities), Taiwan (`^TWII`, local currency in a USD basket), and the nine EXP-031 markets (already read once). Chile, Poland, Greece, Hungary, Czechia and Egypt were checked for availability and had too little history. Availability was verified before the pre-registration was written; availability is not a result.
+
+**The holdout for this hypothesis is now burned.**
