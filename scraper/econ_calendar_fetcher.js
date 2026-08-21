@@ -356,7 +356,11 @@ async function main() {
   // three workers bring it under an hour while staying near one request per
   // second in aggregate, which is a reasonable load to put on a free endpoint
   // for a one-off backfill. Each worker keeps its own delay.
-  const WORKERS = 3;
+  // Two, not three. At three, one date in ten failed even after three retries
+  // each -- a rate that tracks the concurrency rather than the data, since the
+  // repair pass below recovers them when run alone. Fewer workers is the cheaper
+  // fix than more retries.
+  const WORKERS = 2;
   let next = 0;
 
   async function worker() {
@@ -383,6 +387,41 @@ async function main() {
 
   await Promise.all(Array.from({ length: WORKERS }, worker));
 
+  // ── REPAIR PASS ───────────────────────────────────────────────────────────
+  //
+  // The concurrent run leaves failures behind -- roughly one date in ten on the
+  // first full backfill, even with three retries each, which points at the
+  // concurrency itself rather than at missing data. A failed date is invisible
+  // afterwards: it looks exactly like a week with no releases.
+  //
+  // So whatever failed is retried ONCE MORE, alone and slowly. What survives
+  // that is a real hole and gets named. This also answers the question the
+  // failure count alone cannot: rate-limited, or genuinely absent?
+  if (failures.length) {
+    const retryDates = failures.map(f => f.split(':')[0]);
+    console.log('');
+    console.log(`repair pass: ${retryDates.length} failed dates, retried serially`);
+    failures.length = 0;
+    let repaired = 0;
+    for (const date of retryDates) {
+      try {
+        const rows = await fetchDay(date, 4);
+        const { written, withConsensus } = await saveDay(pool, date, rows);
+        rowsTotal += written; consensusTotal += withConsensus;
+        if (written) ok++; else empty++;
+        failed--; repaired++;
+      } catch (e) {
+        failures.push(`${date}: ${e.message}`);
+      }
+      await sleep(1500);
+    }
+    console.log(`  recovered ${repaired} of ${retryDates.length}; ${failures.length} still failing`);
+    if (repaired > retryDates.length * 0.5) {
+      console.log('  Most recovered when run alone, so the concurrent failures were');
+      console.log('  rate limiting rather than absent data.');
+    }
+  }
+
   console.log('');
   console.log(`dates with events : ${ok}`);
   console.log(`dates with none   : ${empty}`);
@@ -392,8 +431,9 @@ async function main() {
   if (failures.length) {
     console.log('');
     console.log('FAILED DATES — these are holes, not empty days:');
-    failures.slice(0, 20).forEach(f => console.log('  ' + f));
-    if (failures.length > 20) console.log(`  ... and ${failures.length - 20} more`);
+    // Every one, not the first twenty. A truncated hole list is a hole list
+    // nobody can act on.
+    failures.forEach(f => console.log('  ' + f));
   }
 
   await pool.end();
