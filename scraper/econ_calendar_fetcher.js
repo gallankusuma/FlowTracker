@@ -102,7 +102,7 @@ const { createPool } = require('./modules/db_config');
 
 const API = 'https://api.nasdaq.com/api/calendar/economicevents';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36';
-const DELAY_MS = 600;          // polite; a full backfill is ~1000 requests
+const DELAY_MS = 500;          // per worker; see the pool size in main()
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const toISO = d => d.toISOString().slice(0, 10);
@@ -200,17 +200,35 @@ function feedToRelease(feedDate, feedTime) {
   };
 }
 
-async function fetchDay(date) {
-  const res = await fetch(`${API}?date=${date}`, {
-    headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-    signal: AbortSignal.timeout(30000),
-  });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const json = await res.json();
-  // An empty day is a legitimate answer (holidays), and is not an error. A
-  // MISSING `data` object is -- that is the shape changing under us.
-  if (!json || !json.data) throw new Error('response has no data object');
-  return json.data.rows || [];
+/**
+ * One day, with retries.
+ *
+ * The first unretried backfill lost 6 of its first 50 dates to transient
+ * failures. That is not a 12% inconvenience -- a dropped date is indistinguish-
+ * able downstream from a day with no releases, so the sample would carry holes
+ * that look like quiet weeks. Retry, and if it still fails, say so loudly at the
+ * end rather than letting the gap pass as data.
+ */
+async function fetchDay(date, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(`${API}?date=${date}`, {
+        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      // An empty day is a legitimate answer (holidays) and is not an error. A
+      // MISSING `data` object is -- that is the shape changing under us.
+      if (!json || !json.data) throw new Error('response has no data object');
+      return json.data.rows || [];
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await sleep(1000 * Math.pow(3, i));
+    }
+  }
+  throw lastErr;
 }
 
 async function setup(pool) {
@@ -331,27 +349,39 @@ async function main() {
   const pool = createPool();
   await setup(pool);
 
-  let ok = 0, empty = 0, failed = 0, rowsTotal = 0, consensusTotal = 0;
+  let ok = 0, empty = 0, failed = 0, rowsTotal = 0, consensusTotal = 0, done = 0;
   const failures = [];
 
-  for (let i = 0; i < dates.length; i++) {
-    const date = dates[i];
-    try {
-      const rows = await fetchDay(date);
-      const { written, withConsensus } = await saveDay(pool, date, rows);
-      rowsTotal += written; consensusTotal += withConsensus;
-      if (written) ok++; else empty++;
-      if ((i + 1) % 50 === 0 || i === dates.length - 1) {
-        console.log(`  ${date}  ${i + 1}/${dates.length}  rows ${rowsTotal}  with consensus ${consensusTotal}  failed ${failed}`);
+  // A few workers rather than one. Serial, a ten-year backfill is six hours;
+  // three workers bring it under an hour while staying near one request per
+  // second in aggregate, which is a reasonable load to put on a free endpoint
+  // for a one-off backfill. Each worker keeps its own delay.
+  const WORKERS = 3;
+  let next = 0;
+
+  async function worker() {
+    while (true) {
+      const i = next++;
+      if (i >= dates.length) return;
+      const date = dates[i];
+      try {
+        const rows = await fetchDay(date);
+        const { written, withConsensus } = await saveDay(pool, date, rows);
+        rowsTotal += written; consensusTotal += withConsensus;
+        if (written) ok++; else empty++;
+      } catch (e) {
+        failed++;
+        failures.push(`${date}: ${e.message}`);
       }
-    } catch (e) {
-      failed++;
-      failures.push(`${date}: ${e.message}`);
-      // A run that quietly drops days is worse than one that stops: the gap
-      // would look like "no releases that week". Fail loudly at the end.
+      done++;
+      if (done % 200 === 0 || done === dates.length) {
+        console.log(`  ${done}/${dates.length}  rows ${rowsTotal}  with consensus ${consensusTotal}  failed ${failed}`);
+      }
+      await sleep(DELAY_MS);
     }
-    if (i < dates.length - 1) await sleep(DELAY_MS);
   }
+
+  await Promise.all(Array.from({ length: WORKERS }, worker));
 
   console.log('');
   console.log(`dates with events : ${ok}`);
