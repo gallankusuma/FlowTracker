@@ -1641,3 +1641,88 @@ should appear there too; if it appears only in Indonesia, EXP-031's lesson
 applies and it was never there.
 
 **This sample is now spent.**
+
+---
+
+## EXP-035 (2026-08-21) — The CPI-surprise effect does NOT replicate across Asia at significance
+
+- **Pre-registration**: `PREREGISTRATION_2026-08-21_cpi_asia.md`, committed in `f048e99` **before** the test ran
+- **Scripts**: `scraper/research/macro/exp035_fetch.py` and `exp035_cpi_asia.js`, same commit
+- **H1**: the same US core CPI MoM surprise predicts a **lower** return on a basket of five untouched Asian indices in the first session each trades after the release. One-sided.
+- **Basket, chosen by rule** (every major Asian index with ≥2,400 sessions never read here): `^TWII`, `^STI`, `^HSI`, `000001.SS`, `^N225`
+
+**Result: NOT REPLICATED.** basket rank IC **−0.0420**, one-sided p **0.3253**, n **119**.
+
+| | EXP-034 (IHSG) | EXP-035 (Asia basket) |
+|---|---|---|
+| rank IC | −0.1658 | **−0.0420** |
+| one-sided p | 0.0358 | **0.3253** |
+| n | 119 | 119 |
+
+### What this does and does not falsify
+
+**It does not falsify EXP-034, and the pre-registration said so before the run.**
+Only a *positive* basket IC would have been counter-evidence — the EXP-031
+signature, where the effect drifts the wrong way outside the market it was found
+in. The IC here is negative, the predicted direction, and at n=119 this test
+would clear 0.05 only about half the time even if the true effect equalled
+EXP-034's.
+
+**But EXP-034 should be read down.** The mechanism did not reach significance in
+five other markets that, on its own logic, should show it. Six markets have now
+been asked and exactly one answers at p < 0.05 — the one where the effect was
+discovered. That is not the outright falsification of EXP-031, but it is the same
+family of warning.
+
+### Secondary, pre-declared non-decisive
+
+| market | n | IC |
+|---|---|---|
+| Taiwan `^TWII` | 116 | −0.138 |
+| Hong Kong `^HSI` | 119 | −0.126 |
+| Singapore `^STI` | 119 | −0.088 |
+| Shanghai `000001.SS` | 115 | −0.081 |
+| Japan `^N225` | 119 | +0.014 |
+
+4 of 5 negative, against 2.5 expected under the null.
+
+The tails are ordered the way the mechanism says, and **more strongly than in
+Indonesia**:
+
+| | n | mean basket next session |
+|---|---|---|
+| biggest undershoots | 8 | **+0.574%** |
+| all releases | 119 | +0.104% |
+| biggest overshoots | 8 | **−0.503%** |
+
+A ~1.08pp spread, against EXP-034's 0.62pp on IHSG.
+
+### A design fault in my own pre-registration, stated rather than buried
+
+The pre-registration argued that averaging *should raise* the IC: "idiosyncratic
+local noise cancels while a common reaction does not, so if the mechanism is real
+the basket IC should be larger than any single market's."
+
+**It came out smaller.** The five per-market ICs average about −0.086; the basket
+reads −0.042 — worse than every member except Japan.
+
+The reason is that the basket equal-weights **raw returns**, so the highest-
+variance members (Shanghai, Nikkei) dominate it, and those are the two least
+responsive. Equal-weighting *standardised* returns would have been the right
+estimator of a common reaction. That choice was made in advance and is not being
+changed now — re-running with a better estimator after seeing this number is
+exactly the p-hacking this apparatus exists to prevent. It is recorded as a
+constraint on the next pre-registration, not as a reason to discount this one.
+
+### Status
+
+The mechanism now has **weak, directionally consistent support across six
+markets** — five of six ICs negative, tails ordered correctly in both tests — and
+**significance in exactly one**. That is a hypothesis worth one more properly
+powered look, not an input to anything.
+
+**No production change.** The macro layer remains display and context; the regime
+switch is untouched. EXP-034's licence to try a regime-layer experiment stands,
+but on weaker grounds than it looked yesterday.
+
+**This sample is now spent.**
