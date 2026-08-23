@@ -1540,3 +1540,104 @@ Secondary and descriptive only, as pre-registered — these do not rescue the pr
 **Three markets sat out on purpose, and the reasons predate the result**: Argentina (`^MERV`, nominal peso returns under triple-digit inflation measure currency collapse, not equities), Taiwan (`^TWII`, local currency in a USD basket), and the nine EXP-031 markets (already read once). Chile, Poland, Greece, Hungary, Czechia and Egypt were checked for availability and had too little history. Availability was verified before the pre-registration was written; availability is not a result.
 
 **The holdout for this hypothesis is now burned.**
+
+---
+
+## EXP-034 (2026-08-21) — Pre-registered: a US core CPI surprise DOES predict the next IHSG session
+
+- **Pre-registration**: `PREREGISTRATION_2026-08-21_cpi_surprise.md`, committed in `5cb5679` **before** the test ran
+- **Script**: `scraper/research/macro/exp034_cpi_surprise.js`, committed in the same commit
+- **H1**: a US core CPI month-on-month print **above** consensus predicts a **lower** IHSG return in the first Jakarta session after the release. One-sided.
+- **Data**: `ft_econ_calendar` (Nasdaq's licensed investing.com feed), 2016-08-01 .. 2026-08-20
+
+**Result: CONFIRMED.** rank IC **−0.1658**, one-sided p **0.0358**, n **119**.
+
+| | |
+|---|---|
+| releases with actual and consensus | 124 |
+| duplicates dropped | 5 |
+| kept | 119 (41 came in exactly at consensus, kept) |
+| rank IC | **−0.1658** |
+| z | −1.802 |
+| one-sided p | **0.0358** |
+
+### Why this one is different from EXP-030/031/032/033
+
+Those tested realised levels and changes — statements about the world. This tests
+a **surprise**, a statement about what was *not already priced*. A 0.3% core print
+is bullish or bearish depending only on whether 0.2% or 0.4% was expected, and no
+level can carry that. `consensus` is the one field the FRED-based work never had.
+
+### The timing is the design, not a detail
+
+Core CPI releases 08:30 US Eastern = **20:30 Jakarta, after the IDX close**. The
+release-day close therefore genuinely precedes the information and the first
+tradeable reaction is the next session. Anchoring one day earlier would measure a
+return that happened *before* the news — which is exactly what the feed's
+one-day filing offset would have produced had it not been corrected first.
+
+### Two corrections made before any return was joined
+
+**`seq` is not a label.** A CPI release puts several rows at one timestamp under
+one name. Measured against FRED's CPIAUCSL, using row order would mislabel
+**50 of 247 rows (20.2%)**, averaging month-on-month and year-on-year into one
+column. Each row was matched to the nearer of the expected MoM/YoY with the
+assignment required to be a bijection; `CPI 2020-07-14`, where MoM 0.48 and YoY
+0.72 both round to the printed 0.6, was left unlabelled rather than guessed.
+
+**Five releases are listed twice**, on consecutive dates with identical values.
+The later of each pair was kept, corroborated internally: on that date the
+weekday-fixed companions line up (MBA on a Wednesday, jobless claims on a
+Thursday).
+
+### Secondary, pre-declared non-decisive — reported as such
+
+| | IC | p | n |
+|---|---|---|---|
+| 5-session horizon | −0.083 | 0.186 | 119 |
+| headline CPI, 1 session | −0.125 | 0.089 | 118 |
+
+Both point the predicted way and neither is significant. The tails:
+
+| | n | mean next session |
+|---|---|---|
+| biggest undershoots | 8 | **+0.228%** |
+| all releases | 119 | +0.015% |
+| biggest overshoots | 8 | **−0.388%** |
+
+A ~0.62pp spread between the tails, ordered the way the mechanism says.
+
+### How much this is worth, stated plainly
+
+**It clears its rule, and it clears it narrowly.** p = 0.036 on a single
+one-sided test. The pre-registration fixed the power in advance — this n detects
+|IC| ≥ 0.152 — and the measured effect is barely above that floor. Nothing here
+would survive a multiplicity correction if it had been one of a family; it is
+significant *because* it was the only thing tested, which is the entire point of
+registering one mechanism, and also the limit of what that buys.
+
+Three weaknesses worth naming before anyone quotes the number:
+
+1. **A third of the sample has no signal.** 41 of 119 prints came in exactly at
+   consensus. They are kept deliberately — dropping them selects on the outcome —
+   but they are ties, and the effective sample carrying information is 78.
+2. **The effect leans on the tails.** The decile spread rests on 8 observations
+   each side.
+3. **One market, one window.** The window covers 2021–22, when inflation
+   surprises were unusually large and markets unusually rate-focused. The effect
+   may be regime-specific, and a split-half check was **not** pre-registered, so
+   running one now would be post-hoc.
+
+**What it licenses**, per the pre-registration and nothing more: one registered
+experiment into whether a US-inflation-surprise condition improves the **regime
+layer**. It does not license a production parameter change, a new composite
+factor, or trading the event — IDX opens with the move already in the overnight
+US market, so an IC on the next close is evidence about a mechanism, not about a
+fill anyone could get.
+
+**The obvious next test is the EXP-031 move**: the same surprise against EM
+markets whose returns this project has never read. If the mechanism is real it
+should appear there too; if it appears only in Indonesia, EXP-031's lesson
+applies and it was never there.
+
+**This sample is now spent.**
