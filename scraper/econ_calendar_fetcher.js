@@ -95,8 +95,10 @@
  *   node econ_calendar_fetcher.js                    today and the last 7 days
  *   node econ_calendar_fetcher.js --days 30          the last 30 days
  *   node econ_calendar_fetcher.js --from 2023-01-01 --to 2026-08-21
+ *   node econ_calendar_fetcher.js --dates holes.txt  refill a known list
  */
 
+const fs = require('fs');
 require('dotenv').config();
 const { createPool } = require('./modules/db_config');
 
@@ -349,8 +351,18 @@ async function main() {
     from = toISO(d);
   }
 
-  const dates = dateRange(from, to);
-  console.log(`econ calendar: ${dates.length} dates, ${from} .. ${to}`);
+  // --dates <file> refills a KNOWN list instead of walking a range. The first
+  // full backfill reported 343 failures; 316 were empty Sundays it had
+  // misclassified and 27 were real holes. Re-walking ten years to recover 27
+  // dates is the wrong tool, and leaving them is worse -- a missing date is
+  // indistinguishable from a week with no releases.
+  const dateFile = arg('--dates');
+  const dates = dateFile
+    ? fs.readFileSync(dateFile, 'utf8').trim().split(/\s+/).filter(d => /^\d{4}-\d{2}-\d{2}$/.test(d))
+    : dateRange(from, to);
+  console.log(dateFile
+    ? `econ calendar: ${dates.length} dates from ${dateFile}`
+    : `econ calendar: ${dates.length} dates, ${from} .. ${to}`);
   console.log('  source: Nasdaq (the licensed investing.com feed) — one request per day');
   console.log('  the feed files each row one day LATE on a fixed GMT-4 clock;');
   console.log('  release_date / release_time_et / release_utc are the corrected values');
@@ -449,7 +461,7 @@ async function main() {
   process.exit(failed ? 1 : 0);
 }
 
-module.exports = { parseFigure, rowUnit, dateRange, feedToRelease, setup, saveDay };
+module.exports = { parseFigure, rowUnit, dateRange, feedToRelease, fetchDay, setup, saveDay };
 
 if (require.main === module) {
   main().catch(e => { console.error(e); process.exit(1); });
