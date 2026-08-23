@@ -219,10 +219,19 @@ async function fetchDay(date, attempts = 3) {
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
-      // An empty day is a legitimate answer (holidays) and is not an error. A
-      // MISSING `data` object is -- that is the shape changing under us.
-      if (!json || !json.data) throw new Error('response has no data object');
-      return json.data.rows || [];
+      if (json && json.data && Array.isArray(json.data.rows)) return json.data.rows;
+
+      // "NO EVENTS TODAY" IS AN ANSWER, NOT A FAILURE, and the API states it in
+      // a way that looks like one: HTTP 200, `data: null`, and a business code
+      // 1002 "Economic Events Calendar: No record found." Treating that as an
+      // error cost the first full backfill 343 dates it then reported under the
+      // heading "these are holes, not empty days" -- which was exactly backwards.
+      // Every one sampled was a Sunday.
+      const code = json && json.status && Array.isArray(json.status.bCodeMessage)
+        && json.status.bCodeMessage[0] && json.status.bCodeMessage[0].code;
+      if (json && json.data === null && code === 1002) return [];
+
+      throw new Error(`unrecognised response shape${code ? ` (code ${code})` : ''}`);
     } catch (e) {
       lastErr = e;
       if (i < attempts - 1) await sleep(1000 * Math.pow(3, i));

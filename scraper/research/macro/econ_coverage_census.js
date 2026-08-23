@@ -54,14 +54,14 @@ function detectableIC(n) {
   const pool = createPool();
 
   const [[span]] = await pool.query(
-    'SELECT COUNT(*) rows, MIN(release_date) a, MAX(release_date) b, COUNT(DISTINCT release_date) days FROM ft_econ_calendar');
-  if (!span.rows) { console.log('ft_econ_calendar is empty — run the fetcher first.'); await pool.end(); return; }
+    'SELECT COUNT(*) total, MIN(release_date) a, MAX(release_date) b, COUNT(DISTINCT release_date) days FROM ft_econ_calendar');
+  if (!span.total) { console.log('ft_econ_calendar is empty — run the fetcher first.'); await pool.end(); return; }
 
   const from = span.a.toISOString().slice(0, 10), to = span.b.toISOString().slice(0, 10);
   const years = (new Date(to) - new Date(from)) / (365.25 * 86400000);
 
   console.log('ECONOMIC CALENDAR — coverage census');
-  console.log(`  ${span.rows} rows over ${span.days} dates, ${from} .. ${to} (${years.toFixed(1)} years)`);
+  console.log(`  ${span.total} rows over ${span.days} dates, ${from} .. ${to} (${years.toFixed(1)} years)`);
   console.log('  dates are the CORRECTED release dates, not the feed\'s filing dates');
   console.log('');
 
