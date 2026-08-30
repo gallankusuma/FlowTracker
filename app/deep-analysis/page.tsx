@@ -246,9 +246,22 @@ export default function DeepAnalysisPage() {
                   than leaving a reader to assume. EXP-036 found +5.7pp against
                   arbitrary bands, but only +1.4pp once proximity to the current
                   price is held constant -- the honest number is the second one. */}
-              <div style={{ fontSize: 11, color: "var(--accent-cyan)", marginBottom: 8 }}>
+              <div style={{ fontSize: 11, color: "var(--accent-cyan)", marginBottom: 4 }}>
                 TESTED (EXP-036): future pivots land here <b>+1.4pp</b> more often than in bands matched
-                for width and distance from price — real, modest, and not a trading rule.
+                for width and distance from price — real, and modest.
+              </div>
+              {/* The negative result gets the same prominence as the positive one.
+                  A page that shows what worked and buries what did not is how a
+                  reader ends up trusting a table that loses money. */}
+              <div style={{
+                fontSize: 11, color: "var(--accent-red)", marginBottom: 8,
+                background: "rgba(248,81,73,0.08)", border: "1px solid rgba(248,81,73,0.25)",
+                borderRadius: 6, padding: "6px 10px",
+              }}>
+                ALSO TESTED (EXP-037): <b>buying these zones loses.</b> Entering on a close into a support
+                zone and holding 20 sessions returned <b>1.6% less</b> than simply holding the same stock —
+                before costs, and before survivorship. A zone catches more turns in <i>either</i> direction;
+                it is not a place where buying pays.
               </div>
               <ZoneTable zones={m.zones.zones} lastClose={data.lastClose} />
               {hourly?.zones?.zones?.length ? (

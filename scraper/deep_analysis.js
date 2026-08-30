@@ -430,11 +430,11 @@ async function analyse(pool, ticker, opts = {}) {
     'The hourly section comes from Yahoo, not from idx_stock_prices. The two are not ' +
     'reconciled, so a small disagreement between the daily close here and the last hourly ' +
     'close is expected and is not evidence of a data fault.',
-    'How far a zone is expected to be respected. EXP-036 measured that pivots land in ' +
-    'these zones more than in arbitrary bands, but most of that advantage was simply ' +
-    'being NEAR the current price: with proximity held constant only +1.4 percentage ' +
-    'points survive (60 of 100 tickers). Which zone will hold, and whether acting on ' +
-    'one pays, are both untested.',
+    'WHICH zone will hold. EXP-036 measured that pivots land in these zones +1.4pp more ' +
+    'often than in matched bands, and EXP-037 measured that BUYING them underperforms ' +
+    'holding by 1.6% per trade -- so the aggregate questions are answered, and answered ' +
+    'unfavourably for acting on them. What remains untested is whether any individual ' +
+    'zone can be told apart from the rest in advance.',
   ];
 
   return report;
@@ -475,7 +475,11 @@ function render(r) {
   // +5.7pp against arbitrary bands, but only +1.4pp once proximity to the
   // current price is held constant.
   L.push('  TESTED (EXP-036): future pivots land here +1.4pp more often than in bands');
-  L.push('  matched for width and distance from price. Real, modest, and not a trading rule.');
+  L.push('  matched for width and distance from price. Real, and modest.');
+  L.push('  ALSO TESTED (EXP-037): BUYING these zones LOSES. Entering on a close into a');
+  L.push('  support zone and holding 20 sessions returned 1.6% LESS than simply holding');
+  L.push('  the same stock -- and that is before costs and before survivorship. A zone');
+  L.push('  catches more turns in EITHER direction; it is not a place where buying pays.');
   L.push('  range              width   vol%   turns   position');
   for (const zz of z.zones) {
     const where = r.lastClose > zz.hi ? 'below price' : r.lastClose < zz.lo ? 'above price' : '** PRICE IS HERE **';
