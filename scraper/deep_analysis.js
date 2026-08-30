@@ -133,9 +133,15 @@ function structure(bars, k = 3) {
  * crude against a tick-by-tick profile, but it uses only what was recorded --
  * and unlike a hand-drawn level it is the same number every time it is computed.
  *
- * The pivot count is the column that matters. A shelf with volume but no turns
- * is a zone price PASSED THROUGH; a shelf with both is where it kept stopping.
- * Volume alone would rank them identically.
+ * The pivot count describes what happened INSIDE the window: a shelf with volume
+ * but no turns is a band price passed through, one with both is where it kept
+ * stopping. It is a fact about the past and it is reported as one.
+ *
+ * IT IS NOT A QUALITY FILTER, AND I DESIGNED IT BELIEVING IT WAS. EXP-036
+ * measured it out of sample: restricting to zones that had turns in the prior
+ * window gives +5.315 pp against +5.668 pp for all zones -- very slightly WORSE.
+ * The column stays because "price turned here before" is worth seeing; the claim
+ * that it picks better zones is withdrawn.
  */
 function zones(bars, nBuckets = 60, topN = 8, maxWidthPct = 5) {
   const lo = Math.min(...bars.map(b => b.l)), hi = Math.max(...bars.map(b => b.h));
@@ -424,9 +430,11 @@ async function analyse(pool, ticker, opts = {}) {
     'The hourly section comes from Yahoo, not from idx_stock_prices. The two are not ' +
     'reconciled, so a small disagreement between the daily close here and the last hourly ' +
     'close is expected and is not evidence of a data fault.',
-    'Whether price actually reacts at these zones more than at arbitrary levels. On ADMR ' +
-    'a scoping check found Fibonacci levels barely beat random ones (36% of arbitrary ' +
-    'levels did as well). The volume zones have NOT had the same test yet.',
+    'How far a zone is expected to be respected. EXP-036 measured that pivots land in ' +
+    'these zones more than in arbitrary bands, but most of that advantage was simply ' +
+    'being NEAR the current price: with proximity held constant only +1.4 percentage ' +
+    'points survive (60 of 100 tickers). Which zone will hold, and whether acting on ' +
+    'one pays, are both untested.',
   ];
 
   return report;
@@ -463,6 +471,11 @@ function render(r) {
   const z = r.measured.zones;
   L.push('');
   L.push(`ZONES — where the shares actually changed hands (${r.measured.zoneWindow.sessions} sessions from ${r.measured.zoneWindow.from})`);
+  // Tested, so it says what the test found rather than implying more. EXP-036:
+  // +5.7pp against arbitrary bands, but only +1.4pp once proximity to the
+  // current price is held constant.
+  L.push('  TESTED (EXP-036): future pivots land here +1.4pp more often than in bands');
+  L.push('  matched for width and distance from price. Real, modest, and not a trading rule.');
   L.push('  range              width   vol%   turns   position');
   for (const zz of z.zones) {
     const where = r.lastClose > zz.hi ? 'below price' : r.lastClose < zz.lo ? 'above price' : '** PRICE IS HERE **';

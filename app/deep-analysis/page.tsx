@@ -133,8 +133,11 @@ function ZoneTable({ zones, lastClose, compact }: { zones: Zone[]; lastClose: nu
                 </td>
                 <td style={{ padding: "6px 8px", color: "var(--text-muted)" }}>{z.widthPct?.toFixed(1)}%</td>
                 <td style={{ padding: "6px 8px", color: "var(--text-secondary)" }}>{z.volPct.toFixed(1)}%</td>
-                {/* The column the whole idea rests on: volume with no turns is a
-                    level price passed through, not one it respected. */}
+                {/* Descriptive, not a quality filter -- and I built it believing it
+                    was one. EXP-036 measured zones-with-turns at +5.315pp against
+                    +5.668pp for all zones, slightly WORSE. It stays because "price
+                    turned here before" is worth seeing; the claim that it picks
+                    better zones is withdrawn. */}
                 <td style={{ padding: "6px 8px", fontWeight: 700, color: z.turns === 0 ? "var(--text-muted)" : "var(--accent-cyan)" }}>
                   {z.turns}
                   {z.turns === 0 && <span style={{ fontWeight: 400, fontSize: 10, color: "var(--text-muted)" }}> passed through</span>}
@@ -235,9 +238,17 @@ export default function DeepAnalysisPage() {
             {/* ── ZONES ───────────────────────────────────────────────────── */}
             <div style={{ ...card, marginBottom: 12 }}>
               <div style={h}>ZONES — WHERE THE SHARES ACTUALLY CHANGED HANDS</div>
-              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 8 }}>
+              <div style={{ fontSize: 11, color: "var(--text-muted)", marginBottom: 4 }}>
                 {m.zoneWindow.sessions} sessions from {m.zoneWindow.from} · point of control {num(m.zones.poc.lo)}–{num(m.zones.poc.hi)} ·
                 value area {num(m.zones.valueArea.lo)}–{num(m.zones.valueArea.hi)}
+              </div>
+              {/* This table has been tested, so it states the measured size rather
+                  than leaving a reader to assume. EXP-036 found +5.7pp against
+                  arbitrary bands, but only +1.4pp once proximity to the current
+                  price is held constant -- the honest number is the second one. */}
+              <div style={{ fontSize: 11, color: "var(--accent-cyan)", marginBottom: 8 }}>
+                TESTED (EXP-036): future pivots land here <b>+1.4pp</b> more often than in bands matched
+                for width and distance from price — real, modest, and not a trading rule.
               </div>
               <ZoneTable zones={m.zones.zones} lastClose={data.lastClose} />
               {hourly?.zones?.zones?.length ? (
