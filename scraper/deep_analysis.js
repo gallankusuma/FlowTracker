@@ -136,14 +136,23 @@ function structure(bars, k = 3) {
  * is a zone price PASSED THROUGH; a shelf with both is where it kept stopping.
  * Volume alone would rank them identically.
  */
-function zones(bars, nBuckets = 60, topN = 8) {
+function zones(bars, nBuckets = 60, topN = 8, maxWidthPct = 5) {
   const lo = Math.min(...bars.map(b => b.l)), hi = Math.max(...bars.map(b => b.h));
   if (!(hi > lo)) return { zones: [], lo, hi };
-  const w = (hi - lo) / nBuckets;
+
+  // LOG-SPACED buckets, not linear. ADMR ran 970 to 2320 in this window, so a
+  // linear bucket 22 rupiah wide is 2.3% of price at the bottom and 1.0% at the
+  // top -- the same "zone" means two different things depending on where it
+  // sits, and the low end gets over-resolved. Equal percentage width keeps a
+  // zone the same size in the only unit that matters to a position.
+  const lnLo = Math.log(lo), lnHi = Math.log(hi);
+  const w = (lnHi - lnLo) / nBuckets;
+  const edge = i => Math.exp(lnLo + i * w);
+  const bucketOf = p => Math.max(0, Math.min(nBuckets - 1, Math.floor((Math.log(p) - lnLo) / w)));
+
   const vol = new Array(nBuckets).fill(0);
   for (const b of bars) {
-    const a = Math.max(0, Math.floor((b.l - lo) / w));
-    const z = Math.min(nBuckets - 1, Math.floor((b.h - lo) / w));
+    const a = bucketOf(b.l), z = bucketOf(b.h);
     const share = b.v / (z - a + 1);
     for (let i = a; i <= z; i++) vol[i] += share;
   }
@@ -151,7 +160,7 @@ function zones(bars, nBuckets = 60, topN = 8) {
   const piv = pivots(bars, 3);
 
   const all = vol.map((v, i) => {
-    const zlo = lo + i * w, zhi = lo + (i + 1) * w;
+    const zlo = edge(i), zhi = edge(i + 1);
     return { i, lo: zlo, hi: zhi, vol: v, volPct: total ? v / total * 100 : 0,
       turns: piv.filter(x => x.p >= zlo && x.p <= zhi).length };
   });
@@ -165,22 +174,38 @@ function zones(bars, nBuckets = 60, topN = 8) {
     if (up >= dn) { hiI++; acc += up; } else { loI--; acc += dn; }
   }
 
-  // Merge adjacent shelves so one thick band is not reported as three.
+  // Merge adjacent shelves so one thick band is not reported three times -- but
+  // CAP the merge. The first version merged every adjacent top-N bucket and
+  // produced "1267 - 1483, 30.8%" on ADMR: a 216-rupiah band, 16% wide, which is
+  // true and useless. A 16%-wide "level" is not a level.
+  //
+  // So a merged zone stops at maxWidthPct, and each one also reports the single
+  // densest bucket inside it. That keeps the honest answer -- this is a broad
+  // range, not a line -- while still naming the price the volume actually
+  // centres on.
   const picked = ranked.slice(0, topN * 2).sort((a, b) => a.i - b.i);
   const merged = [];
   for (const z of picked) {
     const prev = merged[merged.length - 1];
-    if (prev && z.i === prev.iEnd + 1) {
+    const wouldSpan = prev ? (z.hi / prev.lo - 1) * 100 : 0;
+    if (prev && z.i === prev.iEnd + 1 && wouldSpan <= maxWidthPct) {
       prev.iEnd = z.i; prev.hi = z.hi; prev.vol += z.vol; prev.volPct += z.volPct; prev.turns += z.turns;
+      if (z.vol > prev.peakVol) { prev.peakVol = z.vol; prev.peak = { lo: z.lo, hi: z.hi }; }
     } else {
-      merged.push({ iStart: z.i, iEnd: z.i, lo: z.lo, hi: z.hi, vol: z.vol, volPct: z.volPct, turns: z.turns });
+      merged.push({ iStart: z.i, iEnd: z.i, lo: z.lo, hi: z.hi, vol: z.vol, volPct: z.volPct,
+        turns: z.turns, peakVol: z.vol, peak: { lo: z.lo, hi: z.hi } });
     }
+  }
+  for (const m of merged) {
+    m.widthPct = round((m.hi / m.lo - 1) * 100, 1);
+    m.broad = m.iEnd > m.iStart;
+    delete m.peakVol;
   }
   return {
     zones: merged.sort((a, b) => b.vol - a.vol).slice(0, topN).sort((a, b) => b.lo - a.lo),
     poc: { lo: poc.lo, hi: poc.hi },
-    valueArea: { lo: lo + loI * w, hi: lo + (hiI + 1) * w },
-    lo, hi,
+    valueArea: { lo: edge(loI), hi: edge(hiI + 1) },
+    lo, hi, spacing: 'log',
   };
 }
 
@@ -207,6 +232,58 @@ function volumeState(bars) {
     upperWickPct: range > 0 ? round((last.h - Math.max(last.o, last.c)) / range * 100, 1) : null,
     lowerWickPct: range > 0 ? round((Math.min(last.o, last.c) - last.l) / range * 100, 1) : null,
     direction: last.c > last.o ? 'up' : last.c < last.o ? 'down' : 'flat',
+  };
+}
+
+
+/**
+ * The 1H picture — the "cari setup" step of the worked example.
+ *
+ * Daily says where the important prices are; the hourly says whether buyers are
+ * currently taking them. Yahoo serves 60m for roughly 730 days on `.JK` symbols,
+ * which is enough for structure but is a DIFFERENT SOURCE from the daily table --
+ * so it is reported as its own section and never silently blended with it.
+ *
+ * THE RUNNING BAR IS DROPPED. The example is emphatic about this and it is the
+ * easiest way to be wrong here: "jika candle 1H terakhir masih berjalan,
+ * volume-nya juga belum selesai." A partial bar has a partial volume and a close
+ * that is really just the last print, so comparing it to finished bars makes
+ * every session look weak at 09:30 and strong at 15:55. The last bar is dropped
+ * unless it is old enough to have closed.
+ */
+async function intraday(ticker, interval = '60m', range = '730d') {
+  let raw;
+  try {
+    const { fetchYahooIntraday } = require('./yahoo-candles');
+    raw = await fetchYahooIntraday(ticker, interval, range);
+  } catch (e) {
+    return { unavailable: `Yahoo ${interval} fetch failed: ${String(e.message).slice(0, 80)}` };
+  }
+  const list = Array.isArray(raw) ? raw : (raw && raw.candles) || [];
+  const bars = list
+    .filter(c => Number.isFinite(c.close) && c.close > 0 && Number.isFinite(c.high) && Number.isFinite(c.low))
+    .map(c => ({ d: new Date(c.timestamp).toISOString().slice(0, 16).replace('T', ' '),
+      ts: c.timestamp, o: +c.open, h: +c.high, l: +c.low, c: +c.close, v: +c.volume || 0 }));
+
+  if (bars.length < 60) return { unavailable: `only ${bars.length} usable ${interval} bars` };
+
+  // A 60m bar that started less than an interval ago has not closed.
+  const intervalMs = interval === '60m' || interval === '1h' ? 3600e3
+    : interval === '30m' ? 1800e3 : interval === '15m' ? 900e3 : 300e3;
+  const nowish = bars[bars.length - 1].ts;
+  const droppedRunning = (Date.now() - nowish) < intervalMs;
+  const closed = droppedRunning ? bars.slice(0, -1) : bars;
+
+  return {
+    interval,
+    bars: closed.length,
+    from: closed[0].d, to: closed[closed.length - 1].d,
+    runningBarDropped: droppedRunning,
+    lastClose: closed[closed.length - 1].c,
+    structure: structure(closed.slice(-200), 3),
+    // A tighter map than the daily one: the recent hourly range is what a setup
+    // is read against, so only the last ~40 sessions of hourly are used.
+    zones: zones(closed.slice(-280), 40, 6, 3),
   };
 }
 
@@ -274,6 +351,9 @@ async function analyse(pool, ticker, opts = {}) {
     },
   };
 
+  // ── the hourly picture, from a DIFFERENT source, kept separate ─────────────
+  report.measured.intraday = opts.skipIntraday ? { skipped: true } : await intraday(ticker);
+
   // ── broker cost basis: the part no chart can show ──────────────────────────
   const since = opts.brokerSince || (() => {
     const d = new Date(last.d + 'T00:00:00Z'); d.setUTCMonth(d.getUTCMonth() - 3);
@@ -324,8 +404,9 @@ async function analyse(pool, ticker, opts = {}) {
     'awaiting a registered test, not as a finding.';
 
   report.notMeasured = [
-    'Intraday structure. Yahoo serves 60m for ~730 days and 15m/30m for 60 days on .JK ' +
-    'symbols, so the setup timeframe is reachable but is not wired into this report yet.',
+    'The hourly section comes from Yahoo, not from idx_stock_prices. The two are not ' +
+    'reconciled, so a small disagreement between the daily close here and the last hourly ' +
+    'close is expected and is not evidence of a data fault.',
     'Whether price actually reacts at these zones more than at arbitrary levels. On ADMR ' +
     'a scoping check found Fibonacci levels barely beat random ones (36% of arbitrary ' +
     'levels did as well). The volume zones have NOT had the same test yet.',
@@ -365,14 +446,39 @@ function render(r) {
   const z = r.measured.zones;
   L.push('');
   L.push(`ZONES — where the shares actually changed hands (${r.measured.zoneWindow.sessions} sessions from ${r.measured.zoneWindow.from})`);
-  L.push('  range              vol%   turns   position');
+  L.push('  range              width   vol%   turns   position');
   for (const zz of z.zones) {
     const where = r.lastClose > zz.hi ? 'below price' : r.lastClose < zz.lo ? 'above price' : '** PRICE IS HERE **';
-    L.push(`  ${String(Math.round(zz.lo)).padStart(6)} – ${String(Math.round(zz.hi)).padEnd(7)}  ${zz.volPct.toFixed(1).padStart(4)}%  ${String(zz.turns).padStart(5)}   ${where}` +
-      (zz.turns === 0 ? '   <- volume but no turns: a zone price passed THROUGH' : ''));
+    L.push(`  ${String(Math.round(zz.lo)).padStart(6)} – ${String(Math.round(zz.hi)).padEnd(7)} ${(zz.widthPct + '%').padStart(6)}  ${zz.volPct.toFixed(1).padStart(4)}%  ${String(zz.turns).padStart(5)}   ${where}` +
+      (zz.turns === 0 ? '   <- volume but no turns: passed THROUGH' : ''));
+    if (zz.broad) L.push(`         densest at ${Math.round(zz.peak.lo)} – ${Math.round(zz.peak.hi)}`);
   }
   L.push(`  point of control : ${Math.round(z.poc.lo)} – ${Math.round(z.poc.hi)}`);
   L.push(`  value area (70%) : ${Math.round(z.valueArea.lo)} – ${Math.round(z.valueArea.hi)}`);
+
+  const h = r.measured.intraday;
+  if (h && !h.skipped) {
+    L.push('');
+    L.push('HOURLY (60m, Yahoo — a different source from the daily table above)');
+    if (h.unavailable) L.push(`  unavailable: ${h.unavailable}`);
+    else {
+      L.push(`  ${h.bars} closed bars, ${h.from} .. ${h.to}` + (h.runningBarDropped ? '   (the running bar was dropped)' : ''));
+      L.push(`  ${h.structure.state}`);
+      if (h.structure.lastSwingHigh) {
+        if (h.structure.toConfirmUp.status) {
+          L.push(`  price is ${(h.structure.toConfirmUp.abovePct >= 0 ? '+' : '') + h.structure.toConfirmUp.abovePct}% above the last confirmed hourly swing high (${round(h.structure.toConfirmUp.lastConfirmedHigh)})`);
+        } else {
+          L.push(`  needs an hourly close above ${round(h.structure.toConfirmUp.needsCloseAbove)}`);
+        }
+        L.push(`  hourly invalidation: below ${round(h.structure.invalidation.below)}`);
+      }
+      L.push('  hourly zones:');
+      for (const zz of h.zones.zones.slice(0, 6)) {
+        const where = r.lastClose > zz.hi ? 'below' : r.lastClose < zz.lo ? 'above' : '** HERE **';
+        L.push(`    ${String(Math.round(zz.lo)).padStart(6)} – ${String(Math.round(zz.hi)).padEnd(7)} ${zz.volPct.toFixed(1).padStart(4)}%  ${String(zz.turns).padStart(3)} turns   ${where}`);
+      }
+    }
+  }
 
   const t = r.measured.trend;
   L.push('');
@@ -422,4 +528,4 @@ if (require.main === module) {
   })().catch(e => { console.error(e); process.exit(1); });
 }
 
-module.exports = { analyse, pivots, structure, zones, volumeState, weeklyFromDaily };
+module.exports = { analyse, pivots, structure, zones, volumeState, weeklyFromDaily, intraday };
