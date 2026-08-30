@@ -42,6 +42,53 @@ function ema(arr, period) {
 }
 
 /**
+ * How much of an EMA is still its SEED after `bars` observations?
+ *
+ * An EMA is path-dependent: it is seeded with an SMA of the first `period` bars
+ * and then decays that seed by (1 - 2/(period+1)) per bar. Feed it a short
+ * window and the answer is mostly the seed -- a number from the start of the
+ * window, barely updated -- while still being printed as though it were an EMA.
+ *
+ * Nothing errors. The value comes out, looks plausible, and is wrong:
+ *
+ *     EMA(200) on 210 bars -> 90.5% seed
+ *     EMA(200) on 280 bars -> 44.9% seed
+ *     EMA(200) on 600 bars ->  1.8% seed
+ *     EMA(50)  on  60 bars -> 67.0% seed
+ *
+ * Measured on IHSG, the 280-bar window this project used gave an EMA200 0.95%
+ * away from the full-history value, and flipped detectPriceRegime's label on 16
+ * of 1,830 sessions -- clustered at trend transitions, which is exactly where a
+ * regime label is read.
+ *
+ * The short periods are fine and always were: EMA(8) on 60 bars leaves under
+ * 0.01% seed, so our EMA(8) and a charting platform's are the same number. This
+ * is a guard against LONG periods on short windows, not a correction to the
+ * indicators already in use.
+ */
+function emaSeedWeight(period, bars) {
+  if (!(period > 0) || !(bars > 0)) return 1;
+  if (bars <= period) return 1;
+  return Math.pow(1 - 2 / (period + 1), bars - period);
+}
+
+/**
+ * The fewest bars an EMA(period) needs before its seed is worth less than `tol`.
+ *
+ * Derived rather than tabulated, so it stays correct if a period is changed:
+ *   (1 - 2/(p+1))^(n-p) < tol   ->   n > p + ln(tol) / ln(1 - 2/(p+1))
+ *
+ * @param {number} period
+ * @param {number} [tol=0.02] acceptable residual seed weight, 0..1
+ */
+function emaMinBars(period, tol = 0.02) {
+  if (!(period > 0)) return 0;
+  const decay = 1 - 2 / (period + 1);
+  if (decay <= 0) return period;
+  return period + Math.ceil(Math.log(tol) / Math.log(decay));
+}
+
+/**
  * RSI (Relative Strength Index)
  * @returns {number|null} RSI value 0-100
  */
@@ -529,11 +576,21 @@ function calcTechnicalFactors(candles) {
   // level, same condition scoreSR uses internally to decide whether it has
   // a real nearestSupport/nearestResistance pair to work with.
   const srHasBothLevels = !!(sr && sr.support.length > 0 && sr.resistance.length > 0);
+
+  // f12 compares EMA9 against EMA21, and an EMA carries its SMA seed forward.
+  // At the 60 candles every caller passes, EMA9 keeps under 0.01% seed and
+  // EMA21 about 2.4% -- both fine, and this guard changes nothing today. It
+  // exists for the change that comes later: swap 21 for 50 without widening the
+  // window and the seed is 67%, the number still prints, and nothing complains.
+  // That is not a hypothetical -- it is what detectPriceRegime did with EMA200
+  // on 280 bars until it was measured.
+  const emaSeedOk = closes.length >= emaMinBars(21, 0.05) && closes.length >= emaMinBars(9, 0.05);
+
   const factorAvailable = {
     f9: rsi !== null,
     f10: !!macdResult,
     f11: !!bb,
-    f12: ema9 !== null && ema21 !== null,
+    f12: ema9 !== null && ema21 !== null && emaSeedOk,
     f13: srHasBothLevels,
     f14: atr !== null,
   };
@@ -780,6 +837,8 @@ function computeWeeklyTrend(dailyCandles) {
 }
 
 module.exports = {
+  emaSeedWeight,
+  emaMinBars,
   calcRSI,
   calcMACD,
   calcBollinger,

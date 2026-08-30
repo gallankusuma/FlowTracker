@@ -202,7 +202,7 @@ function scoreAtTimestamp({
     combineFactorScores({ f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13 }, f14, factorAvailability, weights, thresholds);
 
   let regime = null;
-  try { regime = candles.length ? detectPriceRegime(candles.slice(-280)).regime : null; } catch {}
+  try { regime = candles.length ? detectPriceRegime(candles.slice(-600)).regime : null; } catch {}
 
   const reasonCodes = [];
   if (!brokerDataAvailable) reasonCodes.push('NO_BROKER_DATA');

@@ -5950,7 +5950,7 @@ async function computeIHSGFactors() {
   // from `trend` above (which is derived from the composite score itself,
   // not from EMA50/200/ADX/ATR). Does not feed into composite/confidence/risk.
   let priceRegime = null;
-  try { priceRegime = detectPriceRegime(candles.slice(-280)); } catch {}
+  try { priceRegime = detectPriceRegime(candles.slice(-600)); } catch {}
 
   return {
     date: candles[candles.length - 1].date,
@@ -6039,7 +6039,7 @@ async function computeIHSGFactorsLive() {
 
   // Price-action Regime (AWO Engine.md §5) — informational badge only.
   let priceRegime = null;
-  try { priceRegime = detectPriceRegime(liveCandles.slice(-280)); } catch {}
+  try { priceRegime = detectPriceRegime(liveCandles.slice(-600)); } catch {}
 
   return {
     date: last.date, composite, trend, isLive, breadthIsLive, yahooTime,
@@ -6211,7 +6211,7 @@ async function computeStockFactorsLive(ticker) {
   // Price-action Regime (AWO Engine.md §5) — informational badge only, not
   // fed into composite/confidence/risk. Same pattern as weeklyTrend above.
   let priceRegime = null;
-  try { priceRegime = detectPriceRegime(liveCandles.slice(-280)); } catch {}
+  try { priceRegime = detectPriceRegime(liveCandles.slice(-600)); } catch {}
 
   let trendAligned = null;
   if (weeklyTrend && weeklyTrend.trend !== 'NEUTRAL') {
@@ -7266,7 +7266,7 @@ async function runSignalScan({ persist = false } = {}) {
         weeklyTrend = computeWeeklyTrend(candles);
         // Price-action Regime (AWO Engine.md §5) — informational badge only,
         // same pattern as weeklyTrend: does NOT feed into composite/confidence/risk.
-        priceRegime = detectPriceRegime(candles.slice(-280));
+        priceRegime = detectPriceRegime(candles.slice(-600));
       } catch {}
 
       // Single source of truth (follow-up #7, 2026-07-30): combineFactorScores
