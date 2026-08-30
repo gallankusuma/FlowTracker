@@ -1523,6 +1523,74 @@ app.post('/api/calc-concentration', requireAdminKey, async (req, res) => {
   }
 });
 
+// ─── DEEP ANALYSIS — the top-down read for one ticker ────────────────────────
+//
+// Wraps scraper/deep_analysis.js. The report is expensive by the standards of a
+// page load: several DB aggregates plus a Yahoo 60m fetch of ~4,800 bars. Yahoo's
+// own module caches for 60s, which dedupes a refresh but not a page that ten
+// people open, so the finished report is cached here too.
+//
+// The cache key includes the LAST SESSION DATE, not just the ticker. Keying on
+// ticker alone would serve yesterday's structure after the nightly run wrote a
+// new bar -- the entry would still look fresh while describing a market that had
+// moved on, which is the failure that is hardest to notice from the outside.
+// Warm the broker registry at startup so the first visitor does not pay for it.
+// Non-blocking and non-fatal: a report without broker tags is still a report,
+// and failing to boot over a cosmetic lookup would be the wrong trade.
+setTimeout(() => {
+  require('./modules/broker_registry').loadRegistry(pool)
+    .then(r => console.log(`  🏷  broker registry warmed: ${r.byCode.size} brokers`))
+    .catch(e => console.warn('  broker registry warm-up failed (non-fatal):', e.message));
+}, 5000);
+
+const deepAnalysisCache = new Map();
+const DEEP_ANALYSIS_TTL = 10 * 60 * 1000;
+
+app.get('/api/deep-analysis', async (req, res) => {
+  const ticker = String(req.query.ticker || '').trim().toUpperCase();
+  if (!/^[A-Z]{2,10}$/.test(ticker)) {
+    return res.status(400).json({ error: 'ticker required, letters only' });
+  }
+  try {
+    const [[latest]] = await pool.query(
+      'SELECT MAX(date) d FROM idx_stock_prices WHERE stock_code = ? AND close_price > 0', [ticker]);
+    if (!latest || !latest.d) {
+      return res.status(404).json({ error: `no price history for ${ticker}` });
+    }
+    const asOf = toDateStr(latest.d);
+    // The key carries the intraday flag as well as the session date. Without it
+    // an `?intraday=0` request poisons the cache for the full report -- the
+    // skipped version is served to a caller that asked for the hourly section
+    // and gets `intraday: {skipped:true}` instead. Found by calling both in
+    // sequence, which is exactly what a page does when it offers a fast toggle.
+    const skipIntraday = req.query.intraday === '0';
+    const key = `${ticker}|${asOf}|${skipIntraday ? 'noIntraday' : 'full'}`;
+    const hit = deepAnalysisCache.get(key);
+    if (hit && Date.now() - hit.at < DEEP_ANALYSIS_TTL) {
+      return res.json({ ...hit.data, cached: true, cachedAgeSec: Math.round((Date.now() - hit.at) / 1000) });
+    }
+
+    const { analyse } = require('./deep_analysis');
+    // The hourly leg calls out to Yahoo. `?intraday=0` gives a caller the fast
+    // path without it rather than making everyone wait for a section they may
+    // not be looking at.
+    const report = await analyse(pool, ticker, { skipIntraday });
+    if (report.error) return res.status(422).json(report);
+
+    deepAnalysisCache.set(key, { at: Date.now(), data: report });
+    // Bounded: one entry per ticker per session date would otherwise grow forever
+    // on a long-running process.
+    if (deepAnalysisCache.size > 200) {
+      const oldest = [...deepAnalysisCache.entries()].sort((a, b) => a[1].at - b[1].at)[0];
+      if (oldest) deepAnalysisCache.delete(oldest[0]);
+    }
+    res.json({ ...report, cached: false });
+  } catch (err) {
+    console.error('deep-analysis error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/ft-concentration — Check what concentration data we have
 app.get('/api/ft-concentration', async (req, res) => {
   const date = req.query.date || getTodayDate();

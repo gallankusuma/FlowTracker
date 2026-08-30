@@ -85,13 +85,25 @@ async function loadRegistry(pool, opts = {}) {
   }
 
   // MEASURED: footprint. A broker's size and how concentrated its flow is.
-  const days = opts.footprintDays || 250;
-  const [fp] = await pool.query(`
+  //
+  // 60 sessions, not 250. The query is an index-only scan either way, but at 250
+  // it walks 1.76M rows and takes 30 SECONDS on this box against 3.5 at 60 --
+  // and 30 seconds is what the first page load pays. The question this answers
+  // is "is this broker large or dormant RIGHT NOW", which 60 sessions settles;
+  // a broker that was big last year and has gone quiet should read as quiet.
+  // Callers wanting the longer view pass footprintDays.
+  //
+  // MAX(date) is resolved in JS rather than left as a subquery, so the optimiser
+  // sees a literal date on the indexed column.
+  const days = opts.footprintDays || 60;
+  const [[maxRow]] = await pool.query('SELECT MAX(date) d FROM idx_broker_summary');
+  const maxDate = maxRow && maxRow.d ? maxRow.d : null;
+  const [fp] = maxDate ? await pool.query(`
     SELECT broker_code code, COUNT(*) rows_, COUNT(DISTINCT date) days,
            SUM(buy_val + sell_val) turnover
       FROM idx_broker_summary
-     WHERE date >= DATE_SUB((SELECT MAX(date) FROM idx_broker_summary), INTERVAL ? DAY)
-     GROUP BY broker_code`, [days]);
+     WHERE date >= DATE_SUB(?, INTERVAL ? DAY)
+     GROUP BY broker_code`, [maxDate, days]) : [[]];
   for (const r of fp) {
     const e = byCode.get(r.code) || { code: r.code, name: null, configCategory: null, ownership: null, clientBase: null, active: null, foreignPct: null };
     e.turnover = Number(r.turnover);
