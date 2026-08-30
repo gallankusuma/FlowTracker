@@ -1726,3 +1726,92 @@ switch is untouched. EXP-034's licence to try a regime-layer experiment stands,
 but on weaker grounds than it looked yesterday.
 
 **This sample is now spent.**
+
+---
+
+## EXP-036 (2026-08-30) — Volume zones beat arbitrary bands. Three quarters of that is proximity.
+
+- **Pre-registration**: `PREREGISTRATION_2026-08-30_volume_zones.md`, committed in `8ee56d3` **before** the test ran
+- **Script**: `scraper/research/exp036_volume_zones.js`, same commit
+- **H1**: swing pivots in the next 60 sessions land inside the top volume shelves of the prior 500 sessions **more often** than inside an equal number of equally wide bands drawn from the same visited range. One-sided.
+- **Design**: zones from `[t-500, t]`, pivots counted in `(t, t+60]` — **no bar on both sides**. Unit of observation is the TICKER (as-of windows overlap heavily), n = 100.
+
+**Result: CONFIRMED.** mean paired difference **+5.668 pp**, t **8.530**, one-sided p **< 0.000001**, 84 of 100 tickers positive.
+
+### The trap the design avoided
+
+A shelf is high-volume *because* price spent time there, and price spent time
+there *because* it kept turning there. Counting the turns that **created** the
+shelf as evidence the shelf works is circular and would produce a large, clean,
+entirely fake result. Every zone is therefore built from data strictly before the
+window it is judged on.
+
+### And then a post-hoc check took most of it away
+
+`scraper/research/exp036b_proximity_control.js`, **not pre-registered** and
+labelled so — it cannot change the verdict, only what the verdict means.
+
+The registered control drew buckets price had **visited**. That is a weak match:
+a bucket visited for two days at the top of a spike counts as visited and is
+nowhere near where price is now. Meanwhile the top shelves sit, almost by
+construction, close to where price has been — and future pivots cluster there
+too. So part of +5.668 pp is "these bands are near the current price", which is
+true of *any* band near the current price and says nothing about volume.
+
+Re-run with the control matched on **log-distance from the as-of close**:
+
+| | registered | proximity-matched |
+|---|---|---|
+| mean difference | **+5.668 pp** | **+1.417 pp** |
+| t | 8.530 | 2.291 |
+| one-sided p | <0.000001 | 0.011 |
+| tickers positive | 84/100 | 60/100 |
+
+**Volume survives 25% of the headline effect.** The remaining +1.4 pp is real on
+this evidence but modest, and 60/100 is a long way from 84/100.
+
+1,333 of 2,821 windows were dropped because no proximity-matched control existed
+— for nearly half the windows the top shelves sit at distances where no other
+visited bucket lives, which is itself a statement about how concentrated they are.
+
+### The `turns` column does NOT do what the report implies
+
+The deployed report highlights a zone's turn count, on the reasoning that a shelf
+price actually reversed at is worth more than one it passed through. Measured out
+of sample, restricting to zones with prior turns gives **+5.315 pp against
++5.668 pp for all zones** — very slightly *worse*.
+
+That was my own design claim and the data does not support it. Pre-declared
+non-decisive, and reported as a negative rather than dropped.
+
+### What does hold up
+
+Hit rate declines monotonically with volume rank — rank 1 catches 4.83% of
+forward pivots, falling to 2.72% at rank 8. Every one of those eight bands is
+"near price", so a pure proximity story does not predict the ordering. Volume is
+doing something; it is just doing much less than the headline number claimed.
+
+### A data fault found while chasing a NaN
+
+930 rows (0.09%) have `low_price` NULL or ≤ 0. `Math.log(0)` makes every bucket
+edge NaN, so any 500-session window containing one produces meaningless zones.
+**12 of 2,856 windows (0.4%)** were affected.
+
+The direction matters and is favourable: a NaN grid makes the real bands *and*
+the control bands NaN, both hit rates 0, and the pair contributes exactly 0 to
+the mean. It dilutes toward zero and cannot manufacture an effect. The registered
+figure is an understatement, so no re-run was performed against the frozen sample.
+
+### Status
+
+**Per the pre-registration, this licenses exactly one thing**: the zone table
+moves out of the report's `NOT COVERED` block with its measured effect printed —
+and the number printed is **+1.4 pp**, the proximity-controlled one, not the
+headline.
+
+It does **not** license a trading rule, a factor, or any production parameter.
+"Pivots land here slightly more than chance" is not "acting on it makes money" —
+EXP-016 remains the standing example of a real relationship whose obvious action
+had the wrong sign.
+
+**This sample is now spent.**
