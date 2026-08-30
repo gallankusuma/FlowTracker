@@ -1815,3 +1815,80 @@ EXP-016 remains the standing example of a real relationship whose obvious action
 had the wrong sign.
 
 **This sample is now spent.**
+
+---
+
+## EXP-037 (2026-08-30) — Buying a volume support zone LOSES to simply holding the stock
+
+- **Pre-registration**: `PREREGISTRATION_2026-08-30_zone_profitability.md`, committed in `9c9dafb` **before** the test ran
+- **Script**: `scraper/research/exp037_zone_profitability.js`, same commit
+- **H1**: buying when the close enters a support zone and holding 20 sessions returns more, **net of costs**, than the same stock returned unconditionally over the same horizon. One-sided.
+- **Rule**: zones from the prior 500 sessions refreshed every 20; entry at the **next open**; hold 20 sessions; **0.6% round trip** fixed in advance; no stop; long only; unit of observation the ticker, n = 99.
+
+**Result: NOT PROFITABLE.** mean per-ticker excess **−1.643%**, t **−3.567**, one-sided p **0.9998**. 1,873 trades across 99 tickers.
+
+| | |
+|---|---|
+| mean excess, net of costs | **−1.643%** |
+| mean excess, **before** costs | **−1.043%** |
+| mean raw trade return, net | −0.002% |
+| the benchmark it lost to | **+1.641%** |
+| win rate | 43.2% |
+| tickers with positive excess | 36 of 99 |
+
+### Costs are not the excuse
+
+The gross excess is **−1.043%**, already negative before a single rupiah of
+brokerage. The 0.6% hurdle was registered in advance precisely so it could not be
+blamed afterwards, and it is not to blame: the rule loses on its own merits and
+the costs then make it worse.
+
+### What this actually says
+
+Trades came out roughly **flat** (−0.002% net), while simply holding the same
+stocks over the same 20-session windows returned **+1.641%**. Buying into a
+support zone means buying weakness, and on this sample the weakness continued
+long enough to give up the drift that doing nothing would have collected.
+
+No pattern by zone rank — rank 7 is the only positive cell (+1.59% over 118
+trades) among eight, which is what one positive cell out of eight looks like.
+
+### And this is the survivorship-inflated version
+
+`backfill_price_history.js` only ever fetched tickers present in
+`idx_broker_summary`, and twelve suspended or delisted names were removed in July
+2026 — exactly the ones that would have blown up. **The true figure is worse than
+−1.643%.**
+
+### EXP-036 and EXP-037 together are the point
+
+EXP-036 found pivots land in these zones **+1.4pp** more often than in matched
+bands. EXP-037 finds that trading them loses 1.6pp to doing nothing. **Both are
+true.** A zone catches more turns in *either* direction, a pivot is only
+identifiable three bars after it happened, and being a place where price often
+turns is not the same as being a place where buying pays.
+
+This is the third time this project has found the obvious action on a real
+relationship to have the wrong sign — after EXP-016 (persistent top-3-broker
+buying predicts UNDERperformance) and the scanner score turning out to describe
+the same day rather than forecast the next.
+
+### On the sign, and what is not being claimed
+
+The point estimate is strongly negative and would clear significance in the
+opposite direction. **Reversing a hypothesis after seeing its sign is exactly the
+move this apparatus exists to prevent**, so no claim is made that this is a
+tradeable short or a fade signal. What can be said without a new test is only the
+registered statistic read with its actual sign: buying these zones underperformed
+holding.
+
+### Status
+
+**Per the pre-registration, a negative result licenses saying so on the page.**
+Done: the zone table stays as a description of where transactions happened, now
+with the profitability question answered rather than left open.
+
+No production change. No paper-trading run — that was reserved for a positive
+result.
+
+**This sample is now spent.**
