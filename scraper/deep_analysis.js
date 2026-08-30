@@ -33,6 +33,7 @@
 require('dotenv').config();
 const { createPool } = require('./modules/db_config');
 const { ema, emaSeedWeight } = require('./awo_technical');
+const { loadRegistry, describe } = require('./modules/broker_registry');
 
 const iso = d => (d instanceof Date ? d.toISOString().slice(0, 10) : String(d).slice(0, 10));
 const round = (v, n = 2) => (v === null || v === undefined || !Number.isFinite(v) ? null : Math.round(v * 10 ** n) / 10 ** n);
@@ -374,15 +375,31 @@ async function analyse(pool, ticker, opts = {}) {
       return lots ? arr.reduce((a, r) => a + r[valKey], 0) / lots : null;
     };
     const buyAvg = vw(buyers, 'bv', 'bl'), sellAvg = vw(sellers, 'sv', 'sl');
+
+    // A broker CODE is not information. `XL` and `AK` sit next to a number and
+    // tell the reader nothing about whether that is foreign money, a retail app,
+    // or a domestic house -- which is the first thing anyone wants to know.
+    const reg = await loadRegistry(pool);
+    const tag = code => describe(reg, code);
     report.measured.brokerCostBasis = {
       since,
       netBuyers: buyers.length, netSellers: sellers.length,
       buyersPaidAvg: round(buyAvg), sellersGotAvg: round(sellAvg),
       lastCloseVsBuyers: buyAvg ? round((last.c / buyAvg - 1) * 100) : null,
       topBuyers: buyers.sort((a, b) => b.net - a.net).slice(0, 5)
-        .map(r => ({ broker: r.code, netB: round(r.net / 1e9, 1), avgBuy: r.bl ? Math.round(r.bv / r.bl) : null })),
+        .map(r => ({ broker: r.code, ...tag(r.code), netB: round(r.net / 1e9, 1), avgBuy: r.bl ? Math.round(r.bv / r.bl) : null })),
       topSellers: sellers.sort((a, b) => a.net - b.net).slice(0, 5)
-        .map(r => ({ broker: r.code, netB: round(r.net / 1e9, 1), avgSell: r.sl ? Math.round(r.sv / r.sl) : null })),
+        .map(r => ({ broker: r.code, ...tag(r.code), netB: round(r.net / 1e9, 1), avgSell: r.sl ? Math.round(r.sv / r.sl) : null })),
+      // Split by the MEASURED axis, not the stored label: ownership is not
+      // client base, and "is this foreign money" is a question about flow.
+      foreignBuyingB: round(buyers.filter(r => (tag(r.code).foreignPct ?? 0) >= 50)
+        .reduce((a, r) => a + r.net, 0) / 1e9, 1),
+      foreignSellingB: round(sellers.filter(r => (tag(r.code).foreignPct ?? 0) >= 50)
+        .reduce((a, r) => a + r.net, 0) / 1e9, 1),
+      retailBuyingB: round(buyers.filter(r => tag(r.code).clientBase === 'RETAIL_PLATFORM')
+        .reduce((a, r) => a + r.net, 0) / 1e9, 1),
+      retailSellingB: round(sellers.filter(r => tag(r.code).clientBase === 'RETAIL_PLATFORM')
+        .reduce((a, r) => a + r.net, 0) / 1e9, 1),
     };
   } else {
     report.measured.brokerCostBasis = { since, unavailable: 'no broker rows in the window' };
@@ -500,8 +517,16 @@ function render(r) {
   else {
     L.push(`  ${b.netBuyers} net buyers paid an average of ${b.buyersPaidAvg}   (last close is ${pct(b.lastCloseVsBuyers)} vs that)`);
     L.push(`  ${b.netSellers} net sellers received an average of ${b.sellersGotAvg}`);
-    b.topBuyers.forEach(x => L.push(`    + ${x.broker.padEnd(4)} ${String(x.netB).padStart(6)} B   bought at ${x.avgBuy}`));
-    b.topSellers.forEach(x => L.push(`    - ${x.broker.padEnd(4)} ${String(x.netB).padStart(6)} B   sold at   ${x.avgSell}`));
+    const who = x => (x.name ? x.name.replace(/ Sekuritas.*| Indonesia$/,'').slice(0, 18) : '?').padEnd(19) +
+      (x.foreignPct === null || x.foreignPct === undefined ? '   ?  fgn' : String(x.foreignPct).padStart(5) + '% fgn') +
+      (x.clientBase === 'RETAIL_PLATFORM' ? '  retail app' : x.ownership === 'FOREIGN_OWNED' ? '  fgn-owned' : '');
+    b.topBuyers.forEach(x => L.push(`    + ${x.broker.padEnd(4)} ${String(x.netB).padStart(6)} B  at ${String(x.avgBuy).padEnd(6)} ${who(x)}`));
+    b.topSellers.forEach(x => L.push(`    - ${x.broker.padEnd(4)} ${String(x.netB).padStart(6)} B  at ${String(x.avgSell).padEnd(6)} ${who(x)}`));
+    L.push('');
+    L.push(`  by MEASURED flow origin (>=50% foreign), not by the stored label:`);
+    const signed = v => (v > 0 ? '+' : '') + v.toFixed(1) + ' B';
+    L.push(`    foreign-flow brokers  net ${signed(b.foreignBuyingB + b.foreignSellingB)}   (bought ${signed(b.foreignBuyingB)}, sold ${signed(b.foreignSellingB)})`);
+    L.push(`    retail platforms      net ${signed(b.retailBuyingB + b.retailSellingB)}   (bought ${signed(b.retailBuyingB)}, sold ${signed(b.retailSellingB)})`);
   }
 
   L.push('');
