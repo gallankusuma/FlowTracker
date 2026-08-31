@@ -476,10 +476,11 @@ function render(r) {
   // current price is held constant.
   L.push('  TESTED (EXP-036): future pivots land here +1.4pp more often than in bands');
   L.push('  matched for width and distance from price. Real, and modest.');
-  L.push('  ALSO TESTED (EXP-037): BUYING these zones LOSES. Entering on a close into a');
-  L.push('  support zone and holding 20 sessions returned 1.6% LESS than simply holding');
-  L.push('  the same stock -- and that is before costs and before survivorship. A zone');
-  L.push('  catches more turns in EITHER direction; it is not a place where buying pays.');
+  L.push('  ALSO TESTED (EXP-037/038): BUYING these zones LOSES. Entering on a close into a');
+  L.push('  SUPPORT zone and holding 20 sessions returned 1.6% LESS than simply holding the');
+  L.push('  same stock (significant); into a RESISTANCE zone, 0.6% less (not significant),');
+  L.push('  and the two sides cannot be told apart. Before costs and before survivorship.');
+  L.push('  A zone catches more turns in EITHER direction; it is not where buying pays.');
   L.push('  range              width   vol%   turns   position');
   for (const zz of z.zones) {
     const where = r.lastClose > zz.hi ? 'below price' : r.lastClose < zz.lo ? 'above price' : '** PRICE IS HERE **';

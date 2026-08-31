@@ -258,10 +258,11 @@ export default function DeepAnalysisPage() {
                 background: "rgba(248,81,73,0.08)", border: "1px solid rgba(248,81,73,0.25)",
                 borderRadius: 6, padding: "6px 10px",
               }}>
-                ALSO TESTED (EXP-037): <b>buying these zones loses.</b> Entering on a close into a support
-                zone and holding 20 sessions returned <b>1.6% less</b> than simply holding the same stock —
-                before costs, and before survivorship. A zone catches more turns in <i>either</i> direction;
-                it is not a place where buying pays.
+                ALSO TESTED (EXP-037/038): <b>buying these zones loses.</b> Entering on a close into a{" "}
+                <b>support</b> zone and holding 20 sessions returned <b>1.6% less</b> than simply holding the
+                same stock (significant); into a <b>resistance</b> zone, <b>0.6% less</b> (not significant), and
+                the two sides cannot be told apart. Before costs, and before survivorship. A zone catches more
+                turns in <i>either</i> direction; it is not a place where buying pays.
               </div>
               <ZoneTable zones={m.zones.zones} lastClose={data.lastClose} />
               {hourly?.zones?.zones?.length ? (
