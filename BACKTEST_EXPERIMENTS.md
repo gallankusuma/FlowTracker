@@ -1892,3 +1892,90 @@ No production change. No paper-trading run — that was reserved for a positive
 result.
 
 **This sample is now spent.**
+
+---
+
+## EXP-038 (2026-08-30) — Buying INTO resistance: no difference, and neither reading survives
+
+- **Pre-registration**: `PREREGISTRATION_2026-08-30_resistance_zones.md`, committed in `2b15870` **before** the test ran
+- **Script**: `scraper/research/exp038_resistance_zones.js`, same commit
+- **H1 (TWO-SIDED)**: buying when the close rises **into** a resistance zone and holding 20 sessions returns something **different**, net of costs, from the stock's unconditional 20-session return.
+- **Rule**: the exact mirror of EXP-037 — only the zone predicate and the direction of approach change. Verified by diffing the two scripts.
+
+**Result: NO DIFFERENCE.** mean per-ticker excess **−0.641%**, t **−1.577**, two-sided p **0.115**. 2,005 trades across 99 tickers.
+
+### Why this was two-sided, and why that mattered
+
+EXP-037 found buying into support underperformed by 1.6%. The momentum reading of
+that predicts the mirror should **out**perform; the textbook predicts resistance
+rejects and it should be the worst entry available. Holding a real prior one way
+and the convention the other, claiming a direction would have been either
+posturing or fitting the hypothesis to a result already seen.
+
+That choice earns its keep here. **−0.641% at p = 0.115 licenses no claim at all**
+— and it happens to point the textbook way, which a one-sided registration in
+that direction would have converted into a "finding" at p = 0.057. It is not one.
+
+### Neither reading survives
+
+| | |
+|---|---|
+| mean excess, net | −0.641% (p = 0.115) |
+| mean excess, **gross** | **−0.041%** |
+| mean raw trade return, net | +0.936% |
+| the benchmark | +1.577% |
+| win rate | 43.3% |
+| tickers positive | 37 of 99 |
+
+The momentum reading predicted positive and got −0.64%. The textbook reading
+predicted strongly negative and got something indistinguishable from zero. **The
+gross excess is −0.041%** — resistance entries are essentially neutral before
+costs, and only the 0.6% hurdle pushes them negative. That is a materially
+different picture from support, which was already −1.043% gross.
+
+### The paired secondary, and a process failure
+
+The pre-registration listed "the paired support-vs-resistance difference per
+ticker" as secondary 1. **The committed script does not compute it.** That is a
+gap between what was registered and what was shipped; it was computed afterwards
+in a separate run and is reported as an after-the-fact computation, even though
+the quantity itself was pre-declared and non-decisive.
+
+| | |
+|---|---|
+| mean excess, support | −1.512% |
+| mean excess, resistance | −0.657% |
+| paired difference | **+0.855 pp** (resistance minus support) |
+| t / two-sided p | 1.379 / **0.168** |
+| tickers where resistance beat support | 56 of 98 |
+
+**The two sides are not distinguishable from each other either.**
+
+### What EXP-036, EXP-037 and EXP-038 say together
+
+1. Pivots land in volume zones **+1.4pp** more often than in matched bands
+   (EXP-036) — a real regularity.
+2. Buying at support underperforms holding by **1.6%** (EXP-037) — significant.
+3. Buying at resistance underperforms by **0.6%** (EXP-038) — not significant.
+4. The two sides cannot be told apart (p = 0.168).
+
+The comparison is like-for-like — a 20-session return inside a trade against the
+average 20-session return of the same stock — so this is about **which windows
+get selected**, not about time out of the market. Zone-touch entries select
+20-session windows that do worse than an average one, and the support side does
+so more.
+
+**No directional claim is made about resistance.** A two-sided test that does not
+clear licenses no statement about the sign, however suggestive −0.641% looks.
+
+*** SURVIVORSHIP-BIASED RESEARCH RESULT — biased UPWARD ***
+
+### Status
+
+No production change. Nothing here licenses shorting — that was excluded in
+advance, since IDX shorting is impractical for this account and a negative result
+would be a reason not to buy rather than a trade. The avoidance follow-up the
+pre-registration described is **not** triggered: it required the underperformance
+to clear, and it did not.
+
+**This sample is now spent.**
