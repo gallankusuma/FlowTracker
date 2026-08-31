@@ -10,11 +10,11 @@ const NAV_ITEMS = [
   { label: "Trade Desk",          href: "/trade-desk",          icon: "🖥", badge: "LIVE", badgeColor: "#3fb950" },
   { label: "Flow Analyzer",       href: "/flow-analyzer",       icon: "🌊" },
   { label: "Accum. Streak",       href: "/accumulation-streak", icon: "🔥" },
-  { label: "Insider Moves",       href: "/insider-moves",       icon: "👁" },
   { label: "Broker Activity",     href: "/broker-activity",     icon: "📋" },
   { label: "Signal Scanner",      href: "/signal-scanner",      icon: "🎯", badge: "NEW" },
   { label: "Deep Analysis",       href: "/deep-analysis",       icon: "🔬", badge: "NEW", badgeColor: "#39d2f5" },
   { label: "Float Map",           href: "/float-map",           icon: "🧭", badge: "EXP", badgeColor: "#a371f7" },
+  { label: "Insider Moves",       href: "/insider-moves",       icon: "👁" },
   { label: "IDX Big Caps",        href: "/idx",                 icon: "🏛", badge: "NEW", badgeColor: "#f0a500" },
   { label: "US Market",           href: "/us-signal-scanner",   icon: "🇺🇸", badge: "NEW", badgeColor: "#f0a500" },
   { label: "AWO",                  href: "/awo-dashboard",       icon: "🧠", badge: "AI", badgeColor: "#17C671" },
@@ -27,15 +27,17 @@ const NAV_ITEMS = [
   { label: "Journey",              href: "/journey",              icon: "📈", badge: "NEW", badgeColor: "#f0a500" },
 ];
 
-// Raised from 7 when Trade Desk was inserted at position 2, and again to 9 when
-// Deep Analysis went in at position 8 -- both times so that adding an item does
-// not silently demote whatever used to be last in the primary bar.
+// THE RULE, because reading the history of this constant is how I walked past it
+// once already: INSERTING ANYWHERE ABOVE THE CUT MEANS RAISING THE CUT, or
+// deliberately choosing which item drops below it. Appending at the end needs no
+// change. Adding Deep Analysis at position 8 without doing either is what pushed
+// Float Map into the More menu.
 //
-// The second time this comment was already here and I inserted anyway, which
-// pushed Float Map into the More menu where the user noticed it missing. The
-// rule is mechanical, so state it as one: INSERTING ANYWHERE ABOVE THE CUT MEANS
-// RAISING THE CUT. An item added at the end needs no change.
-const PRIMARY_COUNT = 9;
+// Back to 8 by CHOICE, not by arithmetic: the user asked for Insider Moves to be
+// the one that leaves the primary bar rather than Float Map, so it now heads the
+// More menu instead of sitting at the bottom of it. The page is untouched and
+// still reachable at /insider-moves.
+const PRIMARY_COUNT = 8;
 const PRIMARY_ITEMS = NAV_ITEMS.slice(0, PRIMARY_COUNT);
 const MORE_ITEMS    = NAV_ITEMS.slice(PRIMARY_COUNT);
 
