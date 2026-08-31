@@ -27,9 +27,15 @@ const NAV_ITEMS = [
   { label: "Journey",              href: "/journey",              icon: "📈", badge: "NEW", badgeColor: "#f0a500" },
 ];
 
-// Raised from 7 when Trade Desk was inserted at position 2, so that adding it
-// does not silently demote whatever used to be last in the primary bar.
-const PRIMARY_COUNT = 8;
+// Raised from 7 when Trade Desk was inserted at position 2, and again to 9 when
+// Deep Analysis went in at position 8 -- both times so that adding an item does
+// not silently demote whatever used to be last in the primary bar.
+//
+// The second time this comment was already here and I inserted anyway, which
+// pushed Float Map into the More menu where the user noticed it missing. The
+// rule is mechanical, so state it as one: INSERTING ANYWHERE ABOVE THE CUT MEANS
+// RAISING THE CUT. An item added at the end needs no change.
+const PRIMARY_COUNT = 9;
 const PRIMARY_ITEMS = NAV_ITEMS.slice(0, PRIMARY_COUNT);
 const MORE_ITEMS    = NAV_ITEMS.slice(PRIMARY_COUNT);
 
