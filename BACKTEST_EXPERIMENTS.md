@@ -1979,3 +1979,92 @@ pre-registration described is **not** triggered: it required the underperformanc
 to clear, and it did not.
 
 **This sample is now spent.**
+
+---
+
+## EXP-039 (2026-09-01) — Horizon scan: the arithmetic holds, the thesis does not
+
+A **scan on half the universe**, not a test. Odd-ranked tickers scanned,
+even-ranked reserved and untouched. `scraper/research/exp039_horizon_scan.js`.
+
+### The arithmetic that motivated it, computed before any signal
+
+| horizon | median return sd | 0.6% cost as % of that |
+|---|---|---|
+| 5 | 7.5% | 8.0% |
+| 20 | 16.3% | 3.7% |
+| 60 | 28.3% | 2.1% |
+| 120 | 36.7% | 1.6% |
+
+A fixed cost shrinks against a widening return distribution. That part is
+arithmetic and it is not in dispute.
+
+### Two mistakes I made reading my own scan
+
+**First**, the scan reported mean excess and the means looked wonderful at
+H=120 — `near 52w high` +15.19%, `below all volume zones` +4.02%. Nearly
+everything turned positive at the longest horizon, which is the shape of an
+artefact rather than six independent edges appearing at once.
+
+**Second**, I then checked consistency, found the median month negative and only
+34–52% of months positive, and read that as evidence against the signals. **That
+was also wrong.** 120-session returns are right-skewed, so mean > median, and
+subtracting the ticker's own *mean* as the benchmark leaves a negative median
+**by construction, with or without an edge**.
+
+Neither reading survived the thing that was missing both times: a control.
+
+### The null — random entries, same benchmark, same costs, month as the unit
+
+| horizon | months positive | mean | median |
+|---|---|---|---|
+| 20 | 44% | −0.56% | −1.16% |
+| 60 | 43% | +0.86% | −1.61% |
+| 120 | 38% | +2.15% | −5.81% |
+
+A coin-flip entry already produces a negative median and sub-50% positive months.
+Everything must be read against this row, not against zero.
+
+### What the signals look like once the null is subtracted
+
+| signal | H=20 vs null | verdict |
+|---|---|---|
+| zone support touch | 34% / −1.36% / −2.26% | **worse than random on all three** |
+| zone resistance touch | 37% / −1.36% / −1.48% | worse than random |
+| below all volume zones | 46% / −0.50% / −0.72% | indistinguishable |
+| drawdown >20% from high | 41% / −0.45% / −0.99% | indistinguishable |
+| above all volume zones | 49% / +1.21% / −0.11% | **better on all three** |
+| near 52w high (<3%) | 52% / +2.89% / +0.54% | **better on all three** |
+
+(null at H=20: 44% / −0.56% / −1.16%)
+
+The two zone-touch rules are worse than random at **every** horizon, which is
+independent confirmation of EXP-037 and EXP-038 from a different statistic.
+
+### And the thesis this scan was built to support is NOT supported
+
+The idea was that a fixed cost hurdle makes longer holds better. The hurdle does
+shrink — 8.0% of noise at H=5 down to 1.6% at H=120 — but **the separation
+between signal and null does not improve with horizon.** The cleanest gap in the
+whole scan is at **H=20**; by H=120 the null itself earns +2.15% and the
+discrimination is buried in variance.
+
+Costs stop being the binding constraint at long horizons. Something else takes
+over, and it is not answered here.
+
+### What it does point at
+
+`near 52w high` beats the null on all three statistics at all three horizons —
+and that is **HI52W, the signal the flagship strategy already uses**. The scan
+looked at six candidates and pointed back at the one already in production.
+
+`above all volume zones` also beats the null and is **untested**. But it is
+probably not independent: a stock trading above every one of its volume shelves
+is very likely also near its 52-week high. Whether it adds anything over HI52W is
+a question about orthogonality, which is the next thing to measure and is not
+answered by this scan.
+
+**NO VERDICT.** These numbers are selected by inspection on half the universe and
+cannot be quoted as findings. The reserved half is untouched.
+
+*** SURVIVORSHIP-BIASED — biased UP ***
