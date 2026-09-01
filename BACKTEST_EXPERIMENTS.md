@@ -2068,3 +2068,105 @@ answered by this scan.
 cannot be quoted as findings. The reserved half is untouched.
 
 *** SURVIVORSHIP-BIASED — biased UP ***
+
+---
+
+## EXP-040 (2026-09-01) — We do not have fourteen signals. We have about four.
+
+A **diagnostic**, not a test. `scraper/research/exp040_orthogonality.js`, measured
+on `idx_signal_history` — the values production actually computed and stored,
+38,830 rows over 144 cross-sections, 2026-01-19 to 2026-08-31.
+
+### Why the question changed
+
+Every earlier experiment asked "does this make money", which is the wrong
+question for a *component*. Medallion has no strategy; it has thousands of weak
+signals combined, and not one would survive the tests run here. Rejection at the
+individual level is what you would observe **even if a profitable ensemble
+existed**.
+
+So: does a signal carry information the others do not? Two things must both hold
+— it is not redundant, **and** it has a non-zero IC. Fifty copies of one signal
+are one signal; fifty independent zeros are still zero.
+
+### The redundancy structure — the finding that travels
+
+Cross-sectional rank correlation (not time-series: these factors *rank* tickers,
+and the ordering is what is traded). Two dense clusters fall out:
+
+| cluster | members | internal correlation |
+|---|---|---|
+| **momentum / oscillator** | F4, F9, F10, F11, F12 | 0.50 – **0.83** |
+| **broker concentration** | F1, F2, F7, F8 | 0.47 – **0.91** |
+
+F1↔F8 = 0.91 and F11↔F12 = −0.83. These are not related factors; they are
+**the same measurement under different names**. F6 breadth is largely the mirror
+of the broker cluster (−0.34 to −0.51).
+
+Genuinely uncorrelated with everything: **F3 volume z, F13 support/resistance,
+F14 ATR** (|ρ| < 0.2 throughout).
+
+**14 factors ≈ 4 distinct things**: momentum, broker concentration, volume, and
+support/resistance — plus ATR as a separate risk axis.
+
+Greedy independent set at |ρ| > 0.5: **8 of 14 survive; only 5 of those carry
+|IC| ≥ 0.02.**
+
+### The ICs, which are the fragile half
+
+Over `return_10d`, this window only:
+
+| factor | IC | IR |
+|---|---|---|
+| F12 EMA trend | **−0.0915** | −0.60 |
+| F11 Bollinger | +0.0896 | 0.71 |
+| F9 RSI | +0.0854 | 0.82 |
+| F10 MACD | −0.0819 | −0.63 |
+| F4 momentum | −0.0677 | −0.41 |
+
+The momentum cluster carries |IC| ≈ 0.09 — and **its sign is inverted**. A
+bullish EMA state preceded *lower* 10-day returns. F11 being positive while F12
+is negative is the same fact, since they correlate −0.83.
+
+**This is one regime and cannot be generalised.** The window sits inside an IHSG
+drawdown of about 30%, and momentum inverts in bear markets. What it does echo is
+[[EXP-016]]: the obvious direction of a real signal keeps turning out to be
+backwards in this market.
+
+F13 and F3 are independent and carry **nothing** (IC 0.004). Independent zeros.
+
+### The Medallion question
+
+Equal-weight blend of the independent carriers versus the best single factor:
+
+| | \|IC\| | \|IR\| |
+|---|---|---|
+| best single (F12) | 0.0915 | 0.60 |
+| equal-weight blend | 0.0892 | **0.83** |
+
+**The blend does not raise the IC — it raises the information ratio by 38%.**
+That is exactly what combining uncorrelated signals is supposed to buy: not a
+bigger number, a **steadier** one. On that reading the ensemble idea works here,
+at the small scale available.
+
+**But the IR is inflated and the reason must be stated.** Each factor was signed
+by its own IC measured on the same data. In production the sign has to be decided
+out of sample, and a sign fitted in-sample is free accuracy. The 0.83 is an
+upper bound, not an estimate.
+
+### What this actually licenses
+
+Nothing tradeable. What it changes is **direction of effort**:
+
+1. **Adding another oscillator is adding nothing.** RSI, MACD, Bollinger, EMA and
+   momentum are one signal with five names. Any new indicator of that family
+   lands in the same cluster.
+2. **We do not have fifty independent signals; we have about four.** The Medallion
+   architecture is not available at that scale — but going from one to four is
+   still the right direction, and the IR result says the mechanism works.
+3. **The empty quadrants are where the value is.** A signal structurally unlike
+   anything in this matrix is worth more than a better momentum measure —
+   which points straight at the broker cost-basis and foreign-flow data, the one
+   dataset here that nothing else resembles.
+
+**NO VERDICT.** One regime, no holdout, and the ICs are the fragile half.
