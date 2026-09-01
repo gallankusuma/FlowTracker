@@ -2170,3 +2170,74 @@ Nothing tradeable. What it changes is **direction of effort**:
    dataset here that nothing else resembles.
 
 **NO VERDICT.** One regime, no holdout, and the ICs are the fragile half.
+
+---
+
+## EXP-041 (2026-09-01) — The empty quadrant has exactly one thing in it, and it is very small
+
+A **diagnostic**, not a test. `scraper/research/exp041_broker_price_axis.js`.
+34,791 of 38,830 stored rows, 648 tickers, target `return_10d`.
+
+EXP-040 showed "broker data" is **not** an empty quadrant — F1/F2/F7/F8 already
+correlate 0.47–0.91. Two other dimensions of the same dataset are absent from
+that matrix: **price** (what the accumulating side actually paid) and
+**identity** (who it was). Five signals were built on those axes and asked two
+questions at once: are they outside the clusters, and do they carry anything.
+
+### The price axis collapsed into things we already have
+
+| signal | max \|ρ\| vs F1–F14 | |
+|---|---|---|
+| cost-basis gap (close vs what buyers paid) | **0.64** (F12 EMA trend) | redundant |
+| buyer price dispersion | **0.62** (F14 ATR) | redundant |
+
+Both make sense in hindsight and neither was obvious in advance. If price sits
+above what buyers recently paid, price has recently risen — that **is** momentum.
+And the spread of buyers' fill prices is a measure of how far price travelled —
+that **is** volatility. Two "new" signals turned out to be re-derivations of F12
+and F14.
+
+This is exactly the failure orthogonality analysis exists to catch, and it caught
+them before either reached a hypothesis.
+
+### The identity axis is genuinely orthogonal — the only thing here that is
+
+| signal | max \|ρ\| vs F1–F14 | IC | IR | t |
+|---|---|---|---|---|
+| foreign-flow net share | **0.15** | −0.0132 | −0.24 | **−2.56** |
+| retail-platform net share | **0.16** | −0.0059 | −0.10 | −1.07 |
+| foreign minus retail | **0.17** | −0.0057 | −0.11 | −1.17 |
+
+All three sit far outside every existing cluster. Concentration counts the top
+three brokers by net value and does not care who they are; this asks who, and the
+answer is uncorrelated with everything the system already computes.
+
+**But the ICs are tiny.** Only `foreign-flow net share` is distinguishable from
+zero at all (t = −2.56 over 114 dates), and at |IC| 0.013 it is economically
+negligible on its own.
+
+### The sign, again
+
+It is **negative**. Foreign-flow brokers buying preceded *lower* forward returns —
+the same inversion [[EXP-016]] found for top-3-broker accumulation, now on an
+independent axis that knows *who* the accumulator was. That the inversion
+survives the identity split is more interesting than its size.
+
+### Where this leaves things
+
+The script's own summary line says "nothing clears both", against a pre-set
+|IC| ≥ 0.02 floor. That floor was fixed before the run and is kept, but the
+sharper statement is:
+
+- the price axis is **redundant** and should be dropped;
+- the identity axis is **independent and nearly empty** — real but tiny;
+- `foreign-flow net share` is the single best candidate this project has for an
+  ensemble component, **because** it is orthogonal, not because it is strong.
+
+In a Medallion-style blend, weak-and-independent is what you want. But EXP-040
+showed we have about four independent things, not fifty, and a fifth worth
+|IC| 0.013 does not change that arithmetic much.
+
+**NO VERDICT.** One regime, no holdout, and the foreign share is a per-broker
+constant projected backwards onto history — a broker's client mix can change and
+this treats it as fixed.
