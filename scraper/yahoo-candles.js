@@ -4,7 +4,36 @@ const https = require('https');
 const yfCache = new Map(); // key -> { data, ts }
 const CACHE_TTL = 3600000; // 1 hour
 
-function fetchYahooCandles(ticker, range, suffix = '.JK') {
+/**
+ * @param {string} ticker
+ * @param {string} range Yahoo range token ('5d', '20y', ...)
+ * @param {string} [suffix] '.JK' for IDX, '' for US (already bare Yahoo symbols)
+ * @param {{roundPrices?: boolean}} [options]
+ *
+ * `roundPrices` defaults to TRUE, which is right for IDX and destructive for
+ * anything quoted in cents. IDX prices are whole rupiah and Yahoo hands them
+ * back as floats carrying binary dust (1710.0000000000002), so rounding there
+ * RESTORES the true value. Applied to a US quote it DESTROYS it: AAPL 317.42
+ * was being stored as 317.
+ *
+ * Not hypothetical. `refreshUSStockPrices()` moved onto this fetcher around
+ * 2026-07 and every `us_stock_prices` row from 2026-08 on is a whole dollar.
+ * On a $320 stock a half-dollar rounding is ~0.16% of injected noise per bar —
+ * the same order as the daily move the factors are trying to read — and
+ * `change_pct` is derived from the rounded closes, so it inherits the error.
+ *
+ * Default stays TRUE so no existing IDX caller changes behaviour; every
+ * non-IDX caller must pass `{ roundPrices: false }`.
+ */
+function fetchYahooCandles(ticker, range, suffix = '.JK', options = {}) {
+  const roundPrices = options.roundPrices !== false;
+  // 4dp matches us_stock_prices' decimal(12,4) and clears the float dust
+  // without claiming precision the feed does not have.
+  const px = v => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    return roundPrices ? Math.round(n) : Math.round(n * 1e4) / 1e4;
+  };
   return new Promise((resolve, reject) => {
     // Index symbols (e.g. ^JKSE / IHSG, ^GSPC / S&P 500) are raw Yahoo
     // symbols — don't append a suffix. US tickers pass suffix='' since
@@ -42,10 +71,10 @@ function fetchYahooCandles(ticker, range, suffix = '.JK') {
             const dd = String(date.getDate()).padStart(2, '0');
             return {
               date: yyyy + '-' + mm + '-' + dd,
-              open:   Math.round(quote.open   && quote.open[i]   || 0),
-              high:   Math.round(quote.high   && quote.high[i]   || 0),
-              low:    Math.round(quote.low    && quote.low[i]    || 0),
-              close:  Math.round(quote.close  && quote.close[i]  || 0),
+              open:   px(quote.open   && quote.open[i]   || 0),
+              high:   px(quote.high   && quote.high[i]   || 0),
+              low:    px(quote.low    && quote.low[i]    || 0),
+              close:  px(quote.close  && quote.close[i]  || 0),
               volume: (quote.volume && quote.volume[i]) || 0,
             };
           }).filter(c => c.close > 0);
