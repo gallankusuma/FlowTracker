@@ -14,6 +14,12 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { createPool } = require('./modules/db_config');
+const { computeUSStockFactors } = require('./modules/us_score_engine');
+const { DEFAULT_THRESHOLDS } = require('./modules/score_engine');
+
+// Must match backfill_us_signal_history.js. If the two drift, check 6 fails
+// loudly rather than passing on a different window than the one written.
+const LOOKBACK = 400;
 
 const argv = process.argv.slice(2);
 const arg = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] ? argv[i + 1] : d; };
@@ -101,7 +107,58 @@ const ok = m => console.log(`  ok    ${m}`);
   else ok(`f3 ${r.f3mn} .. ${r.f3mx},  f9 ${r.f9mn} .. ${r.f9mx}`);
   if (Number(r.nullc)) fail(`${r.nullc} rows with a null composite`);
 
-  console.log('\n6. anchors available, against Promotion Contract v1 S1 (>= 30)');
+  console.log('\n6. no lookahead, the version that actually bites — rescore from a TRUNCATED series');
+  // Checks 2 and 3 only prove the outcome columns behave. This proves the
+  // FACTORS do: rebuild each sampled row from prices that stop at its own
+  // as-of date, rescore through the same engine, and require the stored
+  // numbers back. If any factor had read a later bar, the truncated rescore
+  // could not reproduce it. This is the check the project's strategy-book
+  // suite runs for the same reason ("truncating every future bar leaves the
+  // book identical").
+  const [samples] = await pool.query(
+    `SELECT ticker, data_date, composite_score, f3_volume_z, f4_momentum, f5_rel_strength,
+            f9_rsi, f10_macd, f11_bollinger, f12_ema_trend, f13_support_resistance, f14_atr,
+            market_avg_change_pct, weekly_trend
+       FROM us_signal_history ORDER BY RAND() LIMIT 40`);
+  let mismatched = 0, rescored = 0;
+  for (const s of samples) {
+    const asOf = s.data_date.toISOString().slice(0, 10);
+    const [px] = await pool.query(
+      `SELECT date, open_price, high_price, low_price, close_price, volume
+         FROM us_stock_prices WHERE ticker = ? AND date <= ? ORDER BY date ASC`, [s.ticker, asOf]);
+    if (px.length < 15) continue;
+    const candles = px.map(r => ({
+      date: r.date.toISOString().slice(0, 10),
+      open: Number(r.open_price), high: Number(r.high_price),
+      low: Number(r.low_price), close: Number(r.close_price), volume: Number(r.volume),
+    })).slice(-LOOKBACK);
+    const got = computeUSStockFactors(candles, 'NEUTRAL', Number(s.market_avg_change_pct),
+      { thresholds: DEFAULT_THRESHOLDS });
+    rescored++;
+    const pairs = [
+      ['composite', Math.round(got.composite * 1e4) / 1e4, Number(s.composite_score)],
+      ['f3', got.factors.volumeZ, s.f3_volume_z], ['f4', got.factors.momentum, s.f4_momentum],
+      ['f5', got.factors.relStrength, s.f5_rel_strength], ['f9', got.factors.rsi, s.f9_rsi],
+      ['f10', got.factors.macd, s.f10_macd], ['f11', got.factors.bollinger, s.f11_bollinger],
+      ['f12', got.factors.emaTrend, s.f12_ema_trend],
+      ['f13', got.factors.supportResistance, s.f13_support_resistance],
+      ['f14', got.factors.atr, s.f14_atr],
+      ['weeklyTrend', got.weeklyTrend, s.weekly_trend],
+    ];
+    const bad = pairs.filter(([, a, b]) =>
+      typeof a === 'number' ? Math.abs(a - Number(b)) > 0.011 : a !== b);
+    if (bad.length) {
+      mismatched++;
+      if (mismatched <= 3) {
+        console.log(`  FAIL  ${s.ticker} ${asOf}: ` +
+          bad.map(([k, a, b]) => `${k} rescored ${a} vs stored ${b}`).join(', '));
+      }
+    }
+  }
+  if (mismatched) fail(`${mismatched}/${rescored} rows did not reproduce from a truncated series`);
+  else ok(`${rescored}/${rescored} rows reproduce exactly from prices truncated at their own as-of date`);
+
+  console.log('\n7. anchors available, against Promotion Contract v1 S1 (>= 30)');
   for (const h of [3, 5, 10, 20, 40, 60]) {
     const a = Math.floor(c.sessions / h);
     console.log(`  ${String(h).padStart(2)}d: ${String(a).padStart(5)} anchors  ${a >= 30 ? 'OK' : 'BELOW BAR'}`);
