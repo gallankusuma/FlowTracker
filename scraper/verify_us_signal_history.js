@@ -43,18 +43,18 @@ const ok = m => console.log(`  ok    ${m}`);
   console.log('1. forward returns, recomputed from us_stock_prices by a different route');
   for (const h of HORIZONS) {
     const [rows] = await pool.query(
-      `SELECT h.ticker, h.data_date, h.price_at_signal, h.return_${h} stored,
+      `SELECT h.ticker, h.data_date, h.price_at_signal, h.return_${h}d stored_ret,
               (SELECT q.close_price FROM us_stock_prices q
                 WHERE q.ticker = h.ticker AND q.date > h.data_date
                 ORDER BY q.date ASC LIMIT 1 OFFSET ?) fwd
          FROM us_signal_history h
-        WHERE h.return_${h} IS NOT NULL
+        WHERE h.return_${h}d IS NOT NULL
         ORDER BY RAND() LIMIT ?`, [h - 1, SAMPLES]);
     let bad = 0, worst = 0;
     for (const r of rows) {
       if (r.fwd === null) { bad++; continue; }
       const exp = ((Number(r.fwd) - Number(r.price_at_signal)) / Number(r.price_at_signal)) * 100;
-      const d = Math.abs(exp - Number(r.stored));
+      const d = Math.abs(exp - Number(r.stored_ret));
       worst = Math.max(worst, d);
       if (d > 0.0002) bad++;
     }
