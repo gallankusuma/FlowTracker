@@ -2435,3 +2435,88 @@ pre-registration exists to prevent.
 **INCONCLUSIVE.** `US_TECH_WEIGHTS` unchanged. Survivorship-biased universe
 (today's S&P 500 members projected back twenty years, 11 of 418 unfetchable),
 so every figure above is biased upward. Evidence about US only.
+
+---
+
+## EXP-044 — which US factors carry anything, one at a time
+
+- **Script**: `scraper/research/exp044_us_per_factor_ic.js`
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_us_per_factor_ic.md`, committed
+  `ed6e273` **before** the script was run
+- **Data**: `us_signal_history`, 1,599,910 rows, 4,240 usable sessions
+  (2007-02-28 … 2023-12-29). **2024-01-01 onward sealed and unread.**
+- **Direction**: two-sided, m = 9, Benjamini-Hochberg within each segment, primary horizon only
+- **Floor**: |IC| >= 0.02, fixed before the run
+
+### Result — NONE. Zero carriers, zero inverted carriers.
+
+Primary `return_20d`, DISCOVERY, 150 non-overlapping anchors:
+
+| factor | mean IC | 95% CI | t | q | floor |
+|---|---|---|---|---|---|
+| F3 volume z | +0.0062 | [−0.0064, +0.0188] | 0.98 | 0.531 | below |
+| F4 momentum | −0.0090 | [−0.0307, +0.0127] | −0.82 | 0.531 | below |
+| F5 rel strength | +0.0192 | [−0.0045, +0.0429] | 1.60 | 0.531 | below |
+| F9 RSI | +0.0045 | [−0.0170, +0.0261] | 0.42 | 0.723 | below |
+| F10 MACD | −0.0123 | [−0.0313, +0.0067] | −1.28 | 0.531 | below |
+| F11 Bollinger %B | +0.0093 | [−0.0114, +0.0299] | 0.89 | 0.531 | below |
+| F12 EMA trend | −0.0113 | [−0.0349, +0.0123] | −0.95 | 0.531 | below |
+| F13 support/resistance | −0.0017 | [−0.0109, +0.0076] | −0.36 | 0.723 | below |
+| F14 ATR | −0.0281 | [−0.0644, +0.0083] | −1.52 | 0.531 | PASS |
+
+Nothing reaches q < 0.05. The largest |t| in the whole table is 1.60. Only F14
+clears the economic floor and it is nowhere near significant. **A clean null.**
+
+### The pre-registered horizon choice prevented a false discovery, and here it is
+
+At the SECONDARY horizon `return_40d`, DISCOVERY:
+
+| factor | mean IC | t | q |
+|---|---|---|---|
+| **F5 rel strength** | **+0.0503** | **3.05** | **0.0289 — survives BH** |
+| F10 MACD | −0.0265 | −2.00 | 0.221 |
+| F11 Bollinger %B | +0.0259 | 1.81 | 0.223 |
+
+**F5 at 40 days clears the floor, clears BH at m = 9, and passes the 4/4
+stability screen.** Had 40d been named the primary, this experiment would have
+declared F5 a carrier.
+
+In VALIDATION at 40d, F5 is **−0.0263**. The sign **inverts**.
+
+The horizon was fixed in advance for exactly this reason, and this is the first
+time in this project's registry that the discipline can be shown catching a
+specific number that would otherwise have been reported as a finding.
+
+### The momentum cluster at 40d — four names, one observation, no pass
+
+F9, F10, F11 and F12 agree in sign between discovery and validation at 40d
+(+/+, −/−, +/+, −/−) and reach raw p 0.008–0.040 in validation — but **none
+survives BH in either segment**, and they correlate 0.61–0.83 with each other,
+so this is one observation with four names, not four. Recorded as an
+observation. Any follow-up needs its own registration and its own data.
+
+### An observation across EXP-043 and EXP-044
+
+EXP-043 found the composite ranked positively at 40d in 2007–2018 (+0.0169) and
+negatively in 2019–2026 (−0.0393). EXP-044 finds individual factors carry
+**more** apparent structure in 2019–2023 than in 2007–2018 — at 20d, F9 (+0.0467,
+t 2.22), F11 (+0.0494, t 2.34) and F12 (−0.0567, t −2.51) have raw p < 0.05 in
+validation and are absent from discovery.
+
+Both are consistent with the relationship having **changed around 2019** in a
+direction the deployed weights do not exploit. That is a hypothesis, not a
+finding, and it is written here so a future experiment can be registered against
+it rather than discovered inside it.
+
+### Status
+
+**NULL.** Nine factors, 4,240 sessions, nothing passes. Per the pre-registration
+this "would say the US factor set carries no usable cross-sectional information
+at the traded horizon, which is a substantive answer and the most likely one
+given EXP-043" — and that is what it says.
+
+`US_TECH_WEIGHTS` unchanged, no factor added, none removed. Survivorship-biased
+universe, so the true numbers are **worse** than shown. Rank IC is ordering, not
+profit; nothing here bears the 0.50% round-trip cost.
+
+**The holdout from 2024-01-01 remains sealed and unread.**
