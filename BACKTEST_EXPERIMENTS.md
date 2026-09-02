@@ -2241,3 +2241,93 @@ showed we have about four independent things, not fifty, and a fifth worth
 **NO VERDICT.** One regime, no holdout, and the foreign share is a per-broker
 constant projected backwards onto history — a broker's client mix can change and
 this treats it as fixed.
+
+---
+
+## EXP-042 — is the composite's weighting an accident of naming?
+
+- **Script**: `scraper/research/exp042_cluster_weights.js`
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_cluster_weights.md`, committed
+  `7ec34f3` **before** the script was run
+- **Data**: `idx_signal_history`, 39,430 rows, 145 sessions (2026-01-19 … 2026-09-01)
+- **Scoring**: production `combineFactorScores()`, `finalScore` — not a re-implementation
+- **Direction**: two-sided, m = 3, Benjamini-Hochberg
+
+### The question
+
+`RAW_F1_13_SHARES` pays each factor by name. EXP-040 showed the names outnumber
+the things, so an idea with five names collects five shares. Clustering F1–F13 by
+cross-sectional Spearman, single linkage at |rho| >= 0.5, gives **K = 5**:
+
+| cluster | members | current share | equal-cluster |
+|---|---|---|---|
+| broker flow + breadth | F1, F2, F6, F7, F8 | **48.4%** | 20.0% |
+| momentum / oscillator | F4, F9, F10, F11, F12 | **33.1%** | 20.0% |
+| volume | F3 | 8.2% | 20.0% |
+| relative strength | F5 | 7.2% | 20.0% |
+| support/resistance | F13 | 3.1% | 20.0% |
+
+Two clusters hold **81.5%** of the directional vote; nobody chose that.
+
+### Result — INCONCLUSIVE on the registered rule
+
+Primary, `return_3d`, 39 non-overlapping anchors:
+
+| contrast | mean diff | 95% CI | t | p | q |
+|---|---|---|---|---|---|
+| cluster − current | +0.0095 | [−0.0147, +0.0336] | 0.79 | 0.432 | 0.452 |
+| flat − current | −0.0027 | [−0.0099, +0.0045] | −0.76 | 0.452 | 0.452 |
+| cluster − flat | +0.0122 | [−0.0091, +0.0334] | 1.16 | 0.253 | 0.452 |
+
+Secondary, both stamped inadmissible (below S1's 30-anchor bar):
+
+| horizon | anchors | cluster − current | t | flat − current | t |
+|---|---|---|---|---|---|
+| `return_5d` | 24 | +0.0176 | 1.29 | −0.0012 | −0.30 |
+| `return_10d` | 12 | +0.0204 | 1.22 | +0.0012 | +0.18 |
+
+### The one unambiguous fact the run did produce
+
+**Every scheme has a negative rank IC at every horizon.**
+
+| scheme | 3d | 5d | 10d |
+|---|---|---|---|
+| current | −0.0274 | −0.0360 | −0.0641 |
+| cluster | −0.0179 | −0.0184 | −0.0436 |
+| flat | −0.0301 | −0.0372 | −0.0629 |
+| cluster, |rho| >= 0.6 | −0.0160 | −0.0233 | −0.0426 |
+
+Registered condition 3 — `IC_cluster > 0` — fails outright. This independently
+reconfirms what Promotion Contract v1 already records: `composite_score` died at
+S1 with negative rank IC at all four horizons. **The weighting question is
+downstream of a ranker that does not rank**, and no reallocation of these
+thirteen factors changed that.
+
+### The consistent sign, reported as the contract requires
+
+`cluster − current` is positive at all three horizons and grows with horizon;
+`flat − current` is ~zero at all three. The control therefore did its job — the
+movement is specific to clustering, not to flattening. Both linkage thresholds
+agree, and |rho| >= 0.6 is marginally better at 3d.
+
+Sign agreement with no significance is **exactly the EXP-028 signature**, and
+Promotion Contract v1 S2 names it: *"that combination is the signature of low
+power, and it means the window cannot resolve effects of that size. Report it as
+'unresolvable', never as 'directionally promising'."* Recorded here as
+**unresolvable**.
+
+### Correction to the pre-registration's own arithmetic
+
+The prereg computed anchors from 145 sessions and predicted 48 / 29 / 14. Only
+**117** sessions carry forward returns (the most recent 28 have none yet), so the
+actual counts are **39 / 24 / 12**. The primary still clears S1's bar of 30, so
+the registered design stands, but at lower power than stated: detectable effect
+rises from d ≈ 0.41 to d ≈ 0.46. `return_5d` moved from "barely fails" to
+"clearly fails". Recorded rather than silently corrected.
+
+### Status
+
+**INCONCLUSIVE / UNRESOLVABLE.** `DEFAULT_WEIGHTS` is left unchanged, per the
+pre-registered "what a negative or inconclusive result would license". An
+admissible `return_10d` arm needs ~300 sessions in `idx_signal_history` —
+roughly April 2027.
