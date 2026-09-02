@@ -2331,3 +2331,107 @@ rises from d ≈ 0.41 to d ≈ 0.46. `return_5d` moved from "barely fails" to
 pre-registered "what a negative or inconclusive result would license". An
 admissible `return_10d` arm needs ~300 sessions in `idx_signal_history` —
 roughly April 2027.
+
+---
+
+## EXP-043 — cluster weighting on US, with real power and a frozen validation split
+
+- **Script**: `scraper/research/exp043_us_cluster_weights.js`
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_us_cluster_weights.md`, committed
+  `ff56d1c` **before** the script was run
+- **Data**: `us_signal_history`, 1,869,884 rows, 4,909 sessions (2007-02-28 … 2026-09-01), 407 tickers
+- **Split**: frozen chronological at 2019-01-01 — DISCOVERY 2,982 sessions, VALIDATION 1,927
+- **Direction**: two-sided, m = 3, Benjamini-Hochberg, within each segment
+
+### Clusters — K = 4, and threshold-stable
+
+| cluster | members | current | equal |
+|---|---|---|---|
+| momentum / oscillator | F4, F9, F10, F11, F12 | **64.1%** | 25.0% |
+| volume | F3 | 15.9% | 25.0% |
+| relative strength | F5 | 14.0% | 25.0% |
+| support/resistance | F13 | 6.0% | 25.0% |
+
+Identical membership at |rho| >= 0.5 and 0.6. Registered sensitivities: 0.4 gives
+K=3 (F5 folds into momentum), 0.7 gives K=5 (F4 splits off).
+
+### Result — INCONCLUSIVE on the registered rule
+
+Primary `return_20d`:
+
+| segment | contrast | mean diff | 95% CI | t | q |
+|---|---|---|---|---|---|
+| DISCOVERY (150 anchors) | cluster − current | +0.0078 | [−0.0020, +0.0176] | 1.57 | 0.178 |
+| | flat − current | −0.0010 | [−0.0060, +0.0040] | −0.41 | 0.684 |
+| | cluster − flat | +0.0088 | [+0.0014, +0.0162] | 2.35 | 0.060 |
+| VALIDATION (96 anchors) | cluster − current | +0.0102 | [−0.0049, +0.0252] | 1.34 | 0.275 |
+| | flat − current | +0.0023 | [−0.0049, +0.0094] | 0.64 | 0.527 |
+| | cluster − flat | +0.0079 | [−0.0036, +0.0194] | 1.36 | 0.276 |
+
+Condition 4 is the one that decides it: **`IC_cluster` is +0.0070 in discovery and
+−0.0223 in validation.** A weighting that ranks in one era and anti-ranks in the
+next is not a weighting to adopt.
+
+### The result that matters more than the hypothesis
+
+**With 20 years and genuine power, the US composite does not rank — and it got
+worse in the recent period.** Mean rank IC by segment, every scheme:
+
+| horizon | segment | current | cluster | flat |
+|---|---|---|---|---|
+| 10d | discovery | −0.0124 | −0.0021 | −0.0097 |
+| 10d | **validation** | **−0.0305** | **−0.0251** | **−0.0263** |
+| 20d | discovery | −0.0008 | +0.0070 | −0.0019 |
+| 20d | **validation** | **−0.0325** | **−0.0223** | **−0.0302** |
+| 40d | discovery | +0.0169 | +0.0245 | +0.0121 |
+| 40d | **validation** | **−0.0393** | **−0.0260** | **−0.0401** |
+
+At 40d in 2007–2018 the composite ranked *positively* (+0.0169 current, +0.0245
+cluster). In 2019–2026 the same construction is **−0.0393**. That is not a
+shrinking effect; it is an inversion, and Promotion Contract v1 S2 names
+inversion as a failure rather than a reduction.
+
+This is a far stronger statement than EXP-042 could make. IDX returned "not
+detectable in 145 sessions". This returns "measured across 96 independent
+validation anchors, and it is negative".
+
+### What the control established anyway
+
+`flat − current` is ~zero everywhere (−0.0048 to +0.0042, never significant at
+any horizon or segment), while `cluster − flat` is **positive in all nine
+horizon-segment cells** and reaches q = 0.014 at 10d discovery. So the movement
+is genuinely specific to clustering, not to flattening — the W_flat arm did its
+job and pointed the right way.
+
+**That significance is in a SECONDARY horizon and does not count.** The primary
+was named as 20d in advance precisely so a scan across horizons could not be
+mined afterwards, and 10d discovery `cluster − current` q = 0.014 does not
+replicate in validation (q = 0.61).
+
+### The stability check that undercuts the "consistent sign" reading
+
+`cluster − current` at 20d across four equal chronological blocks:
+
+| block | n | mean | t | IC_cluster |
+|---|---|---|---|---|
+| 2007-02-28 … 2011-12-29 | 62 | **+0.0220** | 2.74 | +0.0109 |
+| 2012-01-30 … 2016-12-02 | 62 | −0.0053 | −0.70 | +0.0106 |
+| 2017-01-03 … 2021-11-05 | 62 | +0.0147 | 1.52 | −0.0179 |
+| 2021-12-06 … 2026-07-23 | 59 | −0.0110 | −1.29 | +0.0161 |
+
+The sign **alternates**, and the whole advantage is carried by the 2007–2011
+block. The discovery/validation split alone would have hidden this. Reported
+because it is the evidence against the reading I would have preferred.
+
+### Not to be acted on
+
+The `|rho| >= 0.4` (K=3) sensitivity had the best validation IC at 10d (−0.0120)
+and 20d (−0.0182). It was registered as descriptive and stays descriptive:
+selecting it now, after seeing which arm won, is exactly the error the
+pre-registration exists to prevent.
+
+### Status
+
+**INCONCLUSIVE.** `US_TECH_WEIGHTS` unchanged. Survivorship-biased universe
+(today's S&P 500 members projected back twenty years, 11 of 418 unfetchable),
+so every figure above is biased upward. Evidence about US only.
