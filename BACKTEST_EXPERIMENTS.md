@@ -2964,3 +2964,64 @@ here licenses one.
 The honest next step is a fresh pre-registration of a **vol-ratio-adjusted risk
 unit**, fitted and gated on IDX before 2024, and only then sealed against the
 untouched IDX reserve — the sequence EXP-048 established and EXP-047 skipped.
+
+---
+
+## EXP-050 — VOID. The registered positive control failed, and it was right to.
+
+- **Script**: `scraper/research/exp050_idx_volratio_stop.js`
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_idx_volratio_stop.md`, committed `b5afa35`
+- **Superseded by** `PREREGISTRATION_2026-09-02_idx_volratio_stop_v2.md`
+
+### What happened
+
+Control 1 required this script to reproduce EXP-049b's IDX figure of −0.1698 for
+`VOL_RATIO` vs the 20-session forward range, within [−0.22, −0.12]. It returned
+**+0.0773 (t 8.19)** — wrong sign, wrong magnitude. The run voided itself before
+reading Stage 0, exactly as registered.
+
+### The diagnosis: my control was mis-specified
+
+EXP-049b computed `spearman(residualizeMulti(rVr, [rPv]), y)` — `VOL_RATIO`
+**residualised on the volatility level**. EXP-050's control computed the **raw**
+correlation. **The band came from one statistic and the code computed another.**
+Nothing about the data disagreed; two of my own scripts measured different things
+under the same name.
+
+That is the **fourth design error of this arc**, after EXP-046's noise-dominated
+objective, EXP-047's missing magnitude bar, and EXP-048's missing control. The
+pattern is consistent and worth naming: *the hypotheses have been careful; the
+specification of how success is measured has been repeatedly sloppy.*
+
+### And it caught something that matters more than the bug
+
+| `VOL_RATIO` vs 20-session range, IDX | IC |
+|---|---|
+| **raw** | **+0.0773** (t 8.19) |
+| residualised on the volatility **level** | **−0.1698** (t −20.72) |
+
+**The sign flips.** So the volatility mean-reversion effect promoted to the
+headline of EXP-049 is *itself* a conditional effect with a suppression
+structure — **the same shape as the F3 finding EXP-049c had just overturned for
+exactly that reason.**
+
+Raw: high recent volatility relative to the longer run mostly means high
+volatility, and high volatility means a bigger forward range. Only after the
+level is removed does the mean-reversion term appear.
+
+That does not make it wrong — EXP-049b's non-parametric checks conditioned inside
+level quintiles and the negative sign held. It does mean the mean-reversion story
+carries the identical caveat that killed the volume story, and it must not be
+described as unconditionally true.
+
+### What was and was not seen
+
+**Seen:** the raw and residualised ICs above.
+**NOT seen:** the Stage 0 stop-hit gap, Stage 1's β, and the Stage 2 gate. The
+script exited before computing any of them, so the successor experiment's
+hypothesis is untouched by this run.
+
+### Status
+
+**VOID.** No β fitted, nothing sealed. **The IDX reserve was not read** and
+remains intact, as does the forward reserve from 2026-09-02.
