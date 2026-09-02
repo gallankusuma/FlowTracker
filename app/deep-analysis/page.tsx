@@ -34,6 +34,7 @@ type Report = {
     zones: { zones: Zone[]; poc: { lo: number; hi: number }; valueArea: { lo: number; hi: number } };
     zoneWindow: { sessions: number; from: string; to: string };
     volume: { date: string; volume: number; vs20dAverage: number | null; closePositionInRange: number | null; upperWickPct: number | null; lowerWickPct: number | null; direction: string };
+    volatilityRegime: { unavailable?: string; sd20Pct?: number; sd60Pct?: number; ratio?: number; ratioPct?: number; state?: string; expectation?: string; measuredAgainst?: string; notADecision?: string };
     trend: { ema8: number | null; ema21: number | null; ema50: number | null; ema200: number | null; ema200Note: string | null; bbUpper: number | null; bbMiddle: number | null; bbLower: number | null };
     intraday?: { skipped?: boolean; unavailable?: string; bars?: number; from?: string; to?: string; runningBarDropped?: boolean; structure?: Struct; zones?: { zones: Zone[] } };
     brokerCostBasis: {
@@ -178,6 +179,7 @@ export default function DeepAnalysisPage() {
 
   const m = data?.measured;
   const b = m?.brokerCostBasis;
+  const vr = m?.volatilityRegime;
   const hourly = m?.intraday;
 
   return (
@@ -294,6 +296,48 @@ export default function DeepAnalysisPage() {
                   <div>upper wick {m.volume.upperWickPct}% · lower wick {m.volume.lowerWickPct}%</div>
                 </div>
               </div>
+            </div>
+
+            {/* ── VOLATILITY vs ITS OWN NORM ───────────────────────────────
+                The strongest relationship this project has measured (rank IC
+                -0.17 IDX / -0.26 US against the 20-session forward range), and
+                the one that demolished the volume finding it replaced.
+
+                It sits on the MEASURED side, but its caveats are rendered at the
+                same size as the number rather than tucked into a tooltip. The
+                obvious next step -- size the stop by it -- was pre-registered,
+                tested, and produced NOTHING (EXP-051, p 0.29). A reader who sees
+                "ELEVATED" and infers a wider stop would be inventing a rule this
+                project already measured and rejected. */}
+            <div style={{ ...card, marginBottom: 12 }}>
+              <div style={h}>VOLATILITY vs ITS OWN NORM</div>
+              {vr?.unavailable ? (
+                <div style={{ fontSize: 12, color: "var(--text-muted)" }}>{vr.unavailable}</div>
+              ) : (
+                <>
+                  <div style={{ display: "flex", gap: 18, flexWrap: "wrap", alignItems: "baseline", marginBottom: 8 }}>
+                    <div style={{
+                      fontSize: 15, fontWeight: 700, lineHeight: 1.3,
+                      color: (vr?.ratio ?? 0) > 0.2 ? "var(--accent-yellow)"
+                        : (vr?.ratio ?? 0) < -0.2 ? "var(--accent-blue, #58a6ff)" : "var(--text-muted)",
+                    }}>{vr?.state}</div>
+                    <div style={{ fontSize: 12, color: "var(--text-secondary)", fontFamily: "ui-monospace, monospace" }}>
+                      20d <b style={{ color: "var(--text-primary)" }}>{vr?.sd20Pct}%</b>/day
+                      {" · "}60d <b style={{ color: "var(--text-primary)" }}>{vr?.sd60Pct}%</b>/day
+                      {" · "}<b style={{ color: "var(--text-primary)" }}>
+                        {(vr?.ratioPct ?? 0) >= 0 ? "+" : ""}{vr?.ratioPct}%
+                      </b>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.7, marginBottom: 8 }}>
+                    {vr?.expectation}
+                  </div>
+                  <div style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.7, borderTop: "1px solid var(--border)", paddingTop: 8 }}>
+                    <div>{vr?.measuredAgainst}</div>
+                    <div style={{ color: "var(--accent-yellow)" }}>{vr?.notADecision}</div>
+                  </div>
+                </>
+              )}
             </div>
 
             {/* ── BROKER COST BASIS ───────────────────────────────────────── */}

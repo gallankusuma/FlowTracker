@@ -12,7 +12,7 @@
  */
 
 const assert = require('assert');
-const { pivots, structure, zones, volumeState, weeklyFromDaily } = require('./deep_analysis');
+const { pivots, structure, zones, volumeState, volatilityRegime, weeklyFromDaily } = require('./deep_analysis');
 
 let pass = 0, fail = 0;
 const queue = [];
@@ -201,6 +201,71 @@ t('volume is compared against the prior 20 sessions, not including itself', () =
 t('the reported date is the last CLOSED session', () => {
   const b = bars(new Array(25).fill(10));
   assert.strictEqual(volumeState(b).date, b[b.length - 1].d);
+});
+
+
+t.section('volatility regime');
+
+/** A price path whose per-bar volatility can be set for the recent and older halves. */
+function volPath(recentVol, olderVol, n = 80) {
+  let px = 100, seed = 7;
+  const rand = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff - 0.5; };
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const v = i >= n - 20 ? recentVol : olderVol;
+    px = px * (1 + rand() * 2 * v);
+    out.push({ d: `2026-${String(1 + Math.floor(i / 28)).padStart(2, '0')}-${String(1 + (i % 28)).padStart(2, '0')}`,
+      o: px, h: px * 1.001, l: px * 0.999, c: px, v: 1000 });
+  }
+  return out;
+}
+
+t('a recently CALM stock reads as compressed, and expects a wider range', () => {
+  const r = volatilityRegime(volPath(0.002, 0.02));
+  assert.ok(r.ratio < -0.2, `expected a clearly negative log ratio, got ${r.ratio}`);
+  assert.ok(/COMPRESSED/.test(r.state), r.state);
+  assert.ok(/WIDER/.test(r.expectation), r.expectation);
+});
+
+t('a recently WILD stock reads as elevated, and expects a narrower range', () => {
+  const r = volatilityRegime(volPath(0.03, 0.003));
+  assert.ok(r.ratio > 0.2, `expected a clearly positive log ratio, got ${r.ratio}`);
+  assert.ok(/ELEVATED/.test(r.state), r.state);
+  assert.ok(/NARROWER/.test(r.expectation), r.expectation);
+});
+
+t('a stock at its own norm reads as neither, not as a weak signal', () => {
+  const r = volatilityRegime(volPath(0.01, 0.01));
+  assert.ok(Math.abs(r.ratio) <= 0.2, `expected a ratio inside the band, got ${r.ratio}`);
+  assert.ok(/in line/.test(r.state), r.state);
+  assert.ok(/no mean-reversion/.test(r.expectation), r.expectation);
+});
+
+t('the ratio is ln(sd20/sd60) and ratioPct is the same number as a percentage', () => {
+  const r = volatilityRegime(volPath(0.02, 0.006));
+  const implied = Math.exp(r.ratio) - 1;
+  assert.ok(Math.abs(implied * 100 - r.ratioPct) < 0.6,
+    `ln ratio ${r.ratio} implies ${(implied * 100).toFixed(1)}% but ratioPct says ${r.ratioPct}`);
+});
+
+t('under 61 sessions it refuses rather than returning a number', () => {
+  const r = volatilityRegime(bars(new Array(50).fill(10)));
+  assert.ok(r.unavailable, 'a short window must not produce a ratio');
+  assert.strictEqual(r.ratio, undefined);
+});
+
+t('flat prices refuse rather than dividing by zero', () => {
+  const r = volatilityRegime(bars(new Array(80).fill(10)));
+  assert.ok(r.unavailable, `flat prices must not produce a ratio, got ${JSON.stringify(r)}`);
+});
+
+t('every reading carries the caveats that keep it out of a decision', () => {
+  const r = volatilityRegime(volPath(0.03, 0.003));
+  // EXP-051 measured the obvious next step and found nothing. If that sentence
+  // ever goes missing the reading starts looking like a stop rule.
+  assert.ok(/EXP-051/.test(r.notADecision), r.notADecision);
+  assert.ok(/not directional/.test(r.notADecision), r.notADecision);
+  assert.ok(/EXP-049b/.test(r.measuredAgainst), r.measuredAgainst);
 });
 
 (async () => {

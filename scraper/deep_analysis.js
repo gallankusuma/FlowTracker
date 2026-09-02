@@ -244,6 +244,81 @@ function volumeState(bars) {
 
 
 /**
+ * Where this stock's volatility sits against its OWN longer-run level.
+ *
+ * ── WHY THIS IS ON THE MEASURED SIDE ─────────────────────────────────────────
+ *
+ * `ln(sd20/sd60)` was the one thing that survived a long arc of experiments on
+ * 2026-09-02. Against the 20-session forward RANGE it carries a rank IC of
+ * -0.1698 on IDX and -0.2553 on US -- an order of magnitude larger than anything
+ * else this project has measured, present in both markets, and stable under
+ * non-parametric conditioning inside volatility-level buckets.
+ *
+ * It also demolished a finding. EXP-045 reported that volume predicts forward
+ * range; adding this as a control removed 82% of it, and 80% of the stop-hit gap
+ * EXP-046 had attributed to volume. The volume story was this quantity wearing
+ * a different name.
+ *
+ * ── AND THE THREE THINGS IT IS NOT ───────────────────────────────────────────
+ *
+ * 1. NOT DIRECTIONAL. Range is a magnitude. This says nothing about which way
+ *    price goes and must never be read as a reason to buy or sell.
+ *
+ * 2. NOT A STOP RULE. The obvious next step -- adjust the risk unit by it -- was
+ *    pre-registered and tested (EXP-051) and produced NO measurable change in
+ *    stop-hit rates on IDX: gap +1.39pp, t 1.07, p 0.29. ATR(14) is a 14-day
+ *    window, shorter than the sd20 here, and already absorbs most of it.
+ *    `computeTradePlan` is deliberately unchanged.
+ *
+ * 3. NOT UNCONDITIONAL. The RAW correlation with forward range is POSITIVE
+ *    (+0.0773 on IDX) and only turns negative once the volatility LEVEL is
+ *    controlled for -- high recent volatility mostly just means high volatility.
+ *    The reading below is about a stock relative to its OWN history, not an
+ *    absolute forecast.
+ *
+ * Context for how much room to expect. Not an input to any decision the system
+ * makes on its own.
+ */
+function volatilityRegime(bars) {
+  const rets = w => w.map((b, i) => (i === 0 ? null : (b.c - w[i - 1].c) / w[i - 1].c * 100)).filter(v => v !== null);
+  const stdev = a => {
+    if (a.length < 2) return null;
+    const m = mean(a);
+    return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1));
+  };
+  if (!bars || bars.length < 61) return { unavailable: `needs 61 sessions, has ${bars ? bars.length : 0}` };
+
+  const sd20 = stdev(rets(bars.slice(-20)));
+  const sd60 = stdev(rets(bars.slice(-60)));
+  if (!sd20 || !sd60 || !(sd20 > 0) || !(sd60 > 0)) return { unavailable: 'flat prices in the window' };
+
+  const ratio = Math.log(sd20 / sd60);
+  // Descriptive labels for a continuous number, not thresholds anything acts on.
+  // +/-0.20 in log terms is roughly a 22% move in daily volatility, which is
+  // where the reading stops being noise.
+  const state = ratio > 0.20 ? 'ELEVATED vs its own norm'
+    : ratio < -0.20 ? 'COMPRESSED vs its own norm'
+      : 'in line with its own norm';
+  const expectation = ratio > 0.20
+    ? 'stocks here have historically calmed down — expect a NARROWER range than the last 20 sessions suggest'
+    : ratio < -0.20
+      ? 'stocks here have historically woken up — expect a WIDER range than the last 20 sessions suggest'
+      : 'no mean-reversion reading either way';
+
+  return {
+    sd20Pct: round(sd20, 2),
+    sd60Pct: round(sd60, 2),
+    ratio: round(ratio, 3),
+    ratioPct: round((sd20 / sd60 - 1) * 100, 1),
+    state,
+    expectation,
+    measuredAgainst: 'rank IC vs 20-session forward range: −0.17 IDX, −0.26 US (EXP-049b)',
+    notADecision: 'descriptive only — not directional, and tested against stop placement with NO effect (EXP-051: +1.39pp, p 0.29)',
+  };
+}
+
+
+/**
  * The 1H picture — the "cari setup" step of the worked example.
  *
  * Daily says where the important prices are; the hourly says whether buyers are
@@ -345,6 +420,7 @@ async function analyse(pool, ticker, opts = {}) {
       zones: zones(zoneWindow),
       zoneWindow: { sessions: zoneWindow.length, from: zoneWindow[0].d, to: last.d },
       volume: volumeState(daily),
+      volatilityRegime: volatilityRegime(daily),
       trend: {
         ema8: round(ema(closes, 8)),
         ema21: round(ema(closes, 21)),
@@ -528,6 +604,19 @@ function render(r) {
   L.push(`  volume ${v.volume.toLocaleString('en-US')}  =  ${v.vs20dAverage}x its 20-session average`);
   L.push(`  close sat ${(v.closePositionInRange * 100).toFixed(0)}% up the bar's range;  upper wick ${v.upperWickPct}%  lower wick ${v.lowerWickPct}%`);
 
+  const vr = r.measured.volatilityRegime;
+  L.push('');
+  L.push('VOLATILITY vs ITS OWN NORM — the strongest relationship this project has measured');
+  if (vr.unavailable) L.push(`  ${vr.unavailable}`);
+  else {
+    L.push(`  last 20 sessions ${vr.sd20Pct}%/day   last 60 ${vr.sd60Pct}%/day   ` +
+      `ratio ${vr.ratioPct >= 0 ? '+' : ''}${vr.ratioPct}%  (ln ${vr.ratio})`);
+    L.push(`  ${vr.state}`);
+    L.push(`  ${vr.expectation}`);
+    L.push(`  ${vr.measuredAgainst}`);
+    L.push(`  ${vr.notADecision}`);
+  }
+
   const b = r.measured.brokerCostBasis;
   L.push('');
   L.push(`BROKER COST BASIS since ${b.since} — not visible on any chart`);
@@ -571,4 +660,4 @@ if (require.main === module) {
   })().catch(e => { console.error(e); process.exit(1); });
 }
 
-module.exports = { analyse, pivots, structure, zones, volumeState, weeklyFromDaily, intraday };
+module.exports = { analyse, pivots, structure, zones, volumeState, volatilityRegime, weeklyFromDaily, intraday };
