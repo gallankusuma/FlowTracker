@@ -608,21 +608,6 @@ export default function BrokerComparisonPage() {
           </div>
         </div>
 
-        {/* Signal Map lives here rather than in the nav while it is unfinished.
-            A link and not an embed on purpose: the redundancy grid answers a
-            different question from broker comparison, and folding it inline
-            would make an unfinished module harder to remove later. */}
-        <a href="/signal-map" style={{
-          display: 'inline-flex', alignItems: 'center', gap: 8, marginTop: 14,
-          padding: '8px 14px', borderRadius: 8, textDecoration: 'none',
-          background: 'rgba(188,140,255,0.10)', border: '1px solid rgba(188,140,255,0.30)',
-          color: '#bc8cff', fontSize: 12, fontWeight: 700,
-        }}>
-          🕸 Signal Map
-          <span style={{ fontWeight: 400, color: '#8b949e' }}>
-            which factors are actually different from each other — work in progress
-          </span>
-        </a>
       </div>
 
       {/* ─── Controls Bar ─── */}
