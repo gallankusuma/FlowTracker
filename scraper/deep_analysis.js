@@ -318,6 +318,64 @@ function volatilityRegime(bars) {
 }
 
 
+
+/**
+ * The same reading for every liquid ticker on one session, cached per date.
+ *
+ * ── WHY THIS EXISTS, AND IT IS A CORRECTION ──────────────────────────────────
+ *
+ * `volatilityRegime` reports an ABSOLUTE ratio: this stock against its own past.
+ * The statistic EXP-049b actually validated is a CROSS-SECTIONAL rank IC --
+ * stocks ranked against each other on the same date. Those are not the same
+ * thing, and the gap showed up the first time the reading was run across the
+ * board: 34 of the 60 most liquid IDX names read COMPRESSED on one session, with
+ * a median log-ratio of -0.24.
+ *
+ * That is not 34 facts about 34 stocks. It is one fact about the market, and a
+ * card that says "COMPRESSED vs its own norm" invites reading it as the former.
+ * So the percentile is computed and shown next to the ratio: a stock at the 2nd
+ * percentile is genuinely unusual today, one at the 45th is just in a quiet
+ * market along with everyone else.
+ *
+ * Cached by session date because the inputs only change once a day, and the
+ * first caller of the day pays for a scan the rest reuse.
+ */
+const _volXsCache = new Map();   // asOf -> sorted array of log-ratios
+async function volatilityCrossSection(pool, asOf) {
+  if (_volXsCache.has(asOf)) return _volXsCache.get(asOf);
+  const [rows] = await pool.query(
+    `SELECT p.stock_code, p.date, p.close_price c
+       FROM idx_stock_prices p
+       JOIN (SELECT stock_code FROM idx_stock_prices
+              WHERE date >= DATE_SUB(?, INTERVAL 120 DAY) AND close_price > 0 AND volume > 0
+              GROUP BY stock_code HAVING COUNT(*) >= 70) q ON q.stock_code = p.stock_code
+      WHERE p.date <= ? AND p.date >= DATE_SUB(?, INTERVAL 130 DAY) AND p.close_price > 0
+      ORDER BY p.stock_code, p.date ASC`, [asOf, asOf, asOf]);
+
+  const by = new Map();
+  for (const r of rows) {
+    if (!by.has(r.stock_code)) by.set(r.stock_code, []);
+    by.get(r.stock_code).push({ c: +r.c });
+  }
+  const ratios = [];
+  for (const bars of by.values()) {
+    const v = volatilityRegime(bars.map(b => ({ ...b })));
+    if (!v.unavailable && Number.isFinite(v.ratio)) ratios.push(v.ratio);
+  }
+  ratios.sort((a, b) => a - b);
+  _volXsCache.set(asOf, ratios);
+  if (_volXsCache.size > 8) _volXsCache.delete(_volXsCache.keys().next().value);
+  return ratios;
+}
+
+/** Percentile of `x` in a sorted array, 0-100. */
+function percentileOf(sorted, x) {
+  if (!sorted.length) return null;
+  let lo = 0, hi = sorted.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (sorted[mid] < x) lo = mid + 1; else hi = mid; }
+  return round((lo / sorted.length) * 100, 0);
+}
+
 /**
  * The 1H picture — the "cari setup" step of the worked example.
  *
@@ -420,7 +478,7 @@ async function analyse(pool, ticker, opts = {}) {
       zones: zones(zoneWindow),
       zoneWindow: { sessions: zoneWindow.length, from: zoneWindow[0].d, to: last.d },
       volume: volumeState(daily),
-      volatilityRegime: volatilityRegime(daily),
+      volatilityRegime: volatilityRegime(daily),   // percentile attached below
       trend: {
         ema8: round(ema(closes, 8)),
         ema21: round(ema(closes, 21)),
@@ -435,6 +493,26 @@ async function analyse(pool, ticker, opts = {}) {
   };
 
   // ── the hourly picture, from a DIFFERENT source, kept separate ─────────────
+  // The cross-sectional position, which is what EXP-049b actually measured.
+  // Without it "COMPRESSED" reads as a fact about the stock when it is often a
+  // fact about the market -- see volatilityCrossSection's header.
+  const vrx = report.measured.volatilityRegime;
+  if (!vrx.unavailable) {
+    try {
+      const xs = await volatilityCrossSection(pool, last.d);
+      vrx.percentile = percentileOf(xs, vrx.ratio);
+      vrx.universe = xs.length;
+      vrx.marketMedianRatio = xs.length ? round(xs[Math.floor(xs.length / 2)], 3) : null;
+      vrx.vsMarket = vrx.percentile === null ? null
+        : vrx.percentile <= 20 ? 'genuinely unusual — among the most compressed liquid names today'
+          : vrx.percentile >= 80 ? 'genuinely unusual — among the most elevated liquid names today'
+            : 'ordinary for today — most liquid names sit near here, so this says more about the market than the stock';
+    } catch (e) {
+      vrx.percentile = null;
+      vrx.vsMarket = `cross-section unavailable: ${String(e.message).slice(0, 60)}`;
+    }
+  }
+
   report.measured.intraday = opts.skipIntraday ? { skipped: true } : await intraday(ticker);
 
   // ── broker cost basis: the part no chart can show ──────────────────────────
@@ -612,6 +690,10 @@ function render(r) {
     L.push(`  last 20 sessions ${vr.sd20Pct}%/day   last 60 ${vr.sd60Pct}%/day   ` +
       `ratio ${vr.ratioPct >= 0 ? '+' : ''}${vr.ratioPct}%  (ln ${vr.ratio})`);
     L.push(`  ${vr.state}`);
+    if (vr.percentile !== null && vr.percentile !== undefined) {
+      L.push(`  p${vr.percentile} of ${vr.universe} liquid names today (market median ${vr.marketMedianRatio})`);
+      L.push(`  ${vr.vsMarket}`);
+    }
     L.push(`  ${vr.expectation}`);
     L.push(`  ${vr.measuredAgainst}`);
     L.push(`  ${vr.notADecision}`);
@@ -660,4 +742,4 @@ if (require.main === module) {
   })().catch(e => { console.error(e); process.exit(1); });
 }
 
-module.exports = { analyse, pivots, structure, zones, volumeState, volatilityRegime, weeklyFromDaily, intraday };
+module.exports = { analyse, pivots, structure, zones, volumeState, volatilityRegime, volatilityCrossSection, percentileOf, weeklyFromDaily, intraday };

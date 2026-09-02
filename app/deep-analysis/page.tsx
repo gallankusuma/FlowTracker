@@ -34,7 +34,7 @@ type Report = {
     zones: { zones: Zone[]; poc: { lo: number; hi: number }; valueArea: { lo: number; hi: number } };
     zoneWindow: { sessions: number; from: string; to: string };
     volume: { date: string; volume: number; vs20dAverage: number | null; closePositionInRange: number | null; upperWickPct: number | null; lowerWickPct: number | null; direction: string };
-    volatilityRegime: { unavailable?: string; sd20Pct?: number; sd60Pct?: number; ratio?: number; ratioPct?: number; state?: string; expectation?: string; measuredAgainst?: string; notADecision?: string };
+    volatilityRegime: { unavailable?: string; sd20Pct?: number; sd60Pct?: number; ratio?: number; ratioPct?: number; state?: string; expectation?: string; measuredAgainst?: string; notADecision?: string; percentile?: number | null; universe?: number; marketMedianRatio?: number | null; vsMarket?: string | null };
     trend: { ema8: number | null; ema21: number | null; ema50: number | null; ema200: number | null; ema200Note: string | null; bbUpper: number | null; bbMiddle: number | null; bbLower: number | null };
     intraday?: { skipped?: boolean; unavailable?: string; bars?: number; from?: string; to?: string; runningBarDropped?: boolean; structure?: Struct; zones?: { zones: Zone[] } };
     brokerCostBasis: {
@@ -329,6 +329,23 @@ export default function DeepAnalysisPage() {
                       </b>
                     </div>
                   </div>
+                  {/* The percentile is not decoration. EXP-049b validated a
+                      CROSS-SECTIONAL rank IC, and the first market-wide run of
+                      this card found 34 of 60 liquid names reading COMPRESSED at
+                      once -- one fact about the market, displayed 34 times as if
+                      it were about the stock. Without this line the label is
+                      misleading on exactly the days it looks most interesting. */}
+                  {vr?.percentile !== null && vr?.percentile !== undefined && (
+                    <div style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.7, marginBottom: 6 }}>
+                      <b style={{
+                        color: (vr.percentile <= 20 || vr.percentile >= 80) ? "var(--text-primary)" : "var(--text-muted)",
+                      }}>p{vr.percentile}</b> of {vr.universe} liquid names today
+                      {" · "}market median {vr.marketMedianRatio}
+                      <div style={{ color: (vr.percentile <= 20 || vr.percentile >= 80) ? "var(--text-secondary)" : "var(--accent-yellow)" }}>
+                        {vr.vsMarket}
+                      </div>
+                    </div>
+                  )}
                   <div style={{ fontSize: 13, color: "var(--text-secondary)", lineHeight: 1.7, marginBottom: 8 }}>
                     {vr?.expectation}
                   </div>

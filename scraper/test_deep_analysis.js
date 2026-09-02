@@ -12,7 +12,7 @@
  */
 
 const assert = require('assert');
-const { pivots, structure, zones, volumeState, volatilityRegime, weeklyFromDaily } = require('./deep_analysis');
+const { pivots, structure, zones, volumeState, volatilityRegime, percentileOf, weeklyFromDaily } = require('./deep_analysis');
 
 let pass = 0, fail = 0;
 const queue = [];
@@ -266,6 +266,25 @@ t('every reading carries the caveats that keep it out of a decision', () => {
   assert.ok(/EXP-051/.test(r.notADecision), r.notADecision);
   assert.ok(/not directional/.test(r.notADecision), r.notADecision);
   assert.ok(/EXP-049b/.test(r.measuredAgainst), r.measuredAgainst);
+});
+
+
+t('percentileOf places a value in a sorted cross-section', () => {
+  const xs = [-1, -0.5, -0.2, 0, 0.3];
+  assert.strictEqual(percentileOf(xs, -1.5), 0, 'below everything is p0');
+  assert.strictEqual(percentileOf(xs, 0.4), 100, 'above everything is p100');
+  assert.strictEqual(percentileOf(xs, -0.2), 40, 'ties take the lower edge');
+  assert.strictEqual(percentileOf([], 0), null, 'an empty cross-section has no percentile');
+});
+
+t('a compressed stock in a compressed MARKET is not unusual', () => {
+  // The failure this whole cross-section exists for: 34 of 60 liquid names read
+  // COMPRESSED on one session, so "COMPRESSED" alone said more about the market
+  // than about any stock.
+  const market = [-0.9, -0.6, -0.5, -0.4, -0.3, -0.25, -0.2, -0.15, -0.1, 0.1];
+  assert.ok(percentileOf(market, -0.25) >= 20 && percentileOf(market, -0.25) <= 80,
+    'a middling stock in a quiet market must not read as unusual');
+  assert.ok(percentileOf(market, -0.9) < 20, 'the genuinely extreme one still does');
 });
 
 (async () => {
