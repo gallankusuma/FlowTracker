@@ -26,6 +26,29 @@ const arg = (n, d) => { const i = argv.indexOf(n); return i >= 0 && argv[i + 1] 
 const SAMPLES = Number(arg('--samples', 400));
 const HORIZONS = [1, 5, 10, 20, 60];
 
+/**
+ * Random rows WITHOUT `ORDER BY RAND()`.
+ *
+ * The obvious query cost a full run: on 1.87M rows MySQL materialises and sorts
+ * everything before LIMIT applies, and any correlated subquery in the SELECT
+ * list gets evaluated across the whole table on the way. It never finished.
+ *
+ * `id` is an untouched AUTO_INCREMENT primary key with no deletes, so drawing
+ * ids uniformly from [min, max] and looking them up is both uniform and a
+ * primary-key hit. A few draws can miss if gaps ever appear; the caller uses
+ * however many came back rather than assuming it got exactly n.
+ */
+async function randomIds(pool, n) {
+  const [[b]] = await pool.query('SELECT MIN(id) lo, MAX(id) hi FROM us_signal_history');
+  if (!b.lo) return [];
+  const span = Number(b.hi) - Number(b.lo) + 1;
+  const ids = new Set();
+  for (let i = 0; i < n * 2 && ids.size < n; i++) {
+    ids.add(Number(b.lo) + Math.floor(Math.random() * span));
+  }
+  return [...ids];
+}
+
 let failures = 0;
 const fail = m => { failures++; console.log(`  FAIL  ${m}`); };
 const ok = m => console.log(`  ok    ${m}`);
@@ -41,6 +64,7 @@ const ok = m => console.log(`  ok    ${m}`);
     `${c.mn && c.mn.toISOString().slice(0, 10)} .. ${c.mx && c.mx.toISOString().slice(0, 10)}\n`);
 
   console.log('1. forward returns, recomputed from us_stock_prices by a different route');
+  const sampleIds = await randomIds(pool, SAMPLES);
   for (const h of HORIZONS) {
     const [rows] = await pool.query(
       `SELECT h.ticker, h.data_date, h.price_at_signal, h.return_${h}d stored_ret,
@@ -48,8 +72,7 @@ const ok = m => console.log(`  ok    ${m}`);
                 WHERE q.ticker = h.ticker AND q.date > h.data_date
                 ORDER BY q.date ASC LIMIT 1 OFFSET ?) fwd
          FROM us_signal_history h
-        WHERE h.return_${h}d IS NOT NULL
-        ORDER BY RAND() LIMIT ?`, [h - 1, SAMPLES]);
+        WHERE h.id IN (?) AND h.return_${h}d IS NOT NULL`, [h - 1, sampleIds]);
     let bad = 0, worst = 0;
     for (const r of rows) {
       if (r.fwd === null) { bad++; continue; }
@@ -119,7 +142,7 @@ const ok = m => console.log(`  ok    ${m}`);
     `SELECT ticker, data_date, composite_score, f3_volume_z, f4_momentum, f5_rel_strength,
             f9_rsi, f10_macd, f11_bollinger, f12_ema_trend, f13_support_resistance, f14_atr,
             market_avg_change_pct, weekly_trend
-       FROM us_signal_history ORDER BY RAND() LIMIT 40`);
+       FROM us_signal_history WHERE id IN (?)`, [await randomIds(pool, 40)]);
   let mismatched = 0, rescored = 0;
   for (const s of samples) {
     const asOf = s.data_date.toISOString().slice(0, 10);
