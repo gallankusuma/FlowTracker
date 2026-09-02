@@ -15,7 +15,6 @@ const NAV_ITEMS = [
   { label: "Deep Analysis",       href: "/deep-analysis",       icon: "🔬", badge: "NEW", badgeColor: "#39d2f5" },
   { label: "Float Map",           href: "/float-map",           icon: "🧭", badge: "EXP", badgeColor: "#a371f7" },
   { label: "Insider Moves",       href: "/insider-moves",       icon: "👁" },
-  { label: "Signal Map",          href: "/signal-map",          icon: "🕸", badge: "NEW", badgeColor: "#bc8cff" },
   { label: "IDX Big Caps",        href: "/idx",                 icon: "🏛", badge: "NEW", badgeColor: "#f0a500" },
   { label: "US Market",           href: "/us-signal-scanner",   icon: "🇺🇸", badge: "NEW", badgeColor: "#f0a500" },
   { label: "AWO",                  href: "/awo-dashboard",       icon: "🧠", badge: "AI", badgeColor: "#17C671" },
