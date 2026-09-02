@@ -2792,3 +2792,70 @@ a real question rather than an obvious next step.
 
 Survivorship-biased universe; gap risk ignored (fills at the stop price, shared
 by both arms).
+
+---
+
+## EXP-048 — the stop miscalibration does NOT travel to IDX. The gate held; nothing was spent.
+
+- **Script**: `scraper/research/exp048_idx_stop_reserve.js` (+ post-hoc `exp048b_idx_null_validity.js`)
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_idx_stop_reserve.md`, committed `5fa5e10` **before** the run
+- **Data**: `idx_stock_prices`, 756,566 rows strictly before 2024-01-01; 580 tickers,
+  1,723 usable sessions, 87 anchors (FIT 51, CHECK 36). Eligible median price **Rp 368**.
+- **RESERVED 2024-01-01 onward: NOT READ.** The script has no flag to open it.
+
+### Stage 0 — it does not replicate
+
+| | gap | 95% CI | t | p |
+|---|---|---|---|---|
+| IDX, FIT segment | **+0.77pp** | [−2.08, +3.62] | 0.55 | 0.5877 |
+
+Against US: **+2.98pp** (t 4.05), **+4.65pp** (t 4.44), **+7.61pp** (t 3.22) in
+three non-overlapping periods.
+
+Stage 0's stop condition fired. **No β was fitted, no seal was written, and the
+IDX reserved period was not opened.** That is the design working: EXP-047 spent
+the US holdout on a candidate nobody had checked; here the gate refused before
+anything was spent.
+
+### Is the null trustworthy? Three post-hoc checks say yes
+
+**A positive control was missing from the pre-registration.** EXP-045 established
+that a control which voids the run is mandatory and I did not carry it forward —
+the third design lapse of this arc, after EXP-046's noise-dominated objective and
+EXP-047's missing magnitude bar. It was supplied late:
+
+| check | result |
+|---|---|
+| **Positive control** — inside an ATR quintile, residual ATR must still move the hit rate | **−1.58pp, t −2.22. PASSES.** The instrument is not blind. |
+| **Tick granularity** — gap by price floor (Rp 368 median means ~0.27% per tick) | ≥0: −1.26pp (t −1.24); ≥500: −0.01pp (t −0.01); ≥1000: −0.87pp (t −0.36). Nothing hiding at higher prices, and the sign is *negative* throughout — opposite to US. |
+| **Is F3 degenerate on IDX?** | mean 50.5, sd 14.4, p10–p90 spread 27.6 points, only 3.7% at exactly 50. Wide enough to rank. |
+
+Power check: a US-sized 2.98pp effect at n = 87 anchors would have been expected
+at t ≈ 3.1. Observed t = 0.55. **The null is informative for effects of the US
+magnitude**, not merely underpowered.
+
+### What this means
+
+**The stop miscalibration is US-specific, or at least absent on IDX.**
+
+That matters more than it first sounds. **IDX is the market this project actually
+trades.** EXP-045's F3→range carrier and EXP-046's stop miscalibration are both
+findings about a parallel US layer, and the one production rule they pointed at —
+`computeTradePlan`'s POSITION profile — shows **no such defect on the market where
+it is actually used.**
+
+So there is no case for changing the IDX stop, and no reason to spend the IDX
+reserve on this candidate.
+
+### Status
+
+**NULL on IDX, and the null is validated.** `trade_policy` and `computeTradePlan`
+untouched.
+
+**RESERVED 2024-01-01 … 2026-09-01 remains sealed**, available for a better
+candidate. A **standing forward reserve from 2026-09-02 onward** is established
+by this pre-registration and may not be read without its own seal.
+
+Whole-rupiah ticks, survivorship and gap risk all bias IDX hit rates; both arms
+would have shared them, and the checks above show none of them manufactured the
+null.
