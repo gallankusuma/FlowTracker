@@ -2606,3 +2606,100 @@ registered follow-up asking whether the improved range forecast actually improve
 stop placement in `computeTradePlan`, measured on data this run has not touched.
 
 **The holdout from 2024-01-01 remains sealed and unread.**
+
+---
+
+## EXP-046 — is the deployed ATR stop miscalibrated, and can F3 fix it?
+
+- **Script**: `scraper/research/exp046_us_stop_calibration.js` (+ post-hoc `exp046b_stop_diagnostic.js`)
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_us_stop_calibration.md`, committed `6568348` **before** the run
+- **Incumbent**: `stop = entry − ATR(14) × 2.5` (POSITION profile), S/R snap disabled
+- **Entry-agnostic**: every ticker-anchor opens a hypothetical long at the next open. **Not a P&L test.**
+- 212 anchors: 150 discovery, 62 validation. **Holdout from 2024-01-01 sealed and unread.**
+
+### Primary — the deployed stop IS miscalibrated, and it replicates
+
+`hitRate(F3 bottom quintile) − hitRate(F3 top quintile)`, measured inside ATR
+quintiles so stop width in ATR units is constant by construction:
+
+| segment | base hit rate | diff | sd | t | p |
+|---|---|---|---|---|---|
+| DISCOVERY | 34.7% | **+2.98pp** | 9.02pp | **4.05** | 0.0001 |
+| VALIDATION | 37.1% | **+4.65pp** | 8.24pp | **4.44** | 0.0000 |
+
+Both clear the 2pp floor fixed before the run. On a ~35% base rate, a 3–5pp
+differential is roughly a 10% relative difference in how often a position is
+stopped out — **at the same ATR-relative stop distance.**
+
+Positive at every stop width tested: 1.5× (+2.03 / +4.20pp), 2.5× (+2.98 /
++4.65pp), 3.5× (+2.65 / +3.20pp). Not an artefact of one setting.
+
+### The dangerous alternative explanation, and it points the wrong way
+
+The pre-registration flagged that the mean ATR spread *inside* an ATR quintile is
+45.8%, leaving room for residual volatility to masquerade as F3. Post-hoc
+(`exp046b`, can only undermine):
+
+- **Mean ATR% by F3 quintile, inside ATR quintiles**: −0.98% / −0.55% / +0.22% /
+  +0.36% / +1.00% of bucket mean. Low-F3 names sit **1.98% BELOW** high-F3 names
+  in ATR. The residual gradient runs **against** the finding, not for it.
+- **Re-run on ATR deciles**, halving the residual room: +3.07pp (t 4.23)
+  discovery, +4.53pp (t 4.21) validation — **unchanged**.
+
+Residual volatility does not explain this.
+
+### The registered verdict, and my own error inside it
+
+**VERDICT: MISCALIBRATED BUT NOT WORTH FIXING — real, and the proposed fix does
+not work.**
+
+That verdict stands, because the fix arm was specified before the run and failed
+on its own terms. But the reason it failed is **a mis-specified objective of
+mine**, and that has to be said plainly rather than left to imply the
+miscalibration is unfixable.
+
+The registered secondary fitted β to minimise the **max-minus-min** hit rate
+across five F3 quintiles. With ~16 names per cell at a ~35% base rate, each cell
+estimate carries SE ≈ 12pp, so max-minus-min over five of them is ≈ 23pp of
+almost pure sampling noise — exactly what the run reported (23.58pp), against a
+real top-to-bottom effect of 3–5pp. **Minimising that objective minimised noise.**
+
+Refitting the *same* parameterisation against the signal-bearing statistic
+(post-hoc, `exp046b` CHECK 3) returns the same β = **−0.020** and shows it works:
+
+| | incumbent | candidate (β = −0.020) |
+|---|---|---|
+| discovery diff | +2.98pp (t 4.05) | **+0.80pp (t 1.07)** |
+| validation diff | +4.65pp (t 4.44) | **+2.69pp (t 2.47)** |
+
+`riskUnit = ATR × 2.5 × (1 − 0.02·z(F3))` — a low-volume name gets a ~4% wider
+stop. It roughly **halves** the miscalibration out of sample.
+
+**This is post-hoc and licenses nothing.** It is a corrected diagnostic, not a
+registered pass, and it cannot become a production change without its own
+pre-registration on data neither run has touched.
+
+### What this is NOT
+
+- **Not a P&L claim.** Entries are uninformative by construction; a
+  better-calibrated stop is not automatically a more profitable one.
+- **Gap risk ignored** — stops are filled at the stop price. Shared by both arms,
+  but the absolute cost of being stopped is understated.
+- **S/R snap disabled**, so this measures the risk-unit rule and not the full
+  deployed `computeTradePlan`.
+- **Survivorship cuts the wrong way**: blow-ups are absent and blowing up is the
+  archetypal stop-hitting event, so hit rates are understated and the names most
+  likely to reveal miscalibration are the missing ones.
+- **Fourth look** at the 2019+ span.
+
+### Status
+
+**MISCALIBRATED, CONFIRMED AND REPLICATED.** The fix is promising and unregistered.
+No production change. `trade_policy` untouched.
+
+The honest next step is a single registered test of the adjusted risk unit
+through the full `computeTradePlan` — snap on, targets on, costs applied — on the
+**sealed period**, which is an S3 read and burns it. It should happen once,
+after the definition and policy are frozen and hashed, and not before.
+
+**The holdout from 2024-01-01 remains sealed and unread.**
