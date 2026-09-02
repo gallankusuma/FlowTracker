@@ -3025,3 +3025,71 @@ hypothesis is untouched by this run.
 
 **VOID.** No β fitted, nothing sealed. **The IDX reserve was not read** and
 remains intact, as does the forward reserve from 2026-09-02.
+
+---
+
+## EXP-051 (v2) — ATR(14) already absorbs the mean-reversion. Second IDX null, reserve intact.
+
+- **Script**: `scraper/research/exp051_idx_volratio_stop_v2.js`
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_idx_volratio_stop_v2.md`, committed `4efdd35` **before** the run
+- Supersedes the VOID EXP-050. **IDX reserve not read.**
+
+### The controls now agree, which validates the EXP-050 diagnosis
+
+| control | result |
+|---|---|
+| `VOL_RATIO` vs range, **residualised on the vol level** | **−0.1698, t −20.72** — reproduces EXP-049b exactly. **PASS** |
+| raw, for reference only (not a criterion) | +0.0773 — the sign flip that voided EXP-050 |
+| residual ATR inside ATR quintiles | −7.09pp, t −7.54. **PASS** |
+
+The two pipelines now measure the same quantity and return the same number. The
+void was a specification bug of mine, confirmed and closed.
+
+### Stage 0 — no miscalibration on IDX
+
+| | gap | 95% CI | t | p |
+|---|---|---|---|---|
+| IDX FIT, 51 anchors, base hit rate 34.7% | **+1.39pp** | [−1.21, +3.99] | 1.07 | 0.2882 |
+
+Below the 2pp floor and not significant. **The stop condition fired: no β fitted,
+nothing sealed, the reserve stays shut.**
+
+### Why this is interesting rather than disappointing
+
+The pre-registration named a Stage 0 null as "the surprising outcome" and said it
+would be informative. It is:
+
+**ATR(14) apparently already absorbs the mean-reversion.** It is a 14-day window —
+*shorter* than the `sd20` in `VOL_RATIO`'s numerator — so it already responds to
+recent conditions faster than the 60-day denominator does. A stop sized off it is
+not obviously mis-set with respect to a 20-vs-60 volatility ratio.
+
+And the deeper point: a −0.17 IC against forward **range** does not have to
+produce a stop-hit gap, because the stop distance itself scales with ATR, which
+tracks much of the same thing. That is the gap between **measurable** and
+**decision-relevant** that EXP-046's pre-registration named in advance. Here it
+lands on the null side.
+
+### The coherent picture across EXP-045 … EXP-051
+
+| | US (median $160.8M/day) | IDX (median $115k/day) |
+|---|---|---|
+| vol mean-reversion → forward range | −0.2553 | −0.1698 |
+| stop-hit gap on **volume** | +2.98 / +4.65 / +7.61pp — but **80% is vol-ratio** | +0.77pp, t 0.55 (EXP-048) |
+| stop-hit gap on **vol ratio** | (implied by the 80%) | **+1.39pp, t 1.07 (this)** |
+
+The range effect exists in both markets. **The stop-hit miscalibration exists only
+in the liquid one**, and on IDX it is now absent under *two different variables*,
+each with passing positive controls.
+
+**The deployed IDX stop rule is not shown to be miscalibrated by anything tested
+today.**
+
+### Status
+
+**NULL, with validated instruments.** `trade_policy` and `computeTradePlan`
+untouched — as they have been through every experiment in this arc.
+
+**IDX reserve 2024-01-01 … 2026-09-01 remains sealed and unspent**, across four
+consecutive opportunities to spend it. The forward reserve from 2026-09-02
+stands.
