@@ -2703,3 +2703,92 @@ through the full `computeTradePlan` — snap on, targets on, costs applied — o
 after the definition and policy are frozen and hashed, and not before.
 
 **The holdout from 2024-01-01 remains sealed and unread.**
+
+---
+
+## EXP-047 — S3 HOLDOUT READ. The reserved period is now BURNED.
+
+- **Script**: `scraper/research/exp047_us_stop_holdout.js`
+- **Seal**: `CANDIDATE_SEAL_2026-09-02_stop_f3adj.md`, committed `456a32b` **before** `--open-holdout`
+- **Script SHA-256 verified on the box before running**: `5f18ba3d…82f04`, matching the seal
+- **Period**: 2024-01-01 … 2026-09-01 — 668 sessions, 34 anchors, 4,975 paired trades across 33
+- Full deployed path: `computeTradePlan` unmodified, S/R snap ON, targets ON, 0.50% round trip,
+  same-bar ambiguity → STOP, 20-session cap. Both arms on identical entries.
+
+### Verdict by the sealed rule: CANDIDATE HOLDS
+
+| arm | result |
+|---|---|
+| **A — shrinks \|stop-out diff\|** | YES |
+| **B — net return non-inferior (LB > −0.10%)** | YES |
+
+### But read the magnitudes before believing the verdict
+
+**A (efficacy):**
+
+| | diff | 95% CI | t | p |
+|---|---|---|---|---|
+| incumbent | **+7.61pp** | [+2.80, +12.42] | 3.22 | 0.0029 |
+| candidate | **+6.94pp** | [+2.15, +11.73] | 2.95 | 0.0059 |
+
+The candidate shrank the miscalibration by **0.67pp — 8.8% of it.** The
+post-hoc refit that motivated this seal had shown β = −0.020 removing **42%**
+(validation +4.65pp → +2.69pp). On the holdout it removed a twelfth of that
+share.
+
+**The sealed rule asked only whether |diff| got smaller. It set no magnitude
+bar** — unlike EXP-046's primary, which had a 2pp floor fixed in advance. That
+omission is mine, and it is why a technically-true "YES" here is substantively
+thin. The shrinkage is also **not tested for significance**: no paired test of
+(incumbent diff − candidate diff) was sealed, so whether 0.67pp differs from zero
+is simply **not established**, and cannot now be established without a fresh
+reserved period.
+
+**B (no harm):** mean +0.005%, 95% CI [−0.008%, +0.019%], p 0.43. Clears the
+−0.10% margin comfortably — because the candidate does essentially nothing to
+return, which is what a 4%-wider stop should do.
+
+### The finding that actually survived: a THIRD independent confirmation
+
+| period | miscalibration |
+|---|---|
+| discovery 2007–2018 | +2.98pp (t 4.05) |
+| validation 2019–2023 | +4.65pp (t 4.44) |
+| **holdout 2024–2026** | **+7.61pp (t 3.22)** |
+
+The deployed stop's miscalibration with respect to volume is confirmed in three
+non-overlapping periods and **is growing**. That is the durable result of this
+whole arc, and it is worth more than the fix that was sealed against it.
+
+It also says the frozen β was **far too small**. A crude linear extrapolation
+puts the β needed to halve a 7.61pp gap near −0.11, five times what was sealed.
+That number is an extrapolation, is not tested, and **cannot be tested** — the
+only reserved period has been spent.
+
+### What must NOT be read out of this run
+
+Both arms returned **+0.42% net per trade, PF 1.15, 50.3% win rate** over
+2024–2026. **That is not evidence the system works.** Entries are the deployed
+bullish signal, which EXP-044 showed carries no directional edge, over a period
+when US equities rose. There is no benchmark arm here, so those figures measure
+market drift with uninformative entry timing, not skill. Only the **paired
+difference** was being read, and the difference is ~zero.
+
+### Cost paid, stated plainly
+
+The project's only reserved period bought a technically-passing but
+substantively marginal result, because the remedy sealed against it was fitted
+with an objective that had already failed once (EXP-046's registered secondary)
+and was corrected only post-hoc. **The right sequence would have been to register
+the corrected fit on validation first, and seal only after it passed there.**
+
+### Status
+
+**HOLDS by the sealed rule; marginal in substance. HOLDOUT BURNED.**
+
+No production change. `trade_policy` untouched, `computeTradePlan` untouched.
+Eligible for S4 forward shadow with no capital — but at an 8.8% reduction, S4 is
+a real question rather than an obvious next step.
+
+Survivorship-biased universe; gap risk ignored (fills at the stop price, shared
+by both arms).
