@@ -2520,3 +2520,89 @@ universe, so the true numbers are **worse** than shown. Rank IC is ordering, not
 profit; nothing here bears the 0.50% round-trip cost.
 
 **The holdout from 2024-01-01 remains sealed and unread.**
+
+---
+
+## EXP-045 — can anything predict how far a stock will MOVE, beyond volatility?
+
+- **Script**: `scraper/research/exp045_us_path_range.js` (+ post-hoc `exp045b_f3_diagnostic.js`)
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_us_path_range.md`, committed `39a82fc` **before** the run
+- **Target**: `range_20d = max_profit_20d − max_drawdown_20d` — total excursion, sign-free by construction
+- **Family**: m = 8 (F14 is a control here, not a candidate), BH q < 0.05 per segment
+- **Data**: 1,599,910 rows with a complete 20-session path, 4,240 sessions. **Holdout from 2024-01-01 sealed and unread.**
+
+### Positive control — emphatic pass
+
+| control | discovery IC | t |
+|---|---|---|
+| `PRIOR_VOL` (20-session realised vol) vs range | **+0.5328** | 49.15 |
+| F14 vs range | **−0.5660** | −62.73 |
+
+Volatility clusters, and F14 comes out negative exactly as `scoreATR`'s own step
+function (80 for a tight ATR, 25 for a wild one) requires. **This is the first
+experiment in the series with a demonstrated working measurement**, which also
+means EXP-044's null cannot be blamed on a broken pipeline.
+
+### Result — F3 is a CARRIER. The first pass in the series.
+
+Residual IC against range, after removing `PRIOR_VOL` **and** F14:
+
+| factor | discovery IC | t | q | validation IC | t | q | blocks |
+|---|---|---|---|---|---|---|---|
+| **F3 volume z** | **−0.0417** | **−7.55** | **0.0000** | **−0.0402** | **−5.19** | **0.0000** | **4/4** |
+| F9 | +0.0244 | 3.42 | 0.0021 | +0.0156 | 1.14 | 0.835 | 4/4 |
+| F10 | −0.0241 | −3.43 | 0.0021 | +0.0114 | 0.90 | 0.835 | 4/4 |
+| F11 | +0.0259 | 3.34 | 0.0021 | −0.0093 | −0.61 | 0.835 | 4/4 |
+| F12 | −0.0192 | −2.31 | 0.0353 | −0.0078 | −0.54 | 0.835 | 4/4 |
+| F4, F5, F13 | — | — | ns | — | — | ns | — |
+
+F9/F10/F11 pass discovery and **die in validation** — correctly rejected. Their
+raw ICs are large (F9 +0.0878 discovery, +0.1077 validation) and mostly vanish
+under residualisation: that apparent range-prediction **is volatility**, and the
+control caught it.
+
+F3 replicates almost exactly across a 12-year discovery and a 5-year validation.
+
+### The direction, and why it demanded scrutiny
+
+**Holding volatility fixed, a stock with unusually high recent volume travels a
+SMALLER range over the next 20 sessions.**
+
+F3's **raw** IC against range is −0.0046 (q 0.59) — indistinguishable from zero.
+The whole effect appears only after conditioning. That is a textbook
+**suppression** pattern, and suppression is what a mis-specified control
+manufactures, so `exp045b` was written to break it. It is post-hoc and **can only
+undermine, never confirm.**
+
+| kill attempt | result |
+|---|---|
+| Non-parametric conditioning — IC inside volatility quintiles, no linear fit anywhere | **−0.0173 / −0.0268 / −0.0570 / −0.0538 / −0.0386.** All five negative, 4 at \|t\| > 2. Not a linearity artefact. |
+| Strip the scoring wrapper — raw volume z, no ±10 direction term, no clamp | **5/5 quintiles negative**, and *stronger* (−0.021 … −0.066). The effect is in **volume**, not in `f3_volumeZ`. |
+| Is it a few dates? (corrected — the first version trimmed the unconditioned series, which has no effect to trim, and answered a question nobody asked) | conditioned per-date IC −0.0387, t −6.74, 68% of dates negative. Removing the 10 most extreme dates **each way**: −0.0379, t −7.97. First half −0.0416, second half −0.0358. |
+| Is the F3/volatility relationship curved? | Mean F3 by volatility decile: 49.6 → 53.0, monotone and mild. Residualisation's linearity assumption is adequate. |
+
+Four attempts, none succeeded. The honest statement is **"the obvious ways to
+break it did not work"** — which is weaker than a second pre-registered pass.
+
+### What this is NOT
+
+- **Not a trading signal.** Range is direction-free; a narrower forecast range
+  says nothing about which way price goes. Per the pre-registration this is an
+  input to **stop distance and position size**, never a reason to buy.
+- **Not usable standalone.** Raw IC is zero. It only exists *conditional on
+  volatility*, so it can only work inside a model that already knows volatility.
+- **Small.** |IC| ≈ 0.04.
+- **Not costed.** No trade is simulated, so nothing here is profitable.
+- **Survivorship cuts the wrong way here.** Companies that blew up are absent,
+  and blow-ups are precisely the large-range events being predicted. The bias
+  removes the right tail of the target.
+- **Third look** at the 2019+ span.
+
+### Status
+
+**CARRIER (F3), by the pre-registered rule.** `US_TECH_WEIGHTS` unchanged, no
+production edit. Per the pre-registration this licenses exactly one thing: a
+registered follow-up asking whether the improved range forecast actually improves
+stop placement in `computeTradePlan`, measured on data this run has not touched.
+
+**The holdout from 2024-01-01 remains sealed and unread.**
