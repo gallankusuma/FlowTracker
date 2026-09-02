@@ -1523,6 +1523,26 @@ app.post('/api/calc-concentration', requireAdminKey, async (req, res) => {
   }
 });
 
+// ─── SIGNAL MAP — which factors are actually different from each other ───────
+//
+// EXP-040's measurement, as an endpoint rather than a script that ran once.
+// Before adding any indicator the question is which cluster it lands in, and
+// that only helps if it is answerable on demand.
+app.get('/api/signal-map', async (req, res) => {
+  try {
+    const { computeSignalMap } = require('./modules/signal_map');
+    const map = await computeSignalMap(pool, {
+      target: req.query.target === 'return_5d' ? 'return_5d' : 'return_10d',
+      redundant: req.query.redundant ? Math.min(0.95, Math.max(0.1, Number(req.query.redundant))) : 0.5,
+    });
+    if (map.error) return res.status(422).json(map);
+    res.json(map);
+  } catch (err) {
+    console.error('signal-map error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── DEEP ANALYSIS — the top-down read for one ticker ────────────────────────
 //
 // Wraps scraper/deep_analysis.js. The report is expensive by the standards of a
