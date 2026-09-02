@@ -2859,3 +2859,108 @@ by this pre-registration and may not be read without its own seal.
 Whole-rupiah ticks, survivorship and gap risk all bias IDX hit rates; both arms
 would have shared them, and the checks above show none of them manufactured the
 null.
+
+---
+
+## EXP-049 — the mechanism hunt, which overturned EXP-045 and EXP-046
+
+- **Scripts**: `exp049_volume_decomposition.js`, `+ exp049b_persistent_vol_control.js`, `+ exp049c_f3_under_volratio.js`
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_volume_decomposition.md`, committed `a542a6d` **before** the run
+- Both markets stop before 2024-01-01. **IDX reserve untouched.**
+
+### My hypothesis was wrong, and something larger was underneath
+
+Registered H-EVENT: a US volume spike is an event that resolves uncertainty, so
+the effect should live in the **transient** component. It does not.
+
+| market | component | IC | t | q |
+|---|---|---|---|---|
+| US | transient | +0.0145 | 3.26 | 0.0013 (below the 0.02 floor) |
+| US | **persistent** | **−0.1488** | **−30.60** | 0.0000 |
+| IDX | transient | +0.0444 | 5.79 | 0.0000 |
+| IDX | persistent | −0.0487 | −5.99 | 0.0000 |
+
+**H-ACTIVITY supported, H-EVENT rejected.**
+
+### And the universes never overlapped
+
+20-session average traded value, at a flat 16,000 IDR/USD:
+
+| market | p10 | median | p90 |
+|---|---|---|---|
+| US | $40.8M | $160.8M | $679.3M |
+| IDX | $2k | $115k | $3.2M |
+
+**IDX's p90 is 12× below US's p10.** "US-only" was always more honestly
+"liquid-only". Registered as a possibility in advance; confirmed.
+
+### The −0.1488 was too large to believe, and it wasn't volume
+
+`exp049b`: EXP-049 residualised on the vol **level**. Volatility mean-reversion
+lives in the **ratio** — `ln(sd20/sd60)` — the exact analogue of how persistent
+volume is built, and a different quantity.
+
+| | US | IDX |
+|---|---|---|
+| persistent volume, level control only | −0.1488 | −0.0446 |
+| **+ vol-ratio control** | **−0.0540** | **+0.0272 (sign flips)** |
+| **VOL_RATIO alone** | **−0.2553 (t −42.77)** | **−0.1698 (t −20.72)** |
+| rho(persistent volume, vol ratio) | +0.4361 | +0.4551 |
+
+63.7% of the US result was volatility mean-reversion. *(My own script labelled
+the IDX cell "survives" when the sign had flipped — a threshold-logic bug in the
+diagnostic, recorded rather than quietly fixed.)*
+
+### The check that overturns EXP-045 and EXP-046
+
+`exp049c`, on US:
+
+| | level control only | **+ vol ratio** | removed |
+|---|---|---|---|
+| **F3 → range** (EXP-045's statistic) | −0.0385 (t −8.43) | **−0.0069 (t −1.72)** | **82.2%** |
+| **stop-hit gap** (EXP-046's claim) | +1.77pp (t 2.94) | **+0.35pp (t 0.48)** | **80.4%** |
+
+**Both collapse.** The F3 residual IC falls below the 0.02 floor and out of
+significance; the stop-hit gap goes to nothing.
+
+**EXP-045's carrier and EXP-046's miscalibration are substantially volatility
+mean-reversion, not volume.** The deployed stop is mis-set with respect to
+*whether a stock's recent volatility sits above or below its own longer-run
+level* — a stock that just spiked will calm down, so an ATR-sized stop is too
+wide; one that just quieted will pick up, so it is too tight. Volume was a noisy
+proxy, and it was described as the cause all day.
+
+### Consequences that have to be stated
+
+1. **EXP-045 passed its registered rule with an inadequate control.** The rule
+   was followed; the control was wrong. A pre-registered pass is not proof the
+   specification was right.
+2. **EXP-045b's four kill attempts shared one blind spot** — every one
+   conditioned on vol *level*, never the ratio. Four checks looking in the same
+   wrong place. **Diversity of attack matters more than count.**
+3. **EXP-047 burned the US holdout on a volume fix for a volatility problem.**
+   That is why β = −0.020 bought only 8.8%: it was adjusting the wrong variable.
+4. **EXP-048's IDX null reads differently now.** IDX has strong vol
+   mean-reversion (−0.1698); what it lacks is volume's ability to proxy for it —
+   consistent with a $115k median daily traded value.
+
+### What actually survived the day
+
+**Volatility mean-reversion predicts the 20-session forward range: IC −0.2553 on
+US, −0.1698 on IDX.** An order of magnitude larger than anything else in this
+arc, present in both markets, and textbook — which is why it is believable and
+why it is **not a discovery**.
+
+It does carry a real implication: `computeTradePlan` sizes stops off ATR(14), a
+**level**, and ignores that volatility mean-reverts. That is a well-motivated
+candidate — but it is **post-hoc**, and the US holdout is gone.
+
+### Status
+
+**EXP-045's CARRIER verdict and EXP-046's attribution are SUPERSEDED.** The
+stop-hit gap is real but is a volatility effect. No production change; nothing
+here licenses one.
+
+The honest next step is a fresh pre-registration of a **vol-ratio-adjusted risk
+unit**, fitted and gated on IDX before 2024, and only then sealed against the
+untouched IDX reserve — the sequence EXP-048 established and EXP-047 skipped.
