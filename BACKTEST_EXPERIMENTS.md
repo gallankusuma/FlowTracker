@@ -3093,3 +3093,95 @@ untouched — as they have been through every experiment in this arc.
 **IDX reserve 2024-01-01 … 2026-09-01 remains sealed and unspent**, across four
 consecutive opportunities to spend it. The forward reserve from 2026-09-02
 stands.
+
+---
+
+## EXP-052 — the structural stop is not better. And my gate printed PASSED on a rejection.
+
+- **Script**: `scraper/research/exp052_idx_structural_stop.js`
+- **Pre-registration**: `PREREGISTRATION_2026-09-02_idx_structural_stop.md`, committed `e99ef4f` **before** the run
+- **RESERVED 2024-01-01 onward: NOT READ.** Excluded in SQL; no flag exists to open it.
+
+### Both positive controls passed
+
+| control | result |
+|---|---|
+| ATR hit rate falls as k rises | 53.1% → 30.2% → 16.3% at k = 1.5 / 2.5 / 3.5. **PASS** |
+| median distances matched after fitting k | swing low 7.63% vs 7.64% (0.19% rel err); VAL 18.11% vs 18.11% (0.01%). **PASS** |
+
+### Result — the hypothesis is REJECTED, in both arms
+
+`gap = hitRate(ATR) − hitRate(STRUCTURE)`. **Positive means structure is hit less,
+i.e. structure wins.**
+
+| level | k | FIT gap | t | q | CHECK gap | t |
+|---|---|---|---|---|---|---|
+| swing low | 1.93 | +1.59pp | 0.87 | 0.393 | — | — |
+| **Value Area Low** | 5.04 | **−9.26pp** | **−8.48** | 0.0000 | **−8.99pp** | **−16.14** |
+
+- **Swing low: null.** Below the 2pp floor and not significant. No evidence a
+  structural level is better placed than a volatility multiple.
+- **Value Area Low: decisively WORSE**, by about 9 percentage points, replicated
+  across both segments at enormous t.
+
+Putting a stop just below the value-area low means putting it exactly where price
+spends its time — **that is what makes it the value area.** Coherent, and the
+opposite of the rule under test.
+
+### My decision code printed "GATE PASSED" on this
+
+The pre-registration says structure passes if it is *hit less often*. The gate I
+wrote checked only sign **consistency** across segments plus significance and the
+floor — it never checked the sign **against the hypothesis**. A two-sided test's
+"consistent and significant" was allowed to render as a win when the direction is
+a rejection.
+
+**Fifth specification error of this arc**, and the same family as the other four:
+the hypothesis was stated carefully and the code that decides success was not.
+The verdict line is wrong; the numbers under it are right, and they reject.
+
+### A limitation that may make the VAL arm the wrong test entirely
+
+`zones()` computes the value area over **500 sessions — about two years.** Nill
+prescribes a **weekly** volume profile. The median VAL distance came out at
+**18.11%**, which is the tell: a weekly value-area low would sit a few percent
+from price, not eighteen.
+
+**So the VAL arm probably did not test his rule.** It tested the deployed
+`zones()` window, which is a different object with the same name. The −9pp result
+is real and is about our two-year value area; it is not evidence against a weekly
+profile, which remains untested.
+
+### And the sample is thinner than registered
+
+The 500-bar warmup for `zones()` pushed the start forward: **64 anchors, FIT 28,
+CHECK 36** against the ~51/~36 the pre-registration projected. **FIT sits below
+the 30-anchor bar**, so the swing-low null is weaker than intended — "not
+detectable at 28 anchors" rather than a clean null. The VAL result is far too
+large for that to matter to it.
+
+Levels were also unavailable or not below the entry on a substantial minority of
+rows — **swing low 25.8%, VAL 34.6%** of 423,899 candidate ticker-days. A rule
+silent on a third of days is a weaker rule, and the fraction is part of the
+result.
+
+### The secondary control axis held
+
+Registered in advance: the gap measured inside recent-return and volatility
+buckets. VAL −9.26pp plain, −8.95pp by return, −8.87pp by volatility; swing low
++1.59 / +1.70 / +1.59pp. **Neither result is a proxy for recent return or
+volatility.**
+
+### Status
+
+**HYPOTHESIS REJECTED.** The deployed ATR-based risk unit is not beaten by either
+structural level at the same risk budget. `computeTradePlan` and `trade_policy`
+untouched.
+
+**The IDX reserve was not opened and must not be** — nothing passed in the
+direction the hypothesis required. It remains sealed and unspent across a fifth
+consecutive opportunity. The forward reserve from 2026-09-02 stands.
+
+**Open, and genuinely untested:** a *weekly* value-area low, which is what the
+source actually prescribes. And the whole order-flow execution layer, which this
+project has no data for.
