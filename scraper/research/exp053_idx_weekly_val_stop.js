@@ -146,11 +146,11 @@ const PRIMARY_KEY = 'val5';
 
 (async () => {
   const pool = createPool();
-  console.log('EXP-052 — a structural stop against the ATR stop, on IDX. Stages 0-1 only.');
-  console.log('  pre-registered in PREREGISTRATION_2026-09-02_idx_structural_stop.md — TWO-SIDED');
-  console.log('  placement and distance are the SAME quantity for one stop, so the ATR arm is');
-  console.log('  RESCALED to match the structural median distance. Without that this measures width.');
-  console.log(`  family m = ${LEVELS.length} (swing low, VAL), BH q < 0.05, floor ${GAP_FLOOR_PP}pp`);
+  console.log('EXP-053 — the WEEKLY value-area low as a stop, on IDX. Stages 0-1 only.');
+  console.log('  pre-registered in PREREGISTRATION_2026-09-05_idx_weekly_val_stop.md — TWO-SIDED');
+  console.log('  DIRECTION is condition 1 -- EXP-052 printed PASSED on a rejection because it');
+  console.log('  checked sign consistency and never sign direction. A negative gap cannot pass.');
+  console.log(`  PRIMARY is the ${WEEK}-session profile; ${SENS_WINDOWS.join('/')} are descriptive. Floor ${GAP_FLOOR_PP}pp`);
   console.log(`  RESERVED [${RESERVED_START} ..] excluded in SQL; no flag can open it`);
   console.log('  entry-agnostic, no target, no costs. NOT a P&L test. Order flow -- half his');
   console.log('  method -- is absent, and the entry half already failed on IDX (EXP-037).');
@@ -226,9 +226,15 @@ const PRIMARY_KEY = 'val5';
   const fit = anchors.filter(d => d < FIT_END);
   const check = anchors.filter(d => d >= FIT_END && d < CHECK_END);
   console.log(`${all.length} usable sessions, ${anchors.length} anchors: FIT ${fit.length}, CHECK ${check.length}`);
-  console.log(`level unavailable or not below entry: swing low ${missing.swingLow}/${considered} ` +
-    `(${(missing.swingLow / considered * 100).toFixed(1)}%), VAL ${missing.val}/${considered} ` +
-    `(${(missing.val / considered * 100).toFixed(1)}%)\n`);
+  // A rule with no answer on a share of days is a weaker rule, and the share is
+  // part of the result. EXP-053's first run printed NaN here: this loop still used
+  // EXP-052's key names after the levels were replaced, and the number the
+  // pre-registration asked for went unreported until exp053b recovered it (26.4%).
+  console.log('level unavailable or not below entry:');
+  for (const [key, label] of LEVELS) {
+    console.log(`  ${key.padEnd(7)} ${missing[key]}/${considered} ` +
+      `(${(missing[key] / considered * 100).toFixed(1)}%)   ${label}`);
+  }
 
   const rowsOf = (dates, key) => dates.flatMap(d => byDate.get(d).filter(r => r[key] !== null));
   const distStruct = (r, key) => (r.entry - r[key]) / r.entry;
