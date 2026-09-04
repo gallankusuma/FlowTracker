@@ -61,6 +61,12 @@ const DELAY_MS = Number(arg('--delay', 700));
 const MIN_VALUE = Number(arg('--min-value', 1e9));   // Rp/day median over the screen window
 const CHUNK = 2000;
 const PARTIAL_MS = 120000;   // a bar younger than this has not closed
+// Exit non-zero when this share of the universe fails. A recorder scheduled to
+// run unattended for two years must not fail silently: cron only notices a
+// non-zero exit, and a run that fetched 40 of 380 tickers is a broken run that
+// would otherwise log cheerfully and be discovered as a hole in the data years
+// later. Set --fail-threshold 1 to disable.
+const FAIL_THRESHOLD = Number(arg('--fail-threshold', 0.25));
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS idx_intraday_1m (
@@ -214,4 +220,13 @@ function fetchMinuteBars(code, range) {
   }
   console.log(`\nelapsed ${((Date.now() - t0) / 1000).toFixed(0)}s`);
   await pool.end();
+
+  const attempted = ok + failed;
+  const rate = attempted ? failed / attempted : 0;
+  if (attempted && rate > FAIL_THRESHOLD) {
+    console.error(`
+EXIT 1: ${failed}/${attempted} tickers failed (${(rate * 100).toFixed(1)}%), ` +
+      `over the ${(FAIL_THRESHOLD * 100).toFixed(0)}% threshold. Treat this run as broken.`);
+    process.exit(1);
+  }
 })().catch(e => { console.error(e.stack || e.message); process.exit(1); });

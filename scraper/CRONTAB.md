@@ -262,10 +262,59 @@ demanded an index close for every public holiday, no refetch could ever supply
 one, and it would have failed every night forever — which is how a monitor
 teaches people to ignore it.
 
+### IDX 1-minute bars — `idx_intraday_1m`  *(added 2026-09-05)*
+
+```cron
+0 10 * * 1-5 cd /var/www/flowtracker-scraper && /usr/bin/node record_intraday_1m.js --limit 400 >> /var/log/flowtracker-1m.log 2>&1
+```
+
+10:00 UTC = 17:00 WIB, after the 16:15 close. **The only Node entry in this
+crontab** — everything else here is Python — so it uses the absolute
+`/usr/bin/node` rather than trusting cron's PATH.
+
+**Why it exists, and why it cannot wait.** Yahoo serves 1-minute bars for `.JK`
+symbols for **seven days only** — verified 2026-09-05, `range=7d` returns 3,045
+bars for BBCA.JK and `range=1mo` is refused outright. Nobody sells IDX minute
+history retail. **A session not captured within the week is lost permanently**,
+so the value of this job is entirely in it having started, not in any analysis it
+currently supports.
+
+**It is NOT an order book.** No bid, no ask, no depth, no trade direction. It was
+built after establishing that IDX L2 has no legitimate route here: Yahoo's v7
+quote endpoint returns `Unauthorized`, live depth lives inside broker platforms
+with no API and no archive, and historical tick data is an enterprise licence.
+Minute bars are the finest granularity actually reachable.
+
+**Self-healing by design.** The 7-day lookback means up to six consecutive missed
+runs still fill themselves in on the next success, and the upsert repairs any
+partial bar written earlier. The script **exits 1 when more than 25% of the
+universe fails**, so a broken run is visible to cron rather than logging
+cheerfully — a run that fetched 40 of 380 tickers would otherwise be discovered
+as a hole in the data years later.
+
+**Growth.** ~84k rows per session, ~63 MB per 7 sessions, so roughly **2.3 GB per
+year** at 400 tickers. The disk had 355 GB free when this was installed. There is
+**no logrotate entry** for `/var/log/flowtracker-1m.log`; at ~30 lines a run that
+is negligible, but it is stated rather than assumed.
+
+**Verify with** `node verify_intraday_1m.js`. Its most important check aggregates
+the minute bars into a daily bar and compares them against `idx_stock_prices`,
+which comes from a **different Yahoo endpoint on a different schedule** — two
+independent paths to the same quantity. That is the class of check that would
+have caught the whole-dollar rounding which corrupted `us_stock_prices` for a
+month. First run: high and low agree within 0.5% on 99.3% and 99.4% of 2,577
+overlapping ticker-days.
+
+**The honest timeline**, printed on every run: 30 non-overlapping 20-session
+anchors needs about **600 sessions**. As of installation there were 7. That is
+roughly **28 more months** before anything built on this table can clear
+Promotion Contract v1 S1.
+
 ## Log files
 
 `/var/log/ft-pull.log`, `/var/log/signal_engine.log`, `/var/log/flowtracker-intel.log`,
 `/var/log/flowtracker-hk.log`, `/var/log/paper-trader.log,
+`/var/log/flowtracker-1m.log`,
 `/var/log/strategy-forward.log`, `/var/log/virtual-portfolio.log`, `/var/log/watchdog.log`
 
 ## Note on "paper trading"
