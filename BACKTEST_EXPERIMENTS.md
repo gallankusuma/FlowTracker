@@ -3185,3 +3185,93 @@ consecutive opportunity. The forward reserve from 2026-09-02 stands.
 **Open, and genuinely untested:** a *weekly* value-area low, which is what the
 source actually prescribes. And the whole order-flow execution layer, which this
 project has no data for.
+
+---
+
+## EXP-053 — the weekly VAL passed the registered gate, and the pass was distribution skew
+
+- **Scripts**: `exp053_idx_weekly_val_stop.js` (+ post-hoc `exp053b_skew_control.js`)
+- **Pre-registration**: `PREREGISTRATION_2026-09-05_idx_weekly_val_stop.md`, committed `fc0ef2a` **before** the run
+- **RESERVED 2024-01-01 onward: NOT READ** by either script.
+
+### The registered run passed, in the right direction this time
+
+Median VAL distance **2.88%** — far under the 12% VOID guard, so unlike EXP-052
+this did test a weekly-shaped object. Both positive controls passed. The gate's
+new **direction-first** condition worked as intended.
+
+| | gap | 95% CI | t | p |
+|---|---|---|---|---|
+| FIT (51 anchors) | **+4.44pp** | [+3.18, +5.70] | 7.08 | 0.0000 |
+| CHECK (36 anchors) | **+4.15pp** | [+2.72, +5.58] | 5.88 | 0.0000 |
+
+Positive = the weekly VAL is hit **less**. The window curve looked coherent:
++4.44pp at 5 sessions, +5.31 at 10, +4.63 at 20, **−9.26 at 500** (EXP-052).
+Short profiles help, the two-year profile hurts — apparently confirming that
+EXP-052 had tested the wrong window.
+
+### It does not survive a stricter match
+
+The pre-registration listed *"matched on median, not per trade"* as known
+weakness 5. The distributions are not the same shape — VAL median 3.10% but mean
+4.58%, against ATR mean 4.36% — and **hit rate is concave in distance**, so an arm
+with more mass far out is hit less for reasons that have nothing to do with where
+the level sits. `exp053b` (post-hoc, can only undermine) matched harder:
+
+| matching | FIT | CHECK |
+|---|---|---|
+| **median** (as registered) | +5.36pp (t 6.84) | +2.67pp (t 3.75) |
+| **mean** | **−1.69pp (t −2.05)** | **−5.32pp (t −6.46)** |
+| **quantile** — whole distribution equalised | **−1.78pp (t −2.69)** | **−2.39pp (t −4.66)** |
+
+**The sign flips under both stricter matchings, in both segments.** The +4.44pp
+was the shape of the distance distribution, not the placement of the level.
+
+Quantile matching gives every trade the ATR distance holding the same *rank* in
+the ATR distribution that its VAL distance holds in the VAL distribution — the
+strongest matching short of making the two stops identical. Under it the weekly
+VAL is **worse**.
+
+### The verdict
+
+**By the letter of the pre-registration the gate passed. It must not be acted
+on.** The weakness that explains the pass was named in that same document before
+the run, and the check that isolates it says the direction reverses. **No
+candidate seal, and the IDX reserve stays shut** — a sixth consecutive
+opportunity declined.
+
+The honest one-line result: *a weekly value-area low is not better placed than a
+volatility multiple on IDX, and is probably slightly worse.*
+
+### Caveats on the diagnostic itself
+
+`exp053b` is **not a perfectly matched re-run**: it keeps only rows where the
+5-session VAL sits below the entry, while EXP-053 kept a row if *any* window had
+a level. Hence 50 FIT anchors against 51, and median distance 3.10% against
+2.88%. The sign flip is large and consistent across two matchings and two
+segments, so it is not fragile — but the two runs are not on identical row sets.
+
+### Two bugs in EXP-053's own output
+
+1. **The silent-level counter printed `undefined/620279 (NaN%)`** — it used the
+   key names from EXP-052 after the levels were replaced. The figure the
+   pre-registration asked for is **26.4%**: the weekly VAL is absent or not below
+   the entry on 163,732 of 620,279 ticker-days. A rule with no answer on a
+   quarter of days is a weaker rule, and this should have been in the run that
+   registered it.
+2. **The banner still identified the script as EXP-052** with `m = 3 (swing low,
+   VAL)`, inherited when the file was derived. Cosmetic, but the output file
+   mislabels itself.
+
+Both fixed after the fact and recorded here rather than quietly.
+
+### Status
+
+**NOT ACTED ON.** `computeTradePlan` and `trade_policy` untouched. IDX reserve
+2024-01-01 … 2026-09-01 sealed and unspent; forward reserve from 2026-09-02
+stands.
+
+Together with EXP-037 (buying the zone loses 1.6% versus holding) and EXP-052
+(the two-year VAL is 9pp worse), **every measurable component of the volume-profile
+framework has now been tested on IDX and none of them holds.** What remains
+untested is the order-flow execution layer, for which this project has no data.
