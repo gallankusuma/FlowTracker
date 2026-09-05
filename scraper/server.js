@@ -6824,10 +6824,28 @@ function computeUSStockFactors(candles, marketDirection, marketAvgChangePct = 0)
 
 app.get('/api/us-signal-scanner', async (req, res) => {
   try {
+    // BOUNDED, for the same reason /api/us-deepdive was: this loaded all 1.9M
+    // rows of a twenty-year table to score ONE session per ticker. Written when
+    // us_stock_prices held six months, left alone when the 2026-09-02 backfill
+    // made it 33x deeper.
+    //
+    // 500 sessions is not arbitrary. The price/volume factors take 60 bars and
+    // calcTechnicalFactors takes 60; the binding constraint is
+    // computeWeeklyTrend, whose EMA21 over weekly bars needs enough history to
+    // shed its SMA seed. 500 daily sessions is ~100 weekly bars, leaving a seed
+    // weight of (1-2/22)^79 ~ 0.0005 -- converged, by the same emaSeedWeight
+    // arithmetic the regime engine enforces. Fewer bars would quietly change
+    // weeklyTrend rather than just speed things up.
+    const SCAN_BARS = 500;
     const [priceRows] = await pool.query(
       `SELECT ticker, date, open_price, high_price, low_price, close_price, volume, change_pct
-       FROM us_stock_prices WHERE ticker IN (?) ORDER BY date ASC`,
-      [US_TICKERS]
+       FROM us_stock_prices
+       WHERE ticker IN (?) AND date >= (
+         SELECT MIN(d) FROM (
+           SELECT DISTINCT date d FROM us_stock_prices ORDER BY date DESC LIMIT ?
+         ) t)
+       ORDER BY date ASC`,
+      [US_TICKERS, SCAN_BARS]
     );
     const priceMap = {};
     for (const r of priceRows) {
