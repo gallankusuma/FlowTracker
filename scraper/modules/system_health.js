@@ -88,6 +88,12 @@ const SUBSYSTEM = {
   SIGNAL_ENGINE:  'signal-engine',   // /api/signal-scanner, AWO factor scoring
   VIRTUAL_BROKER: 'virtual-broker',  // virtual_portfolio + the burn-in
   PAPER_TRADER:   'paper-trader',    // paper_trader.py, driven by ft_signals
+  // Added 2026-09-05. Deliberately depended on by NOTHING: the US layer trades
+  // no capital and feeds no IDX decision, so a stale US table must never gate
+  // IDX execution. readiness() filters by `affects`, so scoping the US checks
+  // here is what makes DEGRADED safe -- they are loud where they matter and
+  // invisible to the chain that actually places orders.
+  US_LAYER:       'us-layer',        // us_stock_prices / us_signal_history / sp500_*
 };
 
 /**
@@ -532,7 +538,15 @@ async function assertCompleteSessions(pool, {
  * rather than against another table. That backstop is the reason it is safe for a
  * per-feed check to be judged relative to its own schedule.
  */
-const REFERENCE = { FRESHEST_FEED: 'freshest-feed', BROKER_PIPELINE: 'broker-pipeline' };
+const REFERENCE = {
+  FRESHEST_FEED: 'freshest-feed',
+  BROKER_PIPELINE: 'broker-pipeline',
+  // The US family judges itself against itself, on the NYSE calendar. It cannot
+  // share FRESHEST_FEED: the US cron runs at 12:30 UTC, an hour BEFORE the US
+  // open, so US tables are structurally one session behind the IDX feeds and
+  // would read stale every single day against a shared yardstick.
+  US_PIPELINE: 'us-pipeline',
+};
 
 const CHECKS = [
   { key: 'prices',       table: 'idx_stock_prices',    col: 'date',        maxLag: 1,
@@ -575,6 +589,33 @@ const CHECKS = [
     severity: SEVERITY.DEGRADED,
     affects: [SUBSYSTEM.PAPER_TRADER],
     why: 'Feeds paper_trader.py. When it goes stale the paper trader still runs and still reports zero trades, which reads as a quiet market rather than a broken pipeline — so DEGRADED, never advisory. Scoped to paper-trader on purpose: it is not an input to the signal engine or the V2 execution chain, and letting it reset the V2 burn-in would be the same scope error as the TEST_* accounts that once entered the official identity hash.' },
+
+  // ── US layer, added 2026-09-05 ────────────────────────────────────────────
+  //
+  // THE WHOLE US LAYER WAS UNMONITORED, and that is not a gap in coverage --
+  // it is the reason two faults survived. sp500_history froze on 2026-07-24 and
+  // reported ok:true for six weeks while the page showed an index price 4% wrong;
+  // us_signal_history had no daily writer at all and decayed from the day it was
+  // built. Both were found by a manual audit on 2026-09-05, which is precisely
+  // the failure mode the standing rule forbids: the system must notice, not wait
+  // to be checked.
+  { key: 'us_prices',    table: 'us_stock_prices',     col: 'date',        maxLag: 1,
+    reference: REFERENCE.US_PIPELINE,
+    severity: SEVERITY.DEGRADED,
+    affects: [SUBSYSTEM.US_LAYER],
+    why: 'Every US factor and the whole us_signal_history sync read this. DEGRADED and scoped to us-layer, never BLOCKING: the US layer trades nothing, so a stale US table must not stop IDX execution — but it must not be advisory either, because advisory is how the S&P sat six weeks wrong.' },
+
+  { key: 'us_signals',   table: 'us_signal_history',   col: 'data_date',   maxLag: 1,
+    reference: REFERENCE.US_PIPELINE,
+    severity: SEVERITY.DEGRADED,
+    affects: [SUBSYSTEM.US_LAYER],
+    why: 'Written by the nightly sync added 2026-09-05, immediately after the prices land. Before that nothing wrote it at all. Tolerance 1 covers the ordering inside a single cron run; more than that means the sync failed and every experiment built on this table is reading a frozen sample without knowing it.' },
+
+  { key: 'us_sp500',     table: 'sp500_history',       col: 'date',        maxLag: 1,
+    reference: REFERENCE.US_PIPELINE,
+    severity: SEVERITY.DEGRADED,
+    affects: [SUBSYSTEM.US_LAYER],
+    why: 'The index itself, shown directly on /us. It froze 2026-07-24..2026-09-05 because a Date was stringified without a T and compared lexicographically against an ISO date, so the guard always said "already current" and the job skipped every night while reporting ok. A check that reads the DATA rather than the job status is the only thing that catches that class of fault.' },
 ];
 
 /**
@@ -597,6 +638,18 @@ const CHECKS = [
  * healthy, and `absoluteStaleness` below measures that reference against the
  * actual clock so a complete outage is still caught.
  */
+async function usTradingDayLag(pool, fromDate, referenceDate) {
+  if (!fromDate || !referenceDate) return null;
+  // The NYSE calendar as we observe it: the distinct dates us_stock_prices
+  // actually holds. Using the IHSG calendar here would be wrong in both
+  // directions -- the two exchanges do not share holidays -- and there is no
+  // separate US session table to borrow.
+  const [r] = await pool.query(
+    `SELECT COUNT(DISTINCT date) n FROM us_stock_prices WHERE date > ? AND date <= ?`,
+    [fromDate, referenceDate]);
+  return Number(r[0]?.n ?? 0);
+}
+
 async function tradingDayLag(pool, fromDate, referenceDate) {
   const [[cal]] = await pool.query('SELECT MAX(date) AS d FROM idx_ihsg_history');
   const maxCal = cal.d ? (cal.d instanceof Date ? cal.d.toISOString().slice(0, 10) : String(cal.d).slice(0, 10)) : null;
@@ -648,12 +701,19 @@ function weekdaysSince(dateStr, today = new Date()) {
  * caught within a week rather than the two months the signal pipeline managed.
  */
 const MAX_REFERENCE_WEEKDAYS = 5;
+// See the us_ingest row for why this is 4 and not 5.
+const US_MAX_REFERENCE_WEEKDAYS = 4;
 
 async function dataFreshness(pool, today = new Date()) {
   // The reference bar is the freshest date ANY monitored feed has produced, so
   // one dead feed cannot make the rest look healthy by freezing the yardstick.
   let reference = null;
   for (const c of CHECKS) {
+    // US feeds are excluded from the shared yardstick on purpose. They run on a
+    // different exchange calendar AND a cron that fires before the US open, so
+    // folding them in would drag the reference around and make the IDX rows lie
+    // in both directions.
+    if (c.reference === REFERENCE.US_PIPELINE) continue;
     try {
       const [r] = await pool.query(`SELECT MAX(${c.col}) AS d FROM ${c.table}`);
       if (!r[0].d) continue;
@@ -681,6 +741,19 @@ async function dataFreshness(pool, today = new Date()) {
     } catch { /* reported per-check below */ }
   }
 
+  // THE SESSION THE US FAMILY HAS COLLECTIVELY REACHED, by the same argument
+  // that gives the broker family its own reference: judged against each other,
+  // never against IDX feeds on a different calendar and a different schedule.
+  let usPipelineSession = null;
+  for (const c of CHECKS) {
+    if (c.reference !== REFERENCE.US_PIPELINE) continue;
+    try {
+      const [r] = await pool.query(`SELECT MAX(${c.col}) AS d FROM ${c.table}`);
+      const d = toIso(r[0]?.d);
+      if (d && (usPipelineSession === null || d > usPipelineSession)) usPipelineSession = d;
+    } catch { /* reported per-check below */ }
+  }
+
   // `critical` is still emitted alongside `severity` because the Trade Desk
   // reads it (app/trade-desk/page.tsx). Derived, never authored: one source of
   // truth, so the two can never disagree the way the gate and the warning did.
@@ -702,6 +775,30 @@ async function dataFreshness(pool, today = new Date()) {
       ok: drift <= MAX_REFERENCE_WEEKDAYS,
       detail: drift <= MAX_REFERENCE_WEEKDAYS ? 'fresh'
         : `no feed has produced data for ${drift} weekdays (tolerance ${MAX_REFERENCE_WEEKDAYS})`,
+    }));
+  }
+
+  // The same argument, for the US family. Without this row every US check is
+  // measured against usPipelineSession, which is drawn FROM the US tables -- so
+  // the freshest of them always scores lag 0 and a total US outage would read as
+  // all-green. That is verbatim the fault this file records at tradingDayLag:
+  // "with the axis frozen, every table is fresh relative to a frozen yardstick".
+  //
+  // Tolerance is 4 weekdays, not the IDX 5, and it is not slack: the US cron
+  // fires at 12:30 UTC, an hour BEFORE the 13:30 open, so one weekday of lag is
+  // the normal resting state. Four leaves room for that plus a US holiday and a
+  // single missed run, and still catches the six-week freeze that prompted this.
+  if (usPipelineSession !== null) {
+    const usDrift = weekdaysSince(usPipelineSession, today);
+    out.push(decorate({
+      key: 'us_ingest', table: '(all US feeds)',
+      severity: SEVERITY.DEGRADED,
+      affects: [SUBSYSTEM.US_LAYER],
+      why: 'Measured against the clock, not against another US table. The per-table US lags below are relative to this bar; if it is stale they are all fresh against a frozen yardstick and a complete US outage reads green — which is exactly how sp500_history stayed unnoticed from 2026-07-24 to 2026-09-05.',
+      latest: usPipelineSession, lagTradingDays: usDrift, maxLag: US_MAX_REFERENCE_WEEKDAYS, rows: null,
+      ok: usDrift <= US_MAX_REFERENCE_WEEKDAYS,
+      detail: usDrift <= US_MAX_REFERENCE_WEEKDAYS ? 'fresh'
+        : `no US feed has produced data for ${usDrift} weekdays (tolerance ${US_MAX_REFERENCE_WEEKDAYS})`,
     }));
   }
 
@@ -740,7 +837,9 @@ async function dataFreshness(pool, today = new Date()) {
         continue;
       }
       const d = latest instanceof Date ? latest.toISOString().slice(0, 10) : String(latest).slice(0, 10);
-      const lag = await tradingDayLag(pool, d, reference);
+      const lag = c.reference === REFERENCE.US_PIPELINE
+        ? await usTradingDayLag(pool, d, usPipelineSession)
+        : await tradingDayLag(pool, d, reference);
       out.push(decorate({ key: c.key, table: c.table, severity: c.severity, affects: c.affects, why: c.why,
                  latest: d, lagTradingDays: lag, maxLag: c.maxLag, rows: Number(r[0].n),
                  ok: lag <= c.maxLag,
@@ -1168,9 +1267,10 @@ async function signalState(pool, opts = {}) {
 
 module.exports = {
   CHECKS, dataFreshness, missingSessions, phantomSessions, recordJobRun, jobHealth,
+  usTradingDayLag,
   signalState, readiness, ensureTable, weekdaysSince,
   expectedBrokerSession, assertCompleteSessions, brokerFreshness, BROKER_FRESHNESS,
-  MAX_REFERENCE_WEEKDAYS, BROKER_DATA_MAX_LAG_SESSIONS, REFERENCE,
+  MAX_REFERENCE_WEEKDAYS, US_MAX_REFERENCE_WEEKDAYS, BROKER_DATA_MAX_LAG_SESSIONS, REFERENCE,
   BROKER_PIPELINE_CUTOFF_UTC_MINUTES, BROKER_PIPELINE_GRACE_MINUTES,
   SEVERITY, SEVERITY_RANK, binds, SUBSYSTEM, SUBSYSTEM_DEPENDS_ON,
 };

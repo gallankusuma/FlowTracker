@@ -625,6 +625,66 @@ const ALL_FRESH = {
     });
   }
 
+  // ── US layer scoping, added 2026-09-05 ──────────────────────────────────
+  //
+  // The US checks are DEGRADED, and DEGRADED binds. The ONLY thing stopping a
+  // stale S&P table from halting IDX order execution is that they are scoped to
+  // a subsystem nothing depends on. That is a one-line property in the CHECKS
+  // table and it would be silently lost by anyone adding SIGNAL_ENGINE to an
+  // `affects` array "so it shows up on the dashboard".
+  {
+    console.log('');
+    console.log('US layer scoping — a US fault must never gate IDX execution');
+    const at = d => new Date(d + 'T12:00:00Z');
+    const usChecks = sh.CHECKS.filter(c => (c.affects || []).includes(sh.SUBSYSTEM.US_LAYER));
+
+    test('the US checks exist at all', () => assert.ok(usChecks.length >= 3,
+      `expected the US feeds to be monitored, found ${usChecks.length}`));
+
+    test('no US check touches an IDX subsystem', () => {
+      for (const c of usChecks) {
+        for (const a of c.affects) {
+          assert.strictEqual(a, sh.SUBSYSTEM.US_LAYER,
+            `${c.key} affects ${a}; a US fault would then bind the IDX chain`);
+        }
+      }
+    });
+
+    test('nothing depends on the US layer', () => {
+      for (const [sub, deps] of Object.entries(sh.SUBSYSTEM_DEPENDS_ON)) {
+        assert.ok(!deps.includes(sh.SUBSYSTEM.US_LAYER),
+          `${sub} depends on us-layer, which would let a US fault cascade`);
+      }
+    });
+
+    test('US checks are DEGRADED — not advisory, not blocking', () => {
+      for (const c of usChecks) {
+        // Advisory is how sp500_history sat six weeks wrong; BLOCKING would let
+        // it stop IDX trading. The middle severity is the point.
+        assert.strictEqual(c.severity, sh.SEVERITY.DEGRADED, `${c.key} is ${c.severity}`);
+        assert.ok(sh.binds(c.severity), `${c.key} must bind within its own scope`);
+      }
+    });
+
+    test('US checks use the US pipeline yardstick, not the IDX one', () => {
+      for (const c of usChecks) {
+        assert.strictEqual(c.reference, sh.REFERENCE.US_PIPELINE,
+          `${c.key} would be measured against IDX feeds on a different calendar`);
+      }
+    });
+
+    test('the US tolerance would have caught the real six-week freeze', () => {
+      // sp500_history froze on 2026-07-24 and was found by hand on 2026-09-05.
+      const stale = sh.weekdaysSince('2026-07-24', at('2026-09-05'));
+      assert.ok(stale > sh.US_MAX_REFERENCE_WEEKDAYS,
+        `${stale} weekdays did not exceed the tolerance ${sh.US_MAX_REFERENCE_WEEKDAYS}`);
+    });
+
+    test('but one weekday of lag does not, because the US cron precedes the open', () => {
+      assert.ok(sh.weekdaysSince('2026-09-03', at('2026-09-04')) <= sh.US_MAX_REFERENCE_WEEKDAYS);
+    });
+  }
+
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail ? 1 : 0);
 })();
