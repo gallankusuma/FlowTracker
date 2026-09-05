@@ -119,12 +119,34 @@ const COLS = [
 
 const r4 = v => (v === null || !Number.isFinite(v) ? null : Math.round(v * 1e4) / 1e4);
 
-(async () => {
-  const pool = createPool();
+/**
+ * The whole job, callable. Extracted 2026-09-05 so the nightly cron can run the
+ * SAME code the backfill runs.
+ *
+ * Before this, nothing wrote to us_signal_history except a manual backfill --
+ * the table froze the day it was built and its unresolved forward returns were
+ * never going to fill in. That is exactly the failure CRONTAB.md records for the
+ * IDX side: "the snapshot used to be a side effect of GET /api/signal-scanner.
+ * History only grew when a human opened the page."
+ *
+ * A nightly run over a trailing window does BOTH jobs at once, because the
+ * forward returns are recomputed from the price series on every pass and the
+ * insert upserts: new sessions get rows, and rows whose 20/40/60-day outcome has
+ * since become knowable get it filled in. The window must therefore exceed the
+ * longest horizon, or the outcomes at the far end never resolve.
+ *
+ * @param {import('mysql2/promise').Pool} pool
+ * @param {{from?: string, only?: string, truncate?: boolean, createOnly?: boolean,
+ *          tickers?: string[], quiet?: boolean}} [opts]
+ */
+async function syncUsSignalHistory(pool, opts = {}) {
+  const log = opts.quiet ? () => {} : (...a) => console.log(...a);
+  const FROM = opts.from ?? null;
+  const TRUNCATE = !!opts.truncate;
   await pool.query(DDL);
-  console.log('us_signal_history ready');
-  if (CREATE_ONLY) { await pool.end(); return; }
-  if (TRUNCATE) { await pool.query('TRUNCATE TABLE us_signal_history'); console.log('truncated'); }
+  log('us_signal_history ready');
+  if (opts.createOnly) return { created: true };
+  if (TRUNCATE) { await pool.query('TRUNCATE TABLE us_signal_history'); log('truncated'); }
 
   // Point-in-time cross-sectional mean daily change, one row per date.
   // Early dates average over fewer tickers because fewer had listed --
@@ -139,21 +161,33 @@ const r4 = v => (v === null || !Number.isFinite(v) ? null : Math.round(v * 1e4) 
     marketAvg.set(d, Number(r.avg_chg));
     marketN.set(d, r.n);
   }
-  console.log(`market averages for ${marketAvg.size} sessions ` +
+  log(`market averages for ${marketAvg.size} sessions ` +
     `(${avgRows.length ? avgRows[0].date.toISOString().slice(0, 10) : '?'} onward)`);
 
-  const tickers = ONLY ? ONLY.split(',').map(s => s.trim().toUpperCase()) : US_TICKERS;
-  console.log(`tickers: ${tickers.length}   warmup ${WARMUP} bars   horizons ${HORIZONS.join('/')}d`);
-  console.log('scored through modules/us_score_engine.js — the same function the live scanner calls');
-  console.log('SURVIVORSHIP: today\'s S&P 500 members, twenty years back. Biased upward. Stated, not fixed.\n');
+  const tickers = opts.tickers ? opts.tickers
+    : opts.only ? opts.only.split(',').map(s => s.trim().toUpperCase())
+    : US_TICKERS;
+  log(`tickers: ${tickers.length}   warmup ${WARMUP} bars   horizons ${HORIZONS.join('/')}d`);
+  log('scored through modules/us_score_engine.js — the same function the live scanner calls');
+  log('SURVIVORSHIP: today\'s S&P 500 members, twenty years back. Biased upward. Stated, not fixed.\n');
 
   const t0 = Date.now();
   let rowsWritten = 0, tickersDone = 0, tickersEmpty = 0, skippedNoAvg = 0, skippedNoScore = 0;
 
   for (const ticker of tickers) {
-    const [px] = await pool.query(
-      `SELECT date, open_price, high_price, low_price, close_price, volume
-         FROM us_stock_prices WHERE ticker = ? ORDER BY date ASC`, [ticker]);
+    // With `from` set the loop only scores dates at or after it, so loading
+    // twenty years per ticker just to throw it away turns a nightly job into a
+    // forty-minute one. LOOKBACK bars of context before `from` is exactly what
+    // the factors need, plus slack for non-trading days; without `from` the
+    // whole series is still loaded, so the backfill is unchanged.
+    const [px] = FROM
+      ? await pool.query(
+        `SELECT date, open_price, high_price, low_price, close_price, volume
+           FROM us_stock_prices WHERE ticker = ? AND date >= DATE_SUB(?, INTERVAL ? DAY)
+          ORDER BY date ASC`, [ticker, FROM, Math.ceil(LOOKBACK * 1.5)])
+      : await pool.query(
+        `SELECT date, open_price, high_price, low_price, close_price, volume
+           FROM us_stock_prices WHERE ticker = ? ORDER BY date ASC`, [ticker]);
     if (px.length < WARMUP + 2) { tickersEmpty++; continue; }
 
     const candles = px.map(r => ({
@@ -227,7 +261,7 @@ const r4 = v => (v === null || !Number.isFinite(v) ? null : Math.round(v * 1e4) 
     tickersDone++;
     if (tickersDone % 25 === 0) {
       const el = (Date.now() - t0) / 1000;
-      console.log(`  ${String(tickersDone).padStart(3)}/${tickers.length} ${ticker.padEnd(6)} ` +
+      log(`  ${String(tickersDone).padStart(3)}/${tickers.length} ${ticker.padEnd(6)} ` +
         `+${String(batch.length).padStart(5)} rows   total ${rowsWritten}   ${el.toFixed(0)}s`);
     }
   }
@@ -238,17 +272,37 @@ const r4 = v => (v === null || !Number.isFinite(v) ? null : Math.round(v * 1e4) 
             SUM(return_10d IS NOT NULL) has10, SUM(return_60d IS NOT NULL) has60
        FROM us_signal_history`);
 
-  console.log(`\n${'='.repeat(72)}`);
-  console.log(`tickers scored ${tickersDone}, too short ${tickersEmpty}, rows written ${rowsWritten}`);
-  console.log(`skipped: ${skippedNoAvg} no market average, ${skippedNoScore} unscoreable`);
-  console.log(`table: ${sum.n} rows, ${sum.tk} tickers, ${sum.sessions} sessions, ` +
+  log(`\n${'='.repeat(72)}`);
+  log(`tickers scored ${tickersDone}, too short ${tickersEmpty}, rows written ${rowsWritten}`);
+  log(`skipped: ${skippedNoAvg} no market average, ${skippedNoScore} unscoreable`);
+  log(`table: ${sum.n} rows, ${sum.tk} tickers, ${sum.sessions} sessions, ` +
     `${sum.mn && sum.mn.toISOString().slice(0, 10)} .. ${sum.mx && sum.mx.toISOString().slice(0, 10)}`);
-  console.log(`resolved outcomes: ${sum.has10} rows with return_10d, ${sum.has60} with return_60d`);
-  console.log(`\nnon-overlapping anchors, the number that gated EXP-042 (S1 needs >= 30):`);
+  log(`resolved outcomes: ${sum.has10} rows with return_10d, ${sum.has60} with return_60d`);
+  log(`\nnon-overlapping anchors, the number that gated EXP-042 (S1 needs >= 30):`);
   for (const h of HORIZONS) {
     const a = Math.floor(sum.sessions / h);
-    console.log(`  ${String(h).padStart(2)}d horizon: ${String(a).padStart(5)} anchors  ${a >= 30 ? 'OK' : 'BELOW BAR'}`);
+    log(`  ${String(h).padStart(2)}d horizon: ${String(a).padStart(5)} anchors  ${a >= 30 ? 'OK' : 'BELOW BAR'}`);
   }
-  console.log(`\nelapsed ${((Date.now() - t0) / 1000).toFixed(0)}s`);
-  await pool.end();
-})().catch(e => { console.error(e.stack || e.message); process.exit(1); });
+  log(`\nelapsed ${((Date.now() - t0) / 1000).toFixed(0)}s`);
+  return {
+    tickersDone, tickersEmpty, rowsWritten, skippedNoAvg, skippedNoScore,
+    rows: Number(sum.n), sessions: Number(sum.sessions),
+    latest: sum.mx && sum.mx.toISOString().slice(0, 10),
+    resolved10d: Number(sum.has10), resolved60d: Number(sum.has60),
+    elapsedSec: Math.round((Date.now() - t0) / 1000),
+  };
+}
+
+module.exports = { syncUsSignalHistory, DDL, HORIZONS };
+
+/* ── CLI ─────────────────────────────────────────────────────────────────── */
+if (require.main === module) {
+  (async () => {
+    const pool = createPool();
+    try {
+      await syncUsSignalHistory(pool, {
+        from: FROM, only: ONLY, truncate: TRUNCATE, createOnly: CREATE_ONLY,
+      });
+    } finally { await pool.end(); }
+  })().catch(e => { console.error(e.stack || e.message); process.exit(1); });
+}

@@ -2849,7 +2849,7 @@ let cronStatus = { lastRun: null, lastResult: null, nextRun: null, running: fals
 // stale for a week (2026-07-22 → 2026-07-30, discovered live 2026-07-30) with
 // no trace of why once logs were gone. Now surfaced in /api/cron/status too,
 // so a silent gap like that is visible without needing historical logs.
-let auxRefreshStatus = { ihsg: null, sp500: null, usStocks: null };
+let auxRefreshStatus = { ihsg: null, sp500: null, sp500Factors: null, usStocks: null, usSignalHistory: null };
 
 /**
  * Fill concentration for recent sessions that have broker data but no
@@ -2914,7 +2914,20 @@ async function runDailyCron(dateOverride) {
   try {
     const r = await fetchAndCacheSP500();
     auxRefreshStatus.sp500 = { ok: true, at: new Date().toISOString(), ...r };
-    console.log('  📈 S&P 500 history refreshed');
+    console.log(`  📈 S&P 500 history refreshed${r.skipped ? ' (skipped, already current)' : ''}`);
+    // sp500_factor_history held exactly ONE row before this. Not because
+    // saveSP500FactorSnapshot was uncalled -- it is called by GET
+    // /api/sp500-factors -- but because that was its ONLY caller, so the history
+    // only grew when a human opened the page. CRONTAB.md records the identical
+    // failure on the IDX side: "the snapshot used to be a side effect of GET
+    // /api/signal-scanner. History only grew when a human opened the page", and
+    // that is why 2026-08-03..06 have no snapshots.
+    //
+    // A snapshot table whose sole writer is a page view is not a history; it is
+    // a cache of whenever somebody last looked.
+    const snap = await saveSP500FactorSnapshot();
+    auxRefreshStatus.sp500Factors = { ok: true, at: new Date().toISOString(), date: snap?.date ?? null };
+    console.log(`  🧭 S&P 500 factor snapshot saved (${snap?.date ?? 'no data'})`);
   } catch (e) {
     auxRefreshStatus.sp500 = { ok: false, at: new Date().toISOString(), error: e.message };
     console.log('  ⚠️ S&P 500 refresh failed:', e.message);
@@ -2926,6 +2939,34 @@ async function runDailyCron(dateOverride) {
   } catch (e) {
     auxRefreshStatus.usStocks = { ok: false, at: new Date().toISOString(), error: e.message };
     console.log('  ⚠️ US stock price refresh failed:', e.message);
+  }
+  try {
+    // us_signal_history had NO daily writer until 2026-09-05. It froze the day
+    // the backfill built it, and its unresolved 20/40/60-day outcomes were never
+    // going to fill in -- the same failure this file's IDX snapshot had, where
+    // history only grew when a human opened the scanner page.
+    //
+    // The trailing window must exceed the longest horizon (60 sessions) or the
+    // outcomes at the far end never resolve. 120 CALENDAR days is about 82
+    // trading sessions, which clears it with slack for holidays. The sync
+    // upserts and recomputes forward returns from prices on every pass, so one
+    // call both appends new sessions and resolves outcomes that have since
+    // become knowable.
+    //
+    // Runs AFTER refreshUSStockPrices on purpose: it scores from the price
+    // table, so scoring before the prices land would date a row to a session it
+    // has no bar for.
+    const { syncUsSignalHistory } = require('./backfill_us_signal_history');
+    const from = new Date(Date.now() - 120 * 86400000).toISOString().slice(0, 10);
+    const r = await syncUsSignalHistory(pool, { from, quiet: true });
+    auxRefreshStatus.usSignalHistory = {
+      ok: true, at: new Date().toISOString(),
+      rowsWritten: r.rowsWritten, latest: r.latest, sessions: r.sessions, elapsedSec: r.elapsedSec,
+    };
+    console.log(`  🧮 US signal history synced (${r.rowsWritten} rows, latest ${r.latest}, ${r.elapsedSec}s)`);
+  } catch (e) {
+    auxRefreshStatus.usSignalHistory = { ok: false, at: new Date().toISOString(), error: e.message };
+    console.log('  ⚠️ US signal history sync failed:', e.message);
   }
 
   const results = { date, started: new Date().toISOString(), stocks: {}, totalRecords: 0 };
@@ -6483,7 +6524,18 @@ app.get('/api/ihsg-factors', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 async function fetchAndCacheSP500() {
   const [[latestRow]] = await pool.query('SELECT MAX(date) d FROM sp500_history');
-  const latest = latestRow?.d ? String(latestRow.d).split('T')[0] : null;
+  // toDateStr, NOT String(...).split('T'). The driver hands back a Date, whose
+  // toString is "Fri Jul 24 2026 00:00:00 GMT+0000 (...)" -- there is no 'T' in
+  // that, so the split was a no-op and `latest` kept the whole sentence. The
+  // comparison below is then lexicographic against an ISO date, and 'F' sorts
+  // after '2', so it was ALWAYS true: this function skipped every night from
+  // 2026-07-24 to 2026-09-05 while reporting ok:true, and the S&P 500 shown on
+  // the page sat six weeks and 4% behind the index.
+  //
+  // It failed silently because "skipped" is a legitimate outcome here -- the
+  // status said ok, the log said nothing, and only a stale number on screen gave
+  // it away.
+  const latest = latestRow?.d ? toDateStr(latestRow.d) : null;
   const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
   if (latest && latest >= yesterday) return { skipped: true, latest };
 
@@ -6833,10 +6885,24 @@ app.get('/api/us-signal-scanner', async (req, res) => {
 app.get('/api/us-deepdive/:ticker', async (req, res) => {
   try {
     const ticker = req.params.ticker.toUpperCase();
+    // BOUNDED. us_stock_prices went from ~150 sessions to 5,029 in the 2026-09-02
+    // backfill, and this route was written when "all of it" meant six months. It
+    // then shipped 1.6 MB and took 19 seconds per ticker: 5,031 rows loaded,
+    // 5,017 scorer calls, and a GROUP BY over 1.9M rows for the market average.
+    //
+    // CONTEXT is loaded beyond what is EMITTED. The rolling factors need 60 bars
+    // behind each point and computeWeeklyTrend needs ~105 to stop returning
+    // NEUTRAL, so trimming the query alone would silently change the numbers at
+    // the start of the window. CONTEXT_BARS of run-up keeps every emitted value
+    // identical to what the unbounded version produced.
+    const bars = Math.max(60, Math.min(2000, Number(req.query.bars) || 500));
+    const CONTEXT_BARS = 400;
     const [rows] = await pool.query(
       `SELECT date, open_price o, high_price h, low_price l, close_price c, volume v
-       FROM us_stock_prices WHERE ticker = ? ORDER BY date ASC`,
-      [ticker]
+       FROM (SELECT date, open_price, high_price, low_price, close_price, volume
+               FROM us_stock_prices WHERE ticker = ? ORDER BY date DESC LIMIT ?) t
+       ORDER BY date ASC`,
+      [ticker, bars + CONTEXT_BARS]
     );
     if (rows.length < 15) return res.json({ ticker, priceHistory: [], factorHistory: [], latest: null, convictionTier: null });
 
@@ -6849,14 +6915,21 @@ app.get('/api/us-deepdive/:ticker', async (req, res) => {
     // Point-in-time cross-sectional average per date (for F5 Relative Strength)
     // — a real historical market average for THAT day, not today's, so the
     // rolling factor history below stays no-lookahead.
+    // Restricted to the loaded range. Unrestricted this grouped every row in the
+    // table -- 1.9M -- to serve a window of a few hundred dates.
     const [avgRows] = await pool.query(
-      `SELECT date, AVG(change_pct) avg_chg FROM us_stock_prices GROUP BY date`
+      `SELECT date, AVG(change_pct) avg_chg FROM us_stock_prices
+        WHERE date >= ? AND date <= ? GROUP BY date`,
+      [candles[0].date, candles[candles.length - 1].date]
     );
     const marketAvgByDate = new Map(avgRows.map(r => [toDateStr(r.date), Number(r.avg_chg) || 0]));
 
     // Rolling per-day factor history — window ends at that day, no lookahead (same approach as regenerate_ihsg_factor_history.js).
     const factorHistory = [];
-    for (let i = 14; i < candles.length; i++) {
+    // Start far enough in that every emitted point has its full run-up; the
+    // earlier bars exist only as context and are deliberately not returned.
+    const emitFrom = Math.max(14, candles.length - bars);
+    for (let i = emitFrom; i < candles.length; i++) {
       const window = candles.slice(0, i + 1).slice(-60);
       const f = computeUSStockFactors(window, marketDir.direction, marketAvgByDate.get(candles[i].date) || 0);
       if (!f) continue;
@@ -6875,7 +6948,11 @@ app.get('/api/us-deepdive/:ticker', async (req, res) => {
       ? { tier: latestFull.convictionTier, sizeMultiplier: latestFull.sizeMultiplier, reason: latestFull.tierReason }
       : null;
 
-    res.json({ ticker, priceHistory: candles, factorHistory, latest, convictionTier });
+    res.json({
+      ticker, priceHistory: candles.slice(-bars), factorHistory, latest, convictionTier,
+      // Say what was trimmed rather than letting a caller assume it got everything.
+      window: { emitted: bars, contextBars: CONTEXT_BARS, loaded: candles.length },
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
