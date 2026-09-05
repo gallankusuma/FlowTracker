@@ -7,6 +7,15 @@ boundary cannot be chosen to suit a result.
 Authoritative for S3 on US hypotheses. Subordinate to `PROMOTION_CONTRACT.md`,
 which this does not amend.
 
+**Provenance of the boundaries.** Both reserves were committed in `b8dde67`
+*before* a single row of either was fetched; the loader landed in `61912aa`
+afterwards. That commit order is the evidence that the edges were not chosen to
+suit anything, and it is stronger evidence than the document hash
+`us_reserve.definitionHash()` returns — the hash changes on ANY edit, including
+the coverage figures added below after loading, so it detects tampering with the
+file, not specifically with the boundaries. The dates themselves are pinned by
+`scraper/test_us_reserve.js`, which asserts each one literally.
+
 ---
 
 ## 1. What is already spent
@@ -30,12 +39,31 @@ Two directions remain: **earlier than we ever fetched**, and **later than now**.
 - **Bounds are absolute dates.** Fetch with `period1`/`period2`, never with a
   relative `range=` token — `25y` slides one session per day and would make the
   reserve's own boundary a function of when it is opened.
-- Measured on a 42-ticker spread of the universe: **1,255 sessions** available
-  from 2001-09-05, ≈ 62 non-overlapping anchors at H=20. The full window from
-  2001-04-09 should reach ~1,360 sessions / ~68 anchors; the backfill reports the
-  true count.
-- 38 of 42 probed tickers carry the window; 3 IPO'd later (KHC, SYF, ZTS), 1
-  errored (JNPR). Expect ~90% universe coverage, thinning toward the start.
+### Loaded 2026-09-05 — actual, replacing the pre-load estimate
+
+| | |
+|---|---|
+| sessions in the window | **1,358** (2001-04-09 … 2006-09-01) |
+| non-overlapping anchors at H=20 | **67** (bar is 30) |
+| tickers carrying the window | **337 of 418** (80.6%) |
+| rows written | 436,869 |
+
+The pre-load estimate from a 42-ticker probe was "~90% coverage". The true figure
+is **80.6%**, and it is recorded here rather than quietly left at the guess.
+
+The 81 absentees were re-fetched once at a slower rate and **none recovered**, so
+they are genuine, not throttling. Almost all are companies that did not trade in
+the window — TSLA (2010), ABNB (2020), GM (2010 re-listing), CARR and OTIS (2020
+spin-offs), CTVA and DOW (2019), AVGO (2009), LYB (2010), AWK (2008), BR (2007).
+
+**Three are not.** `EA`, `EQR` and `AVB` are served truncated by Yahoo: AVB
+returns 27 daily bars beginning 2026-07-17 for a company continuously listed
+since 1993. They hold 136–146 rows in `us_stock_prices` and are 10–15 days stale.
+They are therefore **absent from this reserve for a reason that has nothing to do
+with 2001–2006**, and their absence is a feed fault, not a listing fact. If the
+feed recovers, they must NOT be added — the reserve's cross-section is frozen at
+what was loaded on 2026-09-05, and topping it up later would make its population
+depend on when it is opened.
 
 ### Why 2001-04-09 and not earlier
 
