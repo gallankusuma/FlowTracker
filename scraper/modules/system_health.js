@@ -638,15 +638,61 @@ const CHECKS = [
  * healthy, and `absoluteStaleness` below measures that reference against the
  * actual clock so a complete outage is still caught.
  */
-async function usTradingDayLag(pool, fromDate, referenceDate) {
+/**
+ * A date is only a SESSION if the cross-section actually arrived on it.
+ *
+ * Found on 2026-09-05: `us_stock_prices` MAX(date) was 2026-09-04 and exactly
+ * ONE ticker (AAPL) had a row there; the universe frontier was 2026-09-03. Every
+ * US check read lag 0 against a date 406 of 407 tickers had never reached, and
+ * `usPipelineSession` -- the yardstick the whole US family is measured against --
+ * was that same phantom date.
+ *
+ * This is the identical disease the file already records at `tradingDayLag`
+ * ("with the axis frozen, every table is fresh relative to a frozen yardstick"),
+ * arriving through a different door: not a frozen axis, a HOLLOW one. MAX(date)
+ * cannot distinguish "the session landed" from "one row landed".
+ *
+ * The floor is relative, not absolute, because the universe legitimately changes
+ * size (245 -> 600 on IDX, 407 fetchable of 418 here). Half of the recent median
+ * is far below any real session and far above any stray row.
+ */
+const US_SESSION_COVERAGE_FRACTION = 0.5;
+const US_COVERAGE_LOOKBACK_SESSIONS = 20;
+
+async function usSessionCoverageFloor(pool) {
+  const [rows] = await pool.query(
+    `SELECT COUNT(*) n FROM us_stock_prices
+      GROUP BY date ORDER BY date DESC LIMIT ?`, [US_COVERAGE_LOOKBACK_SESSIONS]);
+  if (!rows.length) return 0;
+  const counts = rows.map(r => Number(r.n)).sort((a, b) => a - b);
+  const median = counts[Math.floor(counts.length / 2)];
+  return Math.max(1, Math.floor(median * US_SESSION_COVERAGE_FRACTION));
+}
+
+/** Newest date whose cross-section cleared the floor, or null. */
+async function usCoveredSession(pool) {
+  const floor = await usSessionCoverageFloor(pool);
+  const [r] = await pool.query(
+    `SELECT date d FROM us_stock_prices GROUP BY date HAVING COUNT(*) >= ?
+      ORDER BY date DESC LIMIT 1`, [floor]);
+  return r.length ? toIso(r[0].d) : null;
+}
+
+async function usTradingDayLag(pool, fromDate, referenceDate, floor = null) {
   if (!fromDate || !referenceDate) return null;
   // The NYSE calendar as we observe it: the distinct dates us_stock_prices
   // actually holds. Using the IHSG calendar here would be wrong in both
   // directions -- the two exchanges do not share holidays -- and there is no
   // separate US session table to borrow.
+  //
+  // Thin dates are excluded so a single stray row cannot count as a session in
+  // either direction: it can neither advance the frontier nor inflate a lag.
+  const f = floor === null ? await usSessionCoverageFloor(pool) : floor;
   const [r] = await pool.query(
-    `SELECT COUNT(DISTINCT date) n FROM us_stock_prices WHERE date > ? AND date <= ?`,
-    [fromDate, referenceDate]);
+    `SELECT COUNT(*) n FROM (
+       SELECT date FROM us_stock_prices WHERE date > ? AND date <= ?
+        GROUP BY date HAVING COUNT(*) >= ?) x`,
+    [fromDate, referenceDate, f]);
   return Number(r[0]?.n ?? 0);
 }
 
@@ -748,8 +794,12 @@ async function dataFreshness(pool, today = new Date()) {
   for (const c of CHECKS) {
     if (c.reference !== REFERENCE.US_PIPELINE) continue;
     try {
-      const [r] = await pool.query(`SELECT MAX(${c.col}) AS d FROM ${c.table}`);
-      const d = toIso(r[0]?.d);
+      // us_stock_prices contributes its newest COVERED session, not its MAX date.
+      // A yardstick that one stray row can advance measures every other feed
+      // against a session that never arrived.
+      const d = c.table === 'us_stock_prices'
+        ? await usCoveredSession(pool)
+        : toIso((await pool.query(`SELECT MAX(${c.col}) AS d FROM ${c.table}`))[0][0]?.d);
       if (d && (usPipelineSession === null || d > usPipelineSession)) usPipelineSession = d;
     } catch { /* reported per-check below */ }
   }
@@ -836,15 +886,31 @@ async function dataFreshness(pool, today = new Date()) {
         out.push(decorate({ ...c, latest: null, lagTradingDays: null, ok: false, detail: 'table is empty' }));
         continue;
       }
-      const d = latest instanceof Date ? latest.toISOString().slice(0, 10) : String(latest).slice(0, 10);
+      let d = latest instanceof Date ? latest.toISOString().slice(0, 10) : String(latest).slice(0, 10);
+
+      // us_stock_prices reports the newest session the CROSS-SECTION reached, not
+      // its MAX(date). Reporting MAX here would let the same stray row that used
+      // to poison the yardstick also make this row's own verdict green: on
+      // 2026-09-05, MAX was 2026-09-04 on one ticker while 406 sat at 09-03.
+      let thin = null;
+      if (c.table === 'us_stock_prices') {
+        const covered = await usCoveredSession(pool);
+        if (covered && covered < d) thin = d;   // remember what MAX claimed
+        if (covered) d = covered;
+      }
+
       const lag = c.reference === REFERENCE.US_PIPELINE
         ? await usTradingDayLag(pool, d, usPipelineSession)
         : await tradingDayLag(pool, d, reference);
       out.push(decorate({ key: c.key, table: c.table, severity: c.severity, affects: c.affects, why: c.why,
                  latest: d, lagTradingDays: lag, maxLag: c.maxLag, rows: Number(r[0].n),
                  ok: lag <= c.maxLag,
-                 detail: lag <= c.maxLag ? 'fresh'
-                   : `${lag} trading session(s) behind (tolerance ${c.maxLag})` }));
+                 detail: (lag <= c.maxLag ? 'fresh'
+                   : `${lag} trading session(s) behind (tolerance ${c.maxLag})`) +
+                   // Stated even when fresh: a partial newest date is how a
+                   // half-finished ingest looks, and it is worth seeing before it
+                   // becomes a gap.
+                   (thin ? ` (MAX(date) is ${thin} but that session is thin — frontier taken as ${d})` : '') }));
     } catch (e) {
       out.push(decorate({ ...c, latest: null, lagTradingDays: null, ok: false, detail: `query failed: ${e.message}` }));
     }

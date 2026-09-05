@@ -67,6 +67,25 @@ function makePool(spec) {
         const s = spec.sessions || [];
         return [[{ n: s.filter(d => d > params[0] && d <= params[1]).length }]];
       }
+      // ── us_stock_prices cross-section coverage ──────────────────────────
+      // spec.usCoverage maps date -> number of tickers that landed on it. Absent,
+      // these fall through and the module keeps its pre-coverage behaviour, which
+      // is what every test written before 2026-09-05 expects.
+      if (spec.usCoverage && /COUNT\(\*\) n FROM us_stock_prices\s+GROUP BY date/i.test(sql)) {
+        const desc = Object.keys(spec.usCoverage).sort().reverse();
+        return [desc.slice(0, params[0]).map(d => ({ n: spec.usCoverage[d] }))];
+      }
+      if (spec.usCoverage && /SELECT date d FROM us_stock_prices GROUP BY date HAVING/i.test(sql)) {
+        const hit = Object.keys(spec.usCoverage).sort().reverse()
+          .filter(d => spec.usCoverage[d] >= params[0]);
+        return [hit.length ? [{ d: hit[0] }] : []];
+      }
+      if (spec.usCoverage && /FROM us_stock_prices WHERE date > \? AND date <= \?/i.test(sql)) {
+        const n = Object.keys(spec.usCoverage)
+          .filter(d => d > params[0] && d <= params[1] && spec.usCoverage[d] >= params[2]).length;
+        return [[{ n }]];
+      }
+
       // Reference scan: MAX(col) AS d, without the COUNT.
       const ref = sql.match(/MAX\((\w+)\) AS d FROM (\w+)/i);
       if (ref) return [[{ d: spec.tables[ref[2]] ?? null }]];
@@ -682,6 +701,54 @@ const ALL_FRESH = {
 
     test('but one weekday of lag does not, because the US cron precedes the open', () => {
       assert.ok(sh.weekdaysSince('2026-09-03', at('2026-09-04')) <= sh.US_MAX_REFERENCE_WEEKDAYS);
+    });
+  }
+
+  // ── a hollow session must not read as a session ──────────────────────────
+  // The real 2026-09-05 shape: MAX(date) 2026-09-04 on ONE ticker, 406 at 09-03.
+  {
+    const HOLLOW = {
+      '2026-08-31': 404, '2026-09-01': 404, '2026-09-02': 404,
+      '2026-09-03': 403, '2026-09-04': 1,
+    };
+    const usSpec = cov => ({
+      tables: {
+        us_stock_prices: '2026-09-04', us_signal_history: '2026-09-03',
+        sp500_history: '2026-09-03',
+        idx_stock_prices: '2026-09-04', idx_ihsg_history: '2026-09-04',
+        idx_broker_summary: '2026-09-04', idx_concentration: '2026-09-04',
+        idx_broker_flow_detail: '2026-09-04', ft_signals: '2026-09-04',
+      },
+      usCoverage: cov, sessions: ['2026-09-03', '2026-09-04'], lag: {}, jobs: [],
+    });
+    const at = new Date('2026-09-05T14:00:00Z');
+
+    await atest('a one-ticker date is not the US frontier', async () => {
+      const rows = await sh.dataFreshness(makePool(usSpec(HOLLOW)), at);
+      const px = rows.find(r => r.key === 'us_prices');
+      assert.strictEqual(px.latest, '2026-09-03',
+        `frontier should be the covered session, got ${px.latest}`);
+    });
+
+    await atest('and the row names the thin session even while reporting fresh', async () => {
+      const rows = await sh.dataFreshness(makePool(usSpec(HOLLOW)), at);
+      const px = rows.find(r => r.key === 'us_prices');
+      assert.ok(/thin/.test(px.detail), `detail should name it, got: ${px.detail}`);
+    });
+
+    await atest('a fully covered newest session is reported unchanged', async () => {
+      const rows = await sh.dataFreshness(makePool(usSpec({ ...HOLLOW, '2026-09-04': 404 })), at);
+      const px = rows.find(r => r.key === 'us_prices');
+      assert.strictEqual(px.latest, '2026-09-04');
+      assert.ok(!/thin/.test(px.detail), `should not warn when whole: ${px.detail}`);
+    });
+
+    await atest('the hollow date does not inflate another US feed lag either', async () => {
+      // us_signal_history sits at 09-03. Against a phantom 09-04 frontier it
+      // would read a session behind; against the covered one it is current.
+      const rows = await sh.dataFreshness(makePool(usSpec(HOLLOW)), at);
+      const sig = rows.find(r => r.key === 'us_signals');
+      assert.strictEqual(sig.lagTradingDays, 0, `got lag ${sig.lagTradingDays}`);
     });
   }
 
