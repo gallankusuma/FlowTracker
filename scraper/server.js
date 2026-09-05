@@ -6090,6 +6090,10 @@ async function computeIHSGFactors() {
       emaTrend: tech.f12, supportResistance: tech.f13, atr: tech.f14,
     },
     breadthPct: Math.round(breadthPct * 100) / 100,
+    // How many names the breadth figure rests on. Early sessions carry far
+    // fewer tickers than today's 400+, and a breadth read on 30 names is not
+    // the same measurement as one on 400 even though the column looks alike.
+    breadthSample: total,
     indicators: tech.indicators,
   };
 }
@@ -6179,6 +6183,10 @@ async function computeIHSGFactorsLive() {
       emaTrend: Math.round(tech.f12), supportResistance: Math.round(tech.f13), atr: Math.round(tech.f14),
     },
     breadthPct: Math.round(breadthPct * 100) / 100,
+    // How many names the breadth figure rests on. Early sessions carry far
+    // fewer tickers than today's 400+, and a breadth read on 30 names is not
+    // the same measurement as one on 400 even though the column looks alike.
+    breadthSample: total,
     indicators: tech.indicators,
   };
 }
@@ -6593,61 +6601,13 @@ async function detectUSMarketDirection() {
   }
 }
 
-async function computeSP500Factors() {
-  const [rows] = await pool.query(
-    `SELECT date, open_price o, high_price h, low_price l, close_price c, volume v FROM sp500_history ORDER BY date ASC`
-  );
-  if (rows.length < 30) return null;
-  const candles = rows.map(r => ({
-    date: toDateStr(r.date), open: Number(r.o), high: Number(r.h), low: Number(r.l), close: Number(r.c), volume: Number(r.v),
-  }));
-
-  const { calcTechnicalFactors } = require('./awo_technical');
-  const tech = calcTechnicalFactors(candles.slice(-60));
-
-  const [[latestPriceDate]] = await pool.query('SELECT MAX(date) d FROM us_stock_prices');
-  const asOfDate = latestPriceDate?.d ? toDateStr(latestPriceDate.d) : candles[candles.length - 1].date;
-  const [changeRows] = await pool.query(`SELECT change_pct FROM us_stock_prices WHERE date = ?`, [asOfDate]);
-  const total = changeRows.length;
-  const positive = changeRows.filter(r => Number(r.change_pct) > 0).length;
-  const breadthPct = total > 0 ? (positive / total) * 100 : 50;
-  const f_breadth = Math.round(breadthPct);
-
-  // f14 (ATR) applies as a Risk Modifier, not a 6th vote in the average — no
-  // factor-coverage concept here (index-level breadth + tech factors are
-  // always full weight), so Confidence is always 1.0. See combineFinalScore.
-  const rawComposite6 = (f_breadth + tech.f9 + tech.f10 + tech.f11 + tech.f12 + tech.f13) / 6;
-  const composite = combineFinalScore(rawComposite6, computeConfidence(undefined), computeRiskModifier(tech.f14));
-  const trend = composite >= 60 ? 'BULLISH' : composite <= 40 ? 'BEARISH' : 'NEUTRAL';
-
-  return {
-    date: candles[candles.length - 1].date,
-    composite, trend,
-    factors: {
-      breadth: f_breadth, rsi: tech.f9, macd: tech.f10, bollinger: tech.f11,
-      emaTrend: tech.f12, supportResistance: tech.f13, atr: tech.f14,
-    },
-    breadthPct: Math.round(breadthPct * 100) / 100,
-    indicators: tech.indicators,
-  };
-}
-
-async function saveSP500FactorSnapshot() {
-  const f = await computeSP500Factors();
-  if (!f) return null;
-  await pool.query(
-    `INSERT INTO sp500_factor_history
-      (date, composite_score, trend, f_breadth, f_rsi, f_macd, f_bollinger, f_ema_trend, f_support_resistance, f_atr, breadth_pct)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)
-     ON DUPLICATE KEY UPDATE composite_score=VALUES(composite_score), trend=VALUES(trend),
-       f_breadth=VALUES(f_breadth), f_rsi=VALUES(f_rsi), f_macd=VALUES(f_macd), f_bollinger=VALUES(f_bollinger),
-       f_ema_trend=VALUES(f_ema_trend), f_support_resistance=VALUES(f_support_resistance), f_atr=VALUES(f_atr),
-       breadth_pct=VALUES(breadth_pct)`,
-    [f.date, f.composite, f.trend, f.factors.breadth, f.factors.rsi, f.factors.macd, f.factors.bollinger,
-     f.factors.emaTrend, f.factors.supportResistance, f.factors.atr, f.breadthPct]
-  );
-  return f;
-}
+// Moved to modules/sp500_factors.js on 2026-09-05 so the backfill, the nightly
+// cron and the live endpoint all run the SAME code. The wrappers keep every
+// existing call site unchanged -- the module takes `pool` explicitly because a
+// module cannot reach server.js's.
+const _sp500Factors = require('./modules/sp500_factors');
+const computeSP500Factors = (asOf = null) => _sp500Factors.computeSP500Factors(pool, asOf);
+const saveSP500FactorSnapshot = (asOf = null) => _sp500Factors.saveSP500FactorSnapshot(pool, asOf);
 
 const SP500_PATTERN_WEIGHTS = { harmonic: 30, wyckoff: 20, smc: 25, volume_profile: 25, broker_flow: 0 };
 
