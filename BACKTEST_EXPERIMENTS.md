@@ -2786,6 +2786,15 @@ the corrected fit on validation first, and seal only after it passed there.**
 
 **HOLDS by the sealed rule; marginal in substance. HOLDOUT BURNED.**
 
+> **Replaced 2026-09-05.** The burned window cannot be un-burned, and every US
+> session from 2007-02-28 to 2026-09-01 has now been read, so no sub-period of the
+> existing data is clean. Two replacement reserves are defined in
+> `HOLDOUT_US_2026-09-05.md` and enforced by `scraper/modules/us_reserve.js`:
+> **RESERVE-US-B** (2001-04-09 … 2006-09-04, backward, ~67 anchors at H=20,
+> mechanism hypotheses only) and **RESERVE-US-F** (2026-09-05 onward, opens at 30
+> anchors). F is gated behind B. Neither is a substitute for the fact that this
+> reserve was spent on a candidate that had not first passed validation.
+
 No production change. `trade_policy` untouched, `computeTradePlan` untouched.
 Eligible for S4 forward shadow with no capital — but at an 8.8% reduction, S4 is
 a real question rather than an obvious next step.

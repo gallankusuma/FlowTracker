@@ -96,7 +96,20 @@ means the window cannot resolve effects of that size. Report it as
   a fresh reserved period
 
 *Enforced by:* `research/candlestick/exp028_oos.js` refuses the final segment
-without `--open-holdout`.
+without `--open-holdout`; on US data, `scraper/modules/us_reserve.js`
+`assertAdmissible()` refuses either reserved period without it.
+
+**Reserved periods currently held:**
+
+| market | period | status |
+|---|---|---|
+| IDX | 2024-01-01 onward | sealed, unread |
+| US | 2024-01-01 … 2026-09-01 | **BURNED** by EXP-047 |
+| US | 2001-04-09 … 2006-09-04 (`RESERVE-US-B`) | sealed, unread — mechanism hypotheses only |
+| US | 2026-09-05 onward (`RESERVE-US-F`) | sealed; opens at 30 anchors, gated behind B |
+
+US reserves are defined in `HOLDOUT_US_2026-09-05.md`, which records why a
+backward reserve is admissible for mechanism claims and not for timing ones.
 
 ### S4 — FORWARD SHADOW
 
