@@ -64,8 +64,38 @@ const MAX_RETRY = 3;
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+/**
+ * The covering index the market-average query needs.
+ *
+ * `SELECT date, AVG(change_pct) ... GROUP BY date` is run by /api/us-deepdive
+ * and by the nightly us_signal_history sync. `idx_date` alone does not cover
+ * change_pct, so every date turned into random primary-key lookups across 1.9M
+ * rows. Profiled on the box: the price query took 48ms, the scoring loop over
+ * 500 points took 91ms, and this single GROUP BY took **14,156ms** -- essentially
+ * the whole of the endpoint response time. With (date, change_pct) it is
+ * index-only: 124ms bounded, 472ms for the unbounded form the nightly sync uses,
+ * and the endpoint fell from 13.6s to 0.22s.
+ *
+ * Created here rather than left as a manual `ALTER` on the box, because an index
+ * that exists only in production is one table rebuild away from a silent 50x
+ * regression that nobody would attribute to a missing index.
+ */
+async function ensureIndexes(pool) {
+  const [rows] = await pool.query(
+    `SELECT COUNT(*) n FROM information_schema.STATISTICS
+      WHERE table_schema = DATABASE() AND table_name = 'us_stock_prices'
+        AND index_name = 'idx_date_chg'`);
+  if (Number(rows[0].n)) return false;
+  console.log('creating covering index idx_date_chg (date, change_pct) ...');
+  const t = Date.now();
+  await pool.query('ALTER TABLE us_stock_prices ADD INDEX idx_date_chg (date, change_pct)');
+  console.log(`  built in ${((Date.now() - t) / 1000).toFixed(1)}s`);
+  return true;
+}
+
 (async () => {
   const pool = createPool();
+  await ensureIndexes(pool);
   const tickers = ONLY ? ONLY.split(',').map(s => s.trim().toUpperCase()) : US_TICKERS;
 
   console.log('Deep-backfill us_stock_prices');
