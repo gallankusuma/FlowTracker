@@ -6,9 +6,10 @@ const CACHE_TTL = 3600000; // 1 hour
 
 /**
  * @param {string} ticker
- * @param {string} range Yahoo range token ('5d', '20y', ...)
+ * @param {string} range Yahoo range token ('5d', '20y', ...). Ignored when
+ *   `options.period1` is given.
  * @param {string} [suffix] '.JK' for IDX, '' for US (already bare Yahoo symbols)
- * @param {{roundPrices?: boolean}} [options]
+ * @param {{roundPrices?: boolean, period1?: string, period2?: string}} [options]
  *
  * `roundPrices` defaults to TRUE, which is right for IDX and destructive for
  * anything quoted in cents. IDX prices are whole rupiah and Yahoo hands them
@@ -39,7 +40,23 @@ function fetchYahooCandles(ticker, range, suffix = '.JK', options = {}) {
     // symbols — don't append a suffix. US tickers pass suffix='' since
     // they're already bare Yahoo symbols (AAPL, not AAPL.JK).
     const symbol = ticker.startsWith('^') ? ticker.toUpperCase() : ticker.toUpperCase() + suffix;
-    const path = '/v8/finance/chart/' + symbol + '?interval=1d&range=' + range;
+
+    // Explicit period1/period2 override `range` because a range token is
+    // RELATIVE: '25y' means 25 years before *today*, so the same call returns a
+    // different first bar tomorrow. Anything whose boundary must not move -- a
+    // reserved research period above all -- has to pin absolute dates.
+    // Also note `range=max` makes Yahoo pick its own granularity and hand back
+    // 3-month bars regardless of interval=1d, so 'max' is never the way to get
+    // deep DAILY history.
+    let window;
+    if (options.period1) {
+      const secs = d => Math.floor(new Date(d + 'T00:00:00Z').getTime() / 1000);
+      const p2 = options.period2 ? secs(options.period2) + 86400 : Math.floor(Date.now() / 1000);
+      window = 'period1=' + secs(options.period1) + '&period2=' + p2;
+    } else {
+      window = 'range=' + range;
+    }
+    const path = '/v8/finance/chart/' + symbol + '?interval=1d&' + window;
     const opts = {
       hostname: 'query2.finance.yahoo.com',
       path: path,

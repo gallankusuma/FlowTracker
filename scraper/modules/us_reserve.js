@@ -112,11 +112,25 @@ function sqlExcludeReserves(col = 'date') {
   return `(${col} > '${RESERVE.B.to}' AND ${col} < '${RESERVE.F.from}')`;
 }
 
-/** Hash of the definition document, so a silently edited boundary is detectable. */
+const DOC = 'HOLDOUT_US_2026-09-05.md';
+
+/**
+ * Hash of the definition document, so a silently edited boundary is detectable.
+ *
+ * Searched in several places on purpose: in the repo the scraper is a
+ * subdirectory (doc at ../..), on the VPS /var/www/flowtracker-scraper is its own
+ * root (doc at ..). Resolving only one of those would make this return null in
+ * production and quietly stop guarding anything -- the exact silent-pass failure
+ * the rest of this file exists to prevent.
+ */
 function definitionHash() {
-  const p = path.join(__dirname, '..', '..', 'HOLDOUT_US_2026-09-05.md');
-  if (!fs.existsSync(p)) return null;
-  return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex').slice(0, 16);
+  for (const rel of [['..', '..'], ['..'], ['..', '..', '..']]) {
+    const p = path.join(__dirname, ...rel, DOC);
+    if (fs.existsSync(p)) {
+      return crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex').slice(0, 16);
+    }
+  }
+  return null;
 }
 
 module.exports = {

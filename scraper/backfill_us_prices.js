@@ -55,6 +55,10 @@ const arg = (name, def) => {
   return i >= 0 && argv[i + 1] ? argv[i + 1] : def;
 };
 const RANGE = arg('--range', '20y');
+// Absolute window, for loading a RESERVED period whose edge must not move.
+// See HOLDOUT_US_2026-09-05.md and modules/us_reserve.js.
+const PERIOD1 = arg('--period1', null);
+const PERIOD2 = arg('--period2', null);
 const ONLY = arg('--only', null);
 const RESUME = argv.includes('--resume');
 const DELAY_MS = Number(arg('--delay', 900));      // Yahoo throttles; be polite
@@ -99,7 +103,19 @@ async function ensureIndexes(pool) {
   const tickers = ONLY ? ONLY.split(',').map(s => s.trim().toUpperCase()) : US_TICKERS;
 
   console.log('Deep-backfill us_stock_prices');
-  console.log(`  range=${RANGE}  tickers=${tickers.length}  delay=${DELAY_MS}ms  resume=${RESUME}`);
+  console.log(PERIOD1
+    ? `  window=${PERIOD1}..${PERIOD2 || 'now'} (ABSOLUTE)  tickers=${tickers.length}  delay=${DELAY_MS}ms`
+    : `  range=${RANGE}  tickers=${tickers.length}  delay=${DELAY_MS}ms  resume=${RESUME}`);
+  if (PERIOD1) {
+    // HOLDOUT_US_2026-09-05.md rule 4: loading is not reading, but a loader that
+    // prints a return, IC or distribution figure over a reserved window burns it
+    // on the spot. Everything this script prints is a COUNT -- rows, sessions,
+    // coverage, date bounds -- and nothing derived from price changes. Rule 3
+    // keeps us_signal_history untouched, so no forward-return label for the
+    // reserve exists in queryable form until a sealed script computes it.
+    console.log('  RESERVED WINDOW: counts only. No return/factor statistic may be printed here.');
+    console.log('  us_signal_history is NOT extended — labels are computed at open time.');
+  }
   console.log('  prices are fetched with roundPrices:false — US equities are quoted in cents');
   console.log('  SURVIVORSHIP: today\'s S&P 500 members projected backwards. Biased upward. Stated, not fixed.');
 
@@ -127,7 +143,10 @@ async function ensureIndexes(pool) {
     let candles = null, lastErr = null;
     for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
       try {
-        const r = await fetchYahooCandles(ticker, RANGE, '', { roundPrices: false });
+        const r = await fetchYahooCandles(ticker, RANGE, '', {
+          roundPrices: false,
+          ...(PERIOD1 ? { period1: PERIOD1, period2: PERIOD2 } : {}),
+        });
         candles = r.candles;
         break;
       } catch (e) {
